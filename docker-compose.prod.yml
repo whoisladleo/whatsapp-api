@@ -1,0 +1,35 @@
+services:
+  api:
+    image: whoisladleo/whatsapp:latest
+    restart: always
+    ports:
+      - "${PORT:-8001}:8000"
+    environment:
+      - PORT=${PORT:-8001}
+      - POSTGRES_SERVER=${POSTGRES_SERVER:-db}
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-password}
+      - POSTGRES_DB=${POSTGRES_DB:-postgres}
+      - POSTGRES_PORT=${POSTGRES_PORT:-5432}
+      - RUN_MODE=production
+      - PROJECT_NAME=${PROJECT_NAME:-WhatsApp Medium}
+      - SECRET_KEY=${SECRET_KEY:-generate_a_very_secure_random_string_here}
+      - ALGORITHM=${ALGORITHM:-HS256}
+      - ACCESS_TOKEN_EXPIRE_MINUTES=${ACCESS_TOKEN_EXPIRE_MINUTES:-1440}
+      - WHATSAPP_TOKEN=${WHATSAPP_TOKEN}
+      - PHONE_NUMBER_ID=${PHONE_NUMBER_ID}
+      - WEBHOOK_VERIFY_TOKEN=${WEBHOOK_VERIFY_TOKEN}
+      - WORKERS_PER_CORE=${WORKERS_PER_CORE:-1}
+      - MAX_WORKERS=${MAX_WORKERS:-4}
+      - TIMEOUT=${TIMEOUT:-120}
+      - BACKEND_CORS_ORIGINS=${BACKEND_CORS_ORIGINS}
+    healthcheck:
+      test: [ "CMD-SHELL", "sh -c 'curl -fs http://127.0.0.1:${PORT:-8000}/health || exit 1'" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10mb"
+        max-file: "3"

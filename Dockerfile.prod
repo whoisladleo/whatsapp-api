@@ -1,0 +1,46 @@
+# Stage 1: Build
+FROM python:3.11-slim as builder
+
+WORKDIR /build
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    postgresql-client \
+    gcc \
+    python3-dev \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip wheel --no-cache-dir --no-deps --wheel-dir /build/wheels -r requirements.txt
+
+# Stage 2: Runtime
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Create a non-privileged user
+RUN addgroup --system webapp && adduser --system --group webapp
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    libpq-dev \
+    postgresql-client \
+    curl \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/wheels /wheels
+RUN pip install --no-cache-dir /wheels/*
+
+COPY . .
+
+# Ensure scripts are executable before switching users
+RUN chmod +x scripts/run.sh && chown -R webapp:webapp /app
+
+USER webapp
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+CMD ["./scripts/run.sh"]

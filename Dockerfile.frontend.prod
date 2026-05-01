@@ -1,0 +1,37 @@
+# Stage 1: Build
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# Install pnpm
+RUN npm install -g pnpm
+
+# Copy only lock file and package.json to leverage cache
+COPY frontend/package.json frontend/pnpm-lock.yaml* ./
+
+RUN pnpm install
+
+# Copy the rest of the frontend code
+COPY frontend .
+
+# Build the application
+# We will set VITE_API_URL at runtime via environment variables
+RUN pnpm build
+
+# Stage 2: Production
+FROM nginx:stable-alpine
+
+# Copy the built assets from the builder stage
+COPY --from=builder /app/dist /usr/share/nginx/html
+
+# Copy a custom nginx configuration to handle SPA routing
+COPY frontend/nginx.conf /etc/nginx/conf.d/default.conf
+
+# Copy and setup the entrypoint script
+COPY frontend/docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh
+
+EXPOSE 3000
+
+ENTRYPOINT ["/docker-entrypoint.sh"]
+CMD ["nginx", "-g", "daemon off;"]
