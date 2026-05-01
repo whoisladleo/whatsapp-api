@@ -19,8 +19,6 @@ jobs:
         include:
           - image: whoisladleo/whatsapp-api
             dockerfile: ./Dockerfile.prod
-          - image: whoisladleo/whatsapp-frontend
-            dockerfile: ./Dockerfile.frontend.prod
 
     steps:
       - name: Checkout code
