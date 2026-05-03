@@ -200,6 +200,7 @@ async def handle_webhook(request: Request, db: Session = Depends(get_db)):
                 db, item["whatsapp_message_id"], item["status"]
             )
         else:
+            print(f"DEBUG: Processing inbound message from {item.get('from_phone')}: {item.get('body')}")
             crud_message.create_message(db, item, account.id)
 
         # 2. AI Response Logic
@@ -209,17 +210,20 @@ async def handle_webhook(request: Request, db: Session = Depends(get_db)):
             and llm_service
             and item.get("type") == "text"
         ):
+            print(f"DEBUG: Generating AI response for account {account.name}...")
             response_text = await llm_service.generate_response(
                 message_body=item.get("body"),
                 product_slug=account.product_slug,
                 system_prompt=account.system_prompt,
             )
+            print(f"DEBUG: AI Response: {response_text}")
 
             # Send the response back
             provider = WhatsAppProvider(account.access_token, account.phone_number_id)
             resp = await provider.send_text(item["from_phone"], response_text)
-
+            
             if resp and "messages" in resp:
+                print(f"DEBUG: AI message sent successfully. ID: {resp['messages'][0].get('id')}")
                 # Log outbound AI message
                 msg_id = resp["messages"][0].get("id")
                 crud_message.create_message(
@@ -235,6 +239,8 @@ async def handle_webhook(request: Request, db: Session = Depends(get_db)):
                     },
                     account.id,
                 )
+            else:
+                print(f"ERROR: Failed to send AI response. Meta Response: {resp}")
 
         # 3. Forward to callback if configured
         if account.callback_url:
