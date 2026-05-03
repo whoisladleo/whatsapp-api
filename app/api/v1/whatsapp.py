@@ -13,6 +13,7 @@ from app.core.webhook_parser import WebhookParser
 from app.crud import message as crud_message
 from app.crud import whatsapp as crud_account
 from app.services.llm import llm_service
+from app.crud import knowledge as crud_knowledge
 from app.schemas.whatsapp import (
     MessageRead,
     MessageSend,
@@ -26,32 +27,7 @@ router = APIRouter()
 security_scheme = HTTPBearer()
 
 
-async def get_current_user(
-    db: Session = Depends(get_db),
-    token: HTTPAuthorizationCredentials = Depends(security_scheme),
-) -> User:
-    try:
-        payload = jwt.decode(
-            token.credentials, settings.SECRET_KEY, algorithms=[settings.ALGORITHM]
-        )
-        user_id: str = payload.get("sub")
-        if user_id is None:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Could not validate credentials",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-    except jwt.InvalidTokenError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    user = db.query(User).filter(User.id == int(user_id)).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    return user
+from app.api.deps import get_current_user
 
 
 async def get_whatsapp_account(
@@ -209,9 +185,19 @@ async def handle_webhook(request: Request, db: Session = Depends(get_db)):
             and llm_service
             and item.get("type") == "text"
         ):
+            # Fetch knowledge content from DB if product_slug matches a KB
+            knowledge_content = None
+            if account.product_slug:
+                kb = crud_knowledge.get_knowledge_base_by_slug(
+                    db, account.product_slug, account.user_id
+                )
+                if kb:
+                    knowledge_content = kb.content
+
             response_text = await llm_service.generate_response(
                 message_body=item.get("body"),
                 product_slug=account.product_slug,
+                knowledge_content=knowledge_content,
                 system_prompt=account.system_prompt,
             )
 

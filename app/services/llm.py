@@ -21,12 +21,13 @@ class LLMService:
         self, 
         message_body: str, 
         product_slug: Optional[str] = None, 
+        knowledge_content: Optional[str] = None,
         system_prompt: Optional[str] = None,
         history: List[dict] = None
     ) -> str:
         # 1. Prepare context from Knowledge Base
-        kb_content = ""
-        if product_slug:
+        kb_content = knowledge_content or ""
+        if not kb_content and product_slug:
             kb_content = self._get_knowledge_base(product_slug)
         
         # 2. Build system instruction
