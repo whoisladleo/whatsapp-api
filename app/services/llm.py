@@ -7,7 +7,7 @@ from app.core.config import settings
 class LLMService:
     def __init__(self, api_key: str):
         self.client = genai.Client(api_key=api_key)
-        self.model_id = 'gemini-3-flash'
+        self.model_id = 'gemini-3-flash-preview'
 
     def _get_knowledge_base(self, product_slug: str) -> str:
         kb_path = f"knowledge/{product_slug}.md"
