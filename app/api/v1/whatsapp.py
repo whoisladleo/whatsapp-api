@@ -165,6 +165,18 @@ def delete_account(
     return {"status": "deleted"}
 
 
+@router.get("/webhook")
+async def verify_webhook(
+    hub_mode: str = Query(None, alias="hub.mode"),
+    hub_challenge: str = Query(None, alias="hub.challenge"),
+    hub_verify_token: str = Query(None, alias="hub.verify_token"),
+):
+    if hub_mode == "subscribe" and hub_verify_token == settings.WEBHOOK_VERIFY_TOKEN:
+        return PlainTextResponse(content=hub_challenge)
+    
+    raise HTTPException(status_code=403, detail="Verification failed")
+
+
 @router.post("/webhook")
 async def handle_webhook(request: Request, db: Session = Depends(get_db)):
     data = await request.json()
