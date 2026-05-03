@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, JSON
+from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, JSON, Boolean
 from sqlalchemy.orm import relationship, DeclarativeBase
 from datetime import datetime
 
@@ -27,6 +27,9 @@ class WhatsAppAccount(Base):
     access_token = Column(String, nullable=False)
     verify_token = Column(String, nullable=True)
     callback_url = Column(String, nullable=True)  # URL to forward incoming messages
+    product_slug = Column(String, nullable=True)  # To identify knowledge base
+    ai_enabled = Column(Boolean, default=False)
+    system_prompt = Column(String, nullable=True)
     user_id = Column(Integer, ForeignKey("users.id"))
     created_at = Column(DateTime, default=datetime.utcnow)
 

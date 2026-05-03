@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     WHATSAPP_BASE_URL: str = "https://graph.facebook.com"
     WEBHOOK_VERIFY_TOKEN: Optional[str] = None
 
+    # LLM
+    GOOGLE_API_KEY: Optional[str] = None
+
     VITE_API_URL: Optional[str] = None
 
     # Scaling

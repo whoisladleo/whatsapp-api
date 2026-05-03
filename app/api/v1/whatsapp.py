@@ -12,6 +12,7 @@ import httpx
 from app.core.webhook_parser import WebhookParser
 from app.crud import message as crud_message
 from app.crud import whatsapp as crud_account
+from app.services.llm import llm_service
 from app.schemas.whatsapp import (
     MessageRead,
     MessageSend,
@@ -189,7 +190,41 @@ async def handle_webhook(request: Request, db: Session = Depends(get_db)):
         else:
             crud_message.create_message(db, item, account.id)
 
-        # 2. Forward to callback if configured
+        # 2. AI Response Logic
+        if (
+            item.get("direction") == "inbound"
+            and account.ai_enabled
+            and llm_service
+            and item.get("type") == "text"
+        ):
+            response_text = await llm_service.generate_response(
+                message_body=item.get("body"),
+                product_slug=account.product_slug,
+                system_prompt=account.system_prompt,
+            )
+
+            # Send the response back
+            provider = WhatsAppProvider(account.access_token, account.phone_number_id)
+            resp = await provider.send_text(item["from_phone"], response_text)
+
+            if resp and "messages" in resp:
+                # Log outbound AI message
+                msg_id = resp["messages"][0].get("id")
+                crud_message.create_message(
+                    db,
+                    {
+                        "whatsapp_message_id": msg_id,
+                        "to_phone": item["from_phone"],
+                        "type": "text",
+                        "body": response_text,
+                        "direction": "outbound",
+                        "status": "sent",
+                        "raw": resp,
+                    },
+                    account.id,
+                )
+
+        # 3. Forward to callback if configured
         if account.callback_url:
             async with httpx.AsyncClient() as client:
                 try:

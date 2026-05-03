@@ -9,6 +9,9 @@ class WhatsAppAccountBase(BaseModel):
     access_token: str
     verify_token: Optional[str] = None
     callback_url: Optional[str] = None
+    product_slug: Optional[str] = None
+    ai_enabled: bool = False
+    system_prompt: Optional[str] = None
 
 
 class WhatsAppAccountCreate(WhatsAppAccountBase):
@@ -20,6 +23,9 @@ class WhatsAppAccountUpdate(BaseModel):
     access_token: Optional[str] = None
     verify_token: Optional[str] = None
     callback_url: Optional[str] = None
+    product_slug: Optional[str] = None
+    ai_enabled: Optional[bool] = None
+    system_prompt: Optional[str] = None
 
 
 class WhatsAppAccountInDB(WhatsAppAccountBase):
