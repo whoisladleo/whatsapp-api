@@ -223,21 +223,29 @@ async def handle_webhook(request: Request, db: Session = Depends(get_db)):
                 resp = await provider.send_text(from_phone, response_text)
                 
                 if resp and "messages" in resp:
-                    # Log outbound AI message
+                    # Meta API succeeded
                     msg_id = resp["messages"][0].get("id")
-                    crud_message.create_message(
-                        db,
-                        {
-                            "whatsapp_message_id": msg_id,
-                            "to_phone": from_phone,
-                            "type": "text",
-                            "body": response_text,
-                            "direction": "outbound",
-                            "status": "sent",
-                            "raw": resp,
-                        },
-                        account.id,
-                    )
+                    status = "sent"
+                else:
+                    # Meta API failed, but we still want to log the AI's response in our DB
+                    import uuid
+                    msg_id = f"failed_{uuid.uuid4().hex[:8]}"
+                    status = "failed"
+                    print(f"WhatsApp API Error: {resp}")
+
+                crud_message.create_message(
+                    db,
+                    {
+                        "whatsapp_message_id": msg_id,
+                        "to_phone": from_phone,
+                        "type": "text",
+                        "body": response_text,
+                        "direction": "outbound",
+                        "status": status,
+                        "raw": resp if resp else {},
+                    },
+                    account.id,
+                )
 
 
         # 3. Forward to callback if configured
