@@ -1,6 +1,8 @@
 from google import genai
 from google.genai import types
 import os
+import re
+import uuid
 from typing import List, Optional
 from app.core.config import settings
 from sqlalchemy.orm import Session
@@ -127,8 +129,9 @@ Ili nianze kazi rasmi, nitumie jina la biashara yako na orodha ya bidhaa zako kw
             base_instruction += """
 RULES:
 1. Onboarding: Guide them through the next steps based on their previous response. DO NOT repeat the welcome message.
-2. Pricing & Negotiation: If they ask about other products, use the catalog info. But your main goal is selling my AI subscription.
-3. Human Handoff: If the customer is unreasonable, has complex technical questions, or explicitly asks for a human, you must include the exact phrase [HUMAN_HANDOFF] in your response.
+2. Onboarding Data Extraction: If the customer provides a product list, you MUST output a hidden command for each product in the format: [ADD_PRODUCT: Name | Max Price | Lowest Acceptable Price | Quantity]. Example: [ADD_PRODUCT: Nike Shoes | 50000 | 45000 | 10]. Put these commands on separate lines. Then reply conversationally acknowledging the products.
+3. Pricing & Negotiation: If they ask about other products, use the catalog info. But your main goal is selling my AI subscription.
+4. Human Handoff: If the customer is unreasonable, has complex technical questions, or explicitly asks for a human, you must include the exact phrase [HUMAN_HANDOFF] in your response.
 """
         
         base_instruction += """
@@ -158,7 +161,42 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
             response_text = response.text
             
             # Post-process response for special triggers
-            if "[HUMAN_HANDOFF]" in response_text:
+            
+            # 1. Process ADD_PRODUCT commands
+            product_matches = re.findall(r"\[ADD_PRODUCT:\s*(.*?)\s*\|\s*(\d+(?:\.\d+)?)\s*\|\s*(\d+(?:\.\d+)?)\s*\|\s*(\d+)\s*\]", response_text)
+            for match in product_matches:
+                name, max_p, min_p, qty = match
+                product = db.query(Product).filter(Product.merchant_id == account.user_id, Product.name.ilike(name.strip())).first()
+                if not product:
+                    # Generate a simple slug
+                    new_slug = re.sub(r'[^a-z0-9]+', '-', name.strip().lower()).strip('-')
+                    if not new_slug:
+                        new_slug = str(uuid.uuid4())[:8]
+                    # Check for slug collision
+                    existing_slug = db.query(Product).filter(Product.slug == new_slug).first()
+                    if existing_slug:
+                        new_slug = f"{new_slug}-{str(uuid.uuid4())[:4]}"
+                        
+                    product = Product(
+                        slug=new_slug,
+                        name=name.strip(),
+                        max_price=float(max_p),
+                        min_price=float(min_p),
+                        quantity=int(qty),
+                        merchant_id=account.user_id
+                    )
+                    db.add(product)
+                else:
+                    product.quantity += int(qty)
+                    product.max_price = float(max_p)
+                    product.min_price = float(min_p)
+            
+            if product_matches:
+                db.commit()
+                # Remove the hidden commands from the text sent to the user
+                response_text = re.sub(r"\[ADD_PRODUCT:.*?\]", "", response_text).strip()
+
+            # 2. Human Handoff
                 context.state = ConversationState.HUMAN_HANDOFF
                 db.commit()
                 response_text = response_text.replace("[HUMAN_HANDOFF]", "").strip()
