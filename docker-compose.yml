@@ -9,31 +9,30 @@ services:
       - .env
     environment:
       - PORT=${PORT:-8000}
-    # depends_on:
-    #   db:
-    #     condition: service_healthy
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
     healthcheck:
       test: [ "CMD-SHELL", "sh -c 'curl -fs http://127.0.0.1:${PORT:-8000}/health || exit 1'" ]
       interval: 30s
       timeout: 10s
       retries: 3
+    depends_on:
+      - redis
 
-  # db:
-  #   image: postgres:16-alpine
-  #   volumes:
-  #     - postgres_data:/var/lib/postgresql/data
-  #   environment:
-  #     - POSTGRES_USER=postgres
-  #     - POSTGRES_PASSWORD=postgres
-  #     - POSTGRES_DB=whatsapp_db
-  #   ports:
-  #     - "5432:5432"
-  #   healthcheck:
-  #     test: [ "CMD-SHELL", "pg_isready -U postgres" ]
-  #     interval: 5s
-  #     timeout: 5s
-  #     retries: 5
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
 
-
-volumes:
-  postgres_data:
+  celery_worker:
+    build: .
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    command: celery -A app.core.celery_app worker --loglevel=info
+    depends_on:
+      - redis

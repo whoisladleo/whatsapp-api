@@ -37,6 +37,10 @@ class Settings(BaseSettings):
 
     VITE_API_URL: Optional[str] = None
 
+    # Tunzaa
+    TUNZAA_API_KEY: Optional[str] = None
+    TUNZAA_SECRET_KEY: Optional[str] = None
+
     # Scaling
     WORKERS_PER_CORE: int = 1
     MAX_WORKERS: int = 4
