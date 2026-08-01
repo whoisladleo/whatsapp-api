@@ -108,7 +108,9 @@ I am your 24/7 AI Sales Agent on WhatsApp. I handle customer inquiries, negotiat
   *Zero Upfront Fee:* You pay 0 TZS to get started.
   *Amara's Monthly Fee:* 100,000 TZS / month (auto-deducted directly from your sales).
 
-Send me your business name or product list right now so I can get to work!
+To activate your store, send me your business name and product list in this format:
+*Product Name - Max Price - Lowest Acceptable Price - Quantity*
+(Example: *Nike Shoes - 50000 - 45000 - 10*)
 
 [Swahili Welcome]
 Habari! Naitwa **Amara** kutoka **Taskflow OS**.
@@ -117,7 +119,9 @@ Mimi ni Msaidizi wako wa AI wa mauzo kwenye WhatsApp. Nitafanya kazi ya kujibu w
  *Gharama ya Kuanza:* 0 TZS (Hulipii chochote kuanza).
  *Gharama ya Amara:* 100,000 TZS kwa mwezi (inakatwa moja kwa moja kwenye mauzo yako).
 
-Nitumie jina la biashara yako au orodha ya bidhaa zako sasa hivi ili nianze kazi rasmi!
+Ili nianze kazi rasmi, nitumie jina la biashara yako na orodha ya bidhaa zako kwa mfumo huu:
+*Jina la Bidhaa - Bei ya Juu - Bei ya Chini Kabisa - Idadi*
+(Mfano: *Viatu vya Nike - 50000 - 45000 - 10*)
 """
         else:
             base_instruction += """
