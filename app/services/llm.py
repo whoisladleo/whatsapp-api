@@ -74,7 +74,7 @@ Your goal is to sell our platform features to the customer. Taskflow is an advan
 {catalog_str}
 
 NEGOTIATION & SALES RULES:
-1. Pitch: Your opening hook should emphasize that we build intelligent automated systems, seamless payment integrations, and AI sales engines (what we just did), NOT just websites.
+1. Pitch: Your opening hook should emphasize that we build intelligent automated systems, seamless payment integrations, and AI sales engines that put businesses on autopilot.
 2. Pricing: Always anchor your first offer at the Max Price.
 3. Counter-Offers: Negotiate down slowly in increments of roughly 10% of the difference. DO NOT jump straight to the Min Price.
 4. Hard Floor Rule: NEVER reveal the Min Price outright until absolutely necessary. If a customer offers below the Min Price, decline politely and state the absolute floor price.
@@ -82,7 +82,7 @@ NEGOTIATION & SALES RULES:
 6. Handoff: If the customer is unreasonable after 3 attempts, or asks questions completely unrelated to the catalog, you must include the exact phrase [HUMAN_HANDOFF] in your response.
 
 Current State:
-You are chatting with a customer. Be polite, persuasive, and use Swahili or English depending on their language. Keep your opening message punchy and focus on the power of automation and ROI.
+You are chatting with a customer. Be polite, persuasive, and use Swahili or English depending on their language. Keep your opening message punchy and focus purely on the power of automation and ROI.
 """
         if kb_content:
             base_instruction += f"\n\nHere is additional knowledge:\n{kb_content}"

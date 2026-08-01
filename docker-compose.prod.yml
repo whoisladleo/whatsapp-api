@@ -33,3 +33,35 @@ services:
       options:
         max-size: "10mb"
         max-file: "3"
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  celery_worker:
+    image: whoisladleo/whatsapp:latest
+    restart: always
+    environment:
+      - POSTGRES_SERVER=${POSTGRES_SERVER:-db}
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-password}
+      - POSTGRES_DB=${POSTGRES_DB:-postgres}
+      - POSTGRES_PORT=${POSTGRES_PORT:-5432}
+      - RUN_MODE=production
+      - PROJECT_NAME=${PROJECT_NAME:-WhatsApp Medium}
+      - SECRET_KEY=${SECRET_KEY:-generate_a_very_secure_random_string_here}
+      - WHATSAPP_TOKEN=${WHATSAPP_TOKEN}
+      - PHONE_NUMBER_ID=${PHONE_NUMBER_ID}
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - TUNZAA_API_KEY=${TUNZAA_API_KEY}
+      - TUNZAA_SECRET_KEY=${TUNZAA_SECRET_KEY}
+    command: celery -A app.core.celery_app worker --loglevel=info
+    depends_on:
+      - redis
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10mb"
+        max-file: "3"
