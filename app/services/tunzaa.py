@@ -1,0 +1,114 @@
+import os
+import httpx
+from typing import Dict, Any, Optional
+from datetime import datetime, timedelta
+import uuid
+from app.db.models import Order, Customer
+
+class TunzaaService:
+    def __init__(self, api_key: str = None, secret_key: str = None, base_url: str = "https://pay.tunzaa.co.tz/api/v1"):
+        self.api_key = api_key or os.environ.get("TUNZAA_API_KEY", "")
+        self.secret_key = secret_key or os.environ.get("TUNZAA_SECRET_KEY", "")
+        self.base_url = base_url
+        self._cached_token = None
+        self._token_expiry = None
+    
+    async def get_token(self) -> str:
+        # Check cache
+        if self._cached_token and self._token_expiry and datetime.utcnow() < self._token_expiry:
+            return self._cached_token
+
+        # Exchange API Key & Secret for short-lived token
+        payload = {
+            "api_key": self.api_key,
+            "secret_key": self.secret_key
+        }
+        
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.post(
+                    f"{self.base_url}/accounts/request/token",
+                    json=payload,
+                    timeout=10.0
+                )
+                response.raise_for_status()
+                data = response.json()
+                self._cached_token = data.get("access_token")
+                # Assume 1 hour expiry
+                self._token_expiry = datetime.utcnow() + timedelta(minutes=55)
+                return self._cached_token
+            except Exception as e:
+                print(f"Tunzaa token error: {e}")
+                raise
+
+    async def initiate_payment(self, phone: str, amount: float, reference: str) -> Dict[str, Any]:
+        """
+        Initiate a direct mobile money push.
+        """
+        payload = {
+            "customer_msisdn": phone,
+            "amount": str(int(amount)),
+            "reference": reference
+        }
+        
+        headers = {
+            "Authorization": f"Bearer {await self.get_token()}",
+            "Content-Type": "application/json"
+        }
+        
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{self.base_url}/payments/initiate-payment",
+                    json=payload,
+                    headers=headers,
+                    timeout=10.0
+                )
+                response.raise_for_status()
+                return response.json()
+        except Exception as e:
+            print(f"Tunzaa initiate_payment error: {e}")
+            raise
+
+    async def create_installment_plan(self, order: Order, product_name: str) -> Dict[str, Any]:
+        """
+        Create a Tunzaa Lipa kwa Awamu installment plan.
+        """
+        start_date = datetime.utcnow().strftime("%Y-%m-%d")
+        end_date = (datetime.utcnow() + timedelta(days=90)).strftime("%Y-%m-%d")
+        
+        payload = {
+            "customer": {
+                "first_name": "Valued",
+                "last_name": "Customer",
+                "phone": order.customer.phone_number,
+                "address": order.customer.delivery_address or "Unknown"
+            },
+            "name": f"{product_name} - 3 Month Plan",
+            "description": f"Installment payment for {product_name}",
+            "total_amount": float(order.agreed_price),
+            "payment_frequency": "monthly",
+            "start_date": start_date,
+            "end_date": end_date
+        }
+        
+        headers = {
+            "Authorization": f"Bearer {await self.get_token()}",
+            "Content-Type": "application/json"
+        }
+        
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{self.base_url}/installments/create",
+                    json=payload,
+                    headers=headers,
+                    timeout=10.0
+                )
+                response.raise_for_status()
+                return response.json()
+        except Exception as e:
+            print(f"Tunzaa create_installment error: {e}")
+            raise
+
+tunzaa_service = TunzaaService()

@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api.v1 import auth, whatsapp, knowledge
+from app.api.v1 import auth, whatsapp, knowledge, tunzaa_webhook
 from app.core.config import settings
 
 app = FastAPI(
@@ -27,6 +27,9 @@ app.include_router(
 )
 app.include_router(
     knowledge.router, prefix=f"{settings.API_V1_STR}/knowledge", tags=["knowledge"]
+)
+app.include_router(
+    tunzaa_webhook.router, prefix=f"{settings.API_V1_STR}/tunzaa", tags=["tunzaa"]
 )
 
 
