@@ -4,7 +4,7 @@ import os
 from typing import List, Optional
 from app.core.config import settings
 from sqlalchemy.orm import Session
-from app.db.models import Customer, ConversationContext, ConversationState, Product, WhatsAppAccount
+from app.db.models import Customer, ConversationContext, ConversationState, Product, WhatsAppAccount, Message
 
 class LLMService:
     def __init__(self, api_key: str):
@@ -67,37 +67,67 @@ class LLMService:
         if not kb_content and product_slug:
             kb_content = self._get_knowledge_base(product_slug)
         
+        # Check if this is the first message
+        message_count = db.query(Message).filter(
+            Message.from_phone == from_phone,
+            Message.account_id == account.id,
+            Message.direction == "inbound"
+        ).count()
+        is_first_message = (message_count <= 1)
+
+        # Build chat history string for context
+        history_msgs = db.query(Message).filter(
+            ((Message.from_phone == from_phone) | (Message.to_phone == from_phone)),
+            Message.account_id == account.id
+        ).order_by(Message.timestamp.asc()).limit(20).all()
+        
+        chat_history_str = ""
+        for m in history_msgs:
+            # Skip empty bodies
+            if not m.body:
+                continue
+            sender = "Customer" if m.direction == "inbound" else "Amara"
+            chat_history_str += f"{sender}: {m.body}\n"
+
         # 4. Build system instruction
         base_instruction = f"""You are Amara, the 24/7 AI Sales Agent for Taskflow OS.
 Your goal is to onboard new merchants and explain the value of having an AI agent handle their WhatsApp sales.
 
 {catalog_str}
-
+"""
+        
+        if is_first_message:
+            base_instruction += """
 RULES:
-1. Welcome Message: If this is the very first message of the conversation, your VERY FIRST MESSAGE MUST BE EXACTLY ONE OF THE FOLLOWING (choose based on the user's language, default to Swahili):
+1. Welcome Message: This is the very first message of the conversation. Your VERY FIRST MESSAGE MUST BE EXACTLY ONE OF THE FOLLOWING (choose based on the user's language, default to Swahili):
 
 [English Welcome]
-Habari! Welcome to **Taskflow OS**.
-We assign **Amara**—your 24/7 AI Sales Agent—directly to your WhatsApp. She handles customer inquiries, negotiates prices, manages inventory, and collects payments via Tunzaa—completely on autopilot.
-**How it works:**
-* **Zero Upfront Setup Fee:** You pay nothing to get started.
-* **Platform Fee:** 100,000 TZS / month for Amara (auto-deducted directly from your sales).
+Habari! My name is **Amara** from **Taskflow OS**.
+I am your 24/7 AI Sales Agent on WhatsApp. I handle customer inquiries, negotiate prices, track your inventory, and collect payments via Tunzaa—completely on autopilot.
+*How we work together:*
+  *Zero Upfront Fee:* You pay 0 TZS to get started.
+  *Amara's Monthly Fee:* 100,000 TZS / month (auto-deducted directly from your sales).
 
-Send us your business name or inventory list to activate Amara for your store today.
+Send me your business name or product list right now so I can get to work!
 
 [Swahili Welcome]
-Habari! Karibu **Taskflow OS**.
-Tunakukabidhi **Amara**—Msaidizi wako wa AI ndani ya WhatsApp anayefanya mauzo, majadiliano ya bei, kutunza stoki, na kupokea malipo kupitia Tunzaa masaa 24/7—bila wewe kutumia nguvu.
-**Jinsi inavyofanya kazi:**
-* **Gharama ya Kuanza:** 0 TZS (Hulipii chochote kuanza).
-* **Gharama ya Amara:** 100,000 TZS kwa mwezi (inakatwa moja kwa moja kwenye mauzo yako).
+Habari! Naitwa **Amara** kutoka **Taskflow OS**.
+Mimi ni Msaidizi wako wa AI wa mauzo kwenye WhatsApp. Nitafanya kazi ya kujibu wateja, kujadiliana bei, kutunza stoki, na kupokea malipo kupitia Tunzaa masaa 24/7—bila wewe kutumia nguvu.
+*Jinsi tunavyofanya kazi:*
+ *Gharama ya Kuanza:* 0 TZS (Hulipii chochote kuanza).
+ *Gharama ya Amara:* 100,000 TZS kwa mwezi (inakatwa moja kwa moja kwenye mauzo yako).
 
-Tupatie jina la biashara yako au orodha ya bidhaa zako leo ili kumweka Amara tayari kwa kazi.
-
-2. Onboarding: If they provide their business name or inventory, acknowledge it enthusiastically and guide them through the next steps.
-3. Pricing & Negotiation: If they ask about other products, use the catalog info. But your main goal is selling the Amara subscription.
-4. Human Handoff: If the customer is unreasonable, has complex technical questions, or explicitly asks for a human, you must include the exact phrase [HUMAN_HANDOFF] in your response.
-
+Nitumie jina la biashara yako au orodha ya bidhaa zako sasa hivi ili nianze kazi rasmi!
+"""
+        else:
+            base_instruction += """
+RULES:
+1. Onboarding: Guide them through the next steps based on their previous response. DO NOT repeat the welcome message.
+2. Pricing & Negotiation: If they ask about other products, use the catalog info. But your main goal is selling the Amara subscription.
+3. Human Handoff: If the customer is unreasonable, has complex technical questions, or explicitly asks for a human, you must include the exact phrase [HUMAN_HANDOFF] in your response.
+"""
+        
+        base_instruction += """
 Current State:
 You are chatting with a customer. Be polite, persuasive, and use Swahili or English depending on their language.
 """
@@ -111,7 +141,7 @@ You are chatting with a customer. Be polite, persuasive, and use Swahili or Engl
             # 5. Call Gemini
             response = await self.client.aio.models.generate_content(
                 model=self.model_id,
-                contents=message_body,
+                contents=f"Recent Conversation:\n{chat_history_str}\n\nRespond as Amara:",
                 config=types.GenerateContentConfig(
                     system_instruction=base_instruction,
                     temperature=0.7,
