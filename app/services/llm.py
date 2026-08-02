@@ -92,14 +92,17 @@ class LLMService:
             chat_history_str += f"{sender}: {m.body}\n"
 
         # 4. Build system instruction
-        base_instruction = f"""You are Amara, the 24/7 AI Sales Agent for Taskflow OS.
+        is_platform_account = (account.name.lower() == 'taskflow')
+        
+        if is_platform_account:
+            base_instruction = f"""You are Amara, the 24/7 AI Sales Agent for Taskflow OS.
 Your goal is to onboard new merchants and explain the value of having an AI agent handle their WhatsApp sales.
 
 {catalog_str}
 """
-        
-        if is_first_message:
-            base_instruction += """
+            
+            if is_first_message:
+                base_instruction += """
 RULES:
 1. Welcome Message: This is the very first message of the conversation. Your VERY FIRST MESSAGE MUST BE EXACTLY ONE OF THE FOLLOWING (choose based on the user's language, default to Swahili):
 
@@ -125,13 +128,24 @@ Ili nianze kazi rasmi, nitumie jina la biashara yako na orodha ya bidhaa zako kw
 *Jina la Bidhaa - Bei ya Juu - Bei ya Chini Kabisa - Idadi*
 (Mfano: *Viatu vya Nike - 50000 - 45000 - 10*)
 """
-        else:
-            base_instruction += """
+            else:
+                base_instruction += """
 RULES:
 1. Onboarding: Guide them through the next steps based on their previous response. DO NOT repeat the welcome message.
 2. Onboarding Data Extraction: If the customer provides a product list, you MUST output a hidden command for each product in the format: [ADD_PRODUCT: Name | Max Price | Lowest Acceptable Price | Quantity]. Example: [ADD_PRODUCT: Nike Shoes | 50000 | 45000 | 10]. Put these commands on separate lines. Then reply conversationally acknowledging the products.
 3. Pricing & Negotiation: If they ask about other products, use the catalog info. But your main goal is selling my AI subscription.
 4. Human Handoff: If the customer is unreasonable, has complex technical questions, or explicitly asks for a human, you must include the exact phrase [HUMAN_HANDOFF] in your response.
+"""
+        else:
+            base_instruction = f"""You are Amara, the 24/7 AI Sales Agent for {account.name}.
+Your goal is to politely assist customers, answer questions, and sell products from the catalog.
+
+{catalog_str}
+
+RULES:
+1. Selling: Be helpful and persuasive. Try to close the sale.
+2. Pricing & Negotiation: Use the provided catalog max and min prices to negotiate. Never sell below the minimum price.
+3. Human Handoff: If the customer is unreasonable, has complex technical questions, or explicitly asks for a human, you must include the exact phrase [HUMAN_HANDOFF] in your response.
 """
         
         base_instruction += """
