@@ -211,6 +211,7 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
                 response_text = re.sub(r"\[ADD_PRODUCT:.*?\]", "", response_text).strip()
 
             # 2. Human Handoff
+            if "[HUMAN_HANDOFF]" in response_text:
                 context.state = ConversationState.HUMAN_HANDOFF
                 db.commit()
                 response_text = response_text.replace("[HUMAN_HANDOFF]", "").strip()
