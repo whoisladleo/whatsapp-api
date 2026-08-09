@@ -88,13 +88,13 @@ class LLMService:
         if not kb_content and product_slug:
             kb_content = self._get_knowledge_base(product_slug)
         
-        # Check if this is the first message
-        message_count = db.query(Message).filter(
-            Message.from_phone == from_phone,
+        # Check if we have ever replied to this user
+        outbound_count = db.query(Message).filter(
+            Message.to_phone == from_phone,
             Message.account_id == account.id,
-            Message.direction == "inbound"
+            Message.direction == "outbound"
         ).count()
-        is_first_message = (message_count <= 1)
+        is_first_message = (outbound_count == 0)
 
         # Build chat history string for context
         history_msgs = db.query(Message).filter(
@@ -122,29 +122,33 @@ Your goal is to onboard new merchants and explain the value of having an AI agen
             if is_first_message:
                 base_instruction += """
 RULES:
-1. Welcome Message: This is the very first message of the conversation. Your VERY FIRST MESSAGE MUST BE EXACTLY ONE OF THE FOLLOWING (choose based on the user's language, default to Swahili):
+1. Welcome Message: This is the very first time we are replying. You MUST reply with EXACTLY the text below, word-for-word, based on the user's language (default to Swahili). DO NOT add any other text or greetings.
 
 [English Welcome]
 Habari! My name is *Amara* from *Taskflow OS*.
 I am your 24/7 AI Sales Agent on WhatsApp. I handle customer inquiries, negotiate prices, track your inventory, and collect payments via Tunzaa—completely on autopilot.
+
 *How we work together:*
   *Zero Upfront Fee:* You pay 0 TZS to get started.
   *My Monthly Fee:* 100,000 TZS / month (auto-deducted directly from your sales).
 
-To activate your store, send me your business name and product list in this format:
-*Product Name - Max Price - Lowest Acceptable Price - Quantity*
-(Example: *Nike Shoes - 50000 - 45000 - 10*)
+To activate your store and add your products, please log in to your merchant dashboard here:
+🔗 *https://dashboard-taskflow.whoisladleo.dev/*
+
+Log in using your WhatsApp number to get started!
 
 [Swahili Welcome]
 Habari! Naitwa *Amara* kutoka *Taskflow OS*.
 Mimi ni Msaidizi wako wa AI wa mauzo kwenye WhatsApp. Nitafanya kazi ya kujibu wateja, kujadiliana bei, kutunza stoki, na kupokea malipo kupitia Tunzaa masaa 24/7—bila wewe kutumia nguvu.
+
 *Jinsi tunavyofanya kazi:*
  *Gharama ya Kuanza:* 0 TZS (Hulipii chochote kuanza).
  *Gharama Yangu:* 100,000 TZS kwa mwezi (inakatwa moja kwa moja kwenye mauzo yako).
 
-Ili nianze kazi rasmi, nitumie jina la biashara yako na orodha ya bidhaa zako kwa mfumo huu:
-*Jina la Bidhaa - Bei ya Juu - Bei ya Chini Kabisa - Idadi*
-(Mfano: *Viatu vya Nike - 50000 - 45000 - 10*)
+Ili nianze kazi rasmi na kuweka bidhaa zako, tafadhali ingia kwenye mfumo wako wa mauzo (dashboard) hapa:
+🔗 *https://dashboard-taskflow.whoisladleo.dev/*
+
+Tumia namba yako ya WhatsApp kuingia na kukamilisha usajili!
 """
             else:
                 base_instruction += """
