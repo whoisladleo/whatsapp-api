@@ -114,9 +114,17 @@ class Product(Base):
     id = Column(Integer, primary_key=True, index=True)
     slug = Column(String, unique=True, index=True, nullable=False)
     name = Column(String, nullable=False)
+    description = Column(String, nullable=True)
+    category = Column(String, nullable=True)
+    image_url = Column(String, nullable=True)
+    sku = Column(String, nullable=True) # Will be unique per merchant logically
+    barcode = Column(String, nullable=True)
     max_price = Column(Float, nullable=False)
     min_price = Column(Float, nullable=False)
+    cost_price = Column(Float, nullable=True)
     quantity = Column(Integer, default=0)
+    weight = Column(Float, nullable=True)
+    is_active = Column(Boolean, default=True)
     merchant_id = Column(Integer, ForeignKey("users.id"))
     created_at = Column(DateTime, default=datetime.utcnow)
 

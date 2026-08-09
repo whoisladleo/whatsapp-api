@@ -50,3 +50,38 @@ def update_product(db: Session, db_product: Product, product_in: ProductUpdate) 
 def delete_product(db: Session, db_product: Product) -> None:
     db.delete(db_product)
     db.commit()
+
+def bulk_upsert_products(db: Session, merchant_id: int, products_data: List[dict]) -> int:
+    """
+    products_data is a list of dictionaries.
+    Uses 'sku' to identify existing products.
+    """
+    upserted_count = 0
+    for p_data in products_data:
+        sku = p_data.get("sku")
+        db_product = None
+        if sku:
+            db_product = db.query(Product).filter(
+                Product.merchant_id == merchant_id,
+                Product.sku == str(sku)
+            ).first()
+            
+        if db_product:
+            for key, value in p_data.items():
+                if hasattr(db_product, key) and key not in ['id', 'merchant_id', 'slug', 'created_at']:
+                    setattr(db_product, key, value)
+            db.add(db_product)
+        else:
+            name = p_data.get("name", "Unnamed")
+            slug = generate_slug(db, name)
+            new_product = Product(
+                merchant_id=merchant_id,
+                slug=slug,
+                **p_data
+            )
+            db.add(new_product)
+        
+        upserted_count += 1
+
+    db.commit()
+    return upserted_count

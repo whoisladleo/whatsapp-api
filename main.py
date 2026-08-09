@@ -3,9 +3,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.v1 import auth, whatsapp, knowledge, tunzaa_webhook, accounts, products
 from app.core.config import settings
 
+from fastapi.staticfiles import StaticFiles
+import os
+
+# Ensure the upload directory exists
+os.makedirs("static/uploads/products", exist_ok=True)
+
 app = FastAPI(
     title=settings.PROJECT_NAME, openapi_url=f"{settings.API_V1_STR}/openapi.json"
 )
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # CORS Middleware
 app.add_middleware(
