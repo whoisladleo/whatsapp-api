@@ -1,10 +1,8 @@
 from datetime import datetime, timedelta
 from typing import Any, Union
 import jwt
-from passlib.context import CryptContext
+import secrets
 from app.core.config import settings
-
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
 def create_access_token(
@@ -23,9 +21,6 @@ def create_access_token(
     return encoded_jwt
 
 
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
-
-
-def get_password_hash(password: str) -> str:
-    return pwd_context.hash(password)
+def generate_otp(length: int = 6) -> str:
+    """Generates a secure numeric OTP of the specified length."""
+    return ''.join(str(secrets.randbelow(10)) for _ in range(length))

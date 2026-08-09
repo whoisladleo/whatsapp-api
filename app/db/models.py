@@ -32,7 +32,8 @@ class User(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True, index=True, nullable=False)
-    hashed_password = Column(String, nullable=False)
+    otp_code = Column(String, nullable=True)
+    otp_expires_at = Column(DateTime, nullable=True)
     business_name = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
