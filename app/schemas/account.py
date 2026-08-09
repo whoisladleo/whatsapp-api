@@ -8,7 +8,7 @@ class AccountBase(BaseModel):
     verify_token: Optional[str] = None
     callback_url: Optional[str] = None
     product_slug: Optional[str] = None
-    ai_enabled: bool = False
+    ai_enabled: bool = True
     system_prompt: Optional[str] = None
 
 class AccountCreate(AccountBase):

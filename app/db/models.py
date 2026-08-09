@@ -66,7 +66,7 @@ class WhatsAppAccount(Base):
     verify_token = Column(String, nullable=True)
     callback_url = Column(String, nullable=True)  # URL to forward incoming messages
     product_slug = Column(String, nullable=True)  # To identify knowledge base
-    ai_enabled = Column(Boolean, default=False)
+    ai_enabled = Column(Boolean, default=True)
     system_prompt = Column(String, nullable=True)
     kyc_status = Column(Enum(KYCStatus), default=KYCStatus.DRAFT)
     user_id = Column(Integer, ForeignKey("users.id"))
