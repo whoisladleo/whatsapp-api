@@ -51,12 +51,19 @@ def delete_product(db: Session, db_product: Product) -> None:
     db.delete(db_product)
     db.commit()
 
-def bulk_upsert_products(db: Session, merchant_id: int, products_data: List[dict]) -> int:
+def bulk_upsert_products(db: Session, merchant_id: int, products_data: List[dict], dry_run: bool = False) -> dict:
     """
     products_data is a list of dictionaries.
     Uses 'sku' to identify existing products.
     """
-    upserted_count = 0
+    stats = {
+        "requires_confirmation": dry_run,
+        "total_products": len(products_data),
+        "new_products_count": 0,
+        "duplicate_products_count": 0,
+        "duplicate_skus": []
+    }
+    
     for p_data in products_data:
         sku = p_data.get("sku")
         db_product = None
@@ -67,21 +74,27 @@ def bulk_upsert_products(db: Session, merchant_id: int, products_data: List[dict
             ).first()
             
         if db_product:
-            for key, value in p_data.items():
-                if hasattr(db_product, key) and key not in ['id', 'merchant_id', 'slug', 'created_at']:
-                    setattr(db_product, key, value)
-            db.add(db_product)
+            stats["duplicate_products_count"] += 1
+            if sku:
+                stats["duplicate_skus"].append(sku)
+            if not dry_run:
+                for key, value in p_data.items():
+                    if hasattr(db_product, key) and key not in ['id', 'merchant_id', 'slug', 'created_at']:
+                        setattr(db_product, key, value)
+                db.add(db_product)
         else:
-            name = p_data.get("name", "Unnamed")
-            slug = generate_slug(db, name)
-            new_product = Product(
-                merchant_id=merchant_id,
-                slug=slug,
-                **p_data
-            )
-            db.add(new_product)
-        
-        upserted_count += 1
+            stats["new_products_count"] += 1
+            if not dry_run:
+                name = p_data.get("name", "Unnamed")
+                slug = generate_slug(db, name)
+                new_product = Product(
+                    merchant_id=merchant_id,
+                    slug=slug,
+                    **p_data
+                )
+                db.add(new_product)
 
-    db.commit()
-    return upserted_count
+    if not dry_run:
+        db.commit()
+        
+    return stats

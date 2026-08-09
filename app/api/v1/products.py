@@ -71,6 +71,7 @@ def download_csv_template():
 
 @router.post("/bulk/upload", status_code=status.HTTP_200_OK)
 def upload_csv_bulk(
+    confirm: bool = False,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
@@ -94,8 +95,17 @@ def upload_csv_bulk(
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid numeric data in CSV")
             
-    upserted_count = bulk_upsert_products(db=db, merchant_id=current_user.id, products_data=products_data)
-    return {"message": f"Successfully processed {upserted_count} products"}
+    stats = bulk_upsert_products(
+        db=db, 
+        merchant_id=current_user.id, 
+        products_data=products_data,
+        dry_run=not confirm
+    )
+    
+    if not confirm:
+        return stats
+        
+    return {"message": "Successfully processed products", "stats": stats}
 
 @router.post("/{product_id}/image", response_model=ProductResponse)
 def upload_product_image(
