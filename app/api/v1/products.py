@@ -18,7 +18,7 @@ from app.api.deps import get_current_user
 
 router = APIRouter()
 
-@router.post("/", response_model=ProductResponse, status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=ProductResponse, status_code=status.HTTP_201_CREATED)
 def create_new_product(
     product_in: ProductCreate,
     db: Session = Depends(get_db),
@@ -26,7 +26,7 @@ def create_new_product(
 ):
     return create_product(db=db, product_in=product_in, merchant_id=current_user.id)
 
-@router.get("/", response_model=List[ProductResponse])
+@router.get("", response_model=List[ProductResponse])
 def read_products(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
