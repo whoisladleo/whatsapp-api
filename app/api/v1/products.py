@@ -61,8 +61,8 @@ def delete_existing_product(
 
 @router.get("/bulk/template")
 def download_csv_template():
-    csv_content = "name,description,max_price,min_price,quantity,category,sku,barcode,cost_price,weight\n"
-    csv_content += "Sample Product,A great product,50000,45000,10,Electronics,SKU-001,123456789,30000,1.5\n"
+    csv_content = "name,description,max_price,min_price,quantity,category,sku,barcode,cost_price,weight,image_url\n"
+    csv_content += "Sample Product,A great product,50000,45000,10,Electronics,SKU-001,123456789,30000,1.5,https://example.com/image.jpg\n"
     return StreamingResponse(
         iter([csv_content]),
         media_type="text/csv",

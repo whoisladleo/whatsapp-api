@@ -154,7 +154,7 @@ Tumia namba yako ya WhatsApp kuingia na kukamilisha usajili!
                 base_instruction += """
 RULES:
 1. Assistance: Answer any questions they have about Taskflow OS, pricing, or how the AI agent works.
-2. Onboarding & Setup: If they want to add products, change their business name, or activate their store, politely remind them that ALL setup and product management must be done through the merchant dashboard: https://dashboard-taskflow.whoisladleo.dev/
+2. Onboarding & Setup: You CANNOT add products or register businesses via WhatsApp. If the user asks you to register their business, add a product, or set up their store, you MUST tell them that you cannot do this here and they MUST use the merchant dashboard: https://dashboard-taskflow.whoisladleo.dev/ . Do NOT pretend or hallucinate that you have added their products or business.
 3. Pricing & Negotiation: If they ask about other products, use the catalog info. But your main goal is selling the AI subscription and getting them to log into the dashboard.
 4. Human Handoff: If the customer is unreasonable, has complex technical questions, or explicitly asks for a human, you must include the exact phrase [HUMAN_HANDOFF] in your response.
 """
@@ -198,48 +198,6 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
             
             # Post-process response for special triggers
             
-            # 1. Process ADD_PRODUCT commands
-            product_matches = re.findall(r"\[ADD_PRODUCT:\s*(.*?)\s*\|\s*(\d+(?:\.\d+)?)\s*\|\s*(\d+(?:\.\d+)?)\s*\|\s*(\d+)\s*\]", response_text)
-            for match in product_matches:
-                name, max_p, min_p, qty = match
-                product = db.query(Product).filter(Product.merchant_id == merchant_id, Product.name.ilike(name.strip())).first()
-                if not product:
-                    # Generate a simple slug
-                    new_slug = re.sub(r'[^a-z0-9]+', '-', name.strip().lower()).strip('-')
-                    if not new_slug:
-                        new_slug = str(uuid.uuid4())[:8]
-                    # Check for slug collision
-                    existing_slug = db.query(Product).filter(Product.slug == new_slug).first()
-                    if existing_slug:
-                        new_slug = f"{new_slug}-{str(uuid.uuid4())[:4]}"
-                        
-                    product = Product(
-                        slug=new_slug,
-                        name=name.strip(),
-                        max_price=float(max_p),
-                        min_price=float(min_p),
-                        quantity=int(qty),
-                        merchant_id=merchant_id
-                    )
-                    db.add(product)
-                else:
-                    product.quantity += int(qty)
-                    product.max_price = float(max_p)
-                    product.min_price = float(min_p)
-            
-            if product_matches:
-                db.commit()
-                # Remove the hidden commands from the text sent to the user
-                response_text = re.sub(r"\[ADD_PRODUCT:.*?\]", "", response_text).strip()
-                
-            # Process SET_BUSINESS commands
-            business_match = re.search(r"\[SET_BUSINESS:\s*(.*?)\]", response_text)
-            if business_match and merchant_user:
-                new_name = business_match.group(1).strip()
-                merchant_user.business_name = new_name
-                db.commit()
-                response_text = re.sub(r"\[SET_BUSINESS:.*?\]", "", response_text).strip()
-
             # 2. Human Handoff
             if "[HUMAN_HANDOFF]" in response_text:
                 context.state = ConversationState.HUMAN_HANDOFF
