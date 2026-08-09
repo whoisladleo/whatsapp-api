@@ -58,3 +58,6 @@ Thumbs.db
 
 # Alembic
 alembic/versions/__pycache__/
+
+# Agent scratch pad
+scratch/

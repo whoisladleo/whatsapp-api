@@ -33,29 +33,29 @@ from app.api.deps import get_current_user
 
 async def get_whatsapp_account(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
     whatsapp_account_id: Optional[str] = Header(None, alias="X-WhatsApp-Account-ID"),
     x_account_id: Optional[str] = Header(None, alias="X-Account-ID"),
     x_account_id_query: Optional[str] = Query(None, alias="X-Account-ID"),
 ) -> WhatsAppAccount:
     account_id = whatsapp_account_id or x_account_id or x_account_id_query
-    query = db.query(WhatsAppAccount).filter(WhatsAppAccount.user_id == current_user.id)
+    
+    if not account_id:
+        raise HTTPException(status_code=400, detail="WhatsApp Account ID is required via header (X-WhatsApp-Account-ID) or query param")
 
-    if account_id:
-        # Try matching by internal ID (if numeric) or phone_number_id
-        is_numeric = str(account_id).isdigit()
-        if is_numeric:
-            account = query.filter(
-                (WhatsAppAccount.id == int(account_id))
-                | (WhatsAppAccount.phone_number_id == str(account_id))
-            ).first()
-        else:
-            account = query.filter(
-                WhatsAppAccount.phone_number_id == str(account_id)
-            ).first()
+    query = db.query(WhatsAppAccount)
+
+    # Try matching by internal ID (if numeric and small enough) or phone_number_id
+    is_numeric = str(account_id).isdigit()
+    
+    if is_numeric and len(str(account_id)) < 10:  # Safe bound for 32-bit int to prevent Postgres out-of-range errors
+        account = query.filter(
+            (WhatsAppAccount.id == int(account_id))
+            | (WhatsAppAccount.phone_number_id == str(account_id))
+        ).first()
     else:
-        # Default to the first account if no specific ID is provided
-        account = query.first()
+        account = query.filter(
+            WhatsAppAccount.phone_number_id == str(account_id)
+        ).first()
 
     if not account:
         raise HTTPException(status_code=404, detail="WhatsApp account not found")
