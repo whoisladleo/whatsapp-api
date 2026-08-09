@@ -6,8 +6,15 @@ from typing import Dict, Any, List
 def create_message(
     db: Session, message_data: Dict[str, Any], account_id: int
 ) -> Message:
+    whatsapp_message_id = message_data.get("whatsapp_message_id")
+    
+    if whatsapp_message_id:
+        existing = db.query(Message).filter(Message.whatsapp_message_id == whatsapp_message_id).first()
+        if existing:
+            return existing
+
     db_message = Message(
-        whatsapp_message_id=message_data.get("whatsapp_message_id"),
+        whatsapp_message_id=whatsapp_message_id,
         from_phone=message_data.get("from_phone"),
         to_phone=message_data.get("to_phone"),
         type=message_data.get("type", "text"),
