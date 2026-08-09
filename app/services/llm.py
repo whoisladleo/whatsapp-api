@@ -6,7 +6,7 @@ import uuid
 from typing import List, Optional
 from app.core.config import settings
 from sqlalchemy.orm import Session
-from app.db.models import Customer, ConversationContext, ConversationState, Product, WhatsAppAccount, Message
+from app.db.models import Customer, ConversationContext, ConversationState, Product, WhatsAppAccount, Message, User
 
 class LLMService:
     def __init__(self, api_key: str):
@@ -55,8 +55,28 @@ class LLMService:
             # We assume a human agent is dealing with it. 
             return None # Don't send an automated message
 
+        # 1.5 Determine merchant context
+        is_platform_account = (account.name.lower() == 'taskflow')
+        
+        merchant_user = None
+        if is_platform_account:
+            # The person texting IS the merchant
+            merchant_user = db.query(User).filter(User.username == from_phone).first()
+            if not merchant_user:
+                merchant_user = User(
+                    username=from_phone,
+                    hashed_password=str(uuid.uuid4())
+                )
+                db.add(merchant_user)
+                db.commit()
+                db.refresh(merchant_user)
+            merchant_id = merchant_user.id
+        else:
+            # The person texting is a customer, the merchant is the account owner
+            merchant_id = account.user_id
+
         # 2. Fetch products for this merchant
-        products = db.query(Product).filter(Product.merchant_id == account.user_id).all()
+        products = db.query(Product).filter(Product.merchant_id == merchant_id).all()
         if not products:
             catalog_str = "No products currently available."
         else:
@@ -92,7 +112,6 @@ class LLMService:
             chat_history_str += f"{sender}: {m.body}\n"
 
         # 4. Build system instruction
-        is_platform_account = (account.name.lower() == 'taskflow')
         
         if is_platform_account:
             base_instruction = f"""You are Amara, the 24/7 AI Sales Agent for Taskflow OS.
@@ -132,7 +151,7 @@ Ili nianze kazi rasmi, nitumie jina la biashara yako na orodha ya bidhaa zako kw
                 base_instruction += """
 RULES:
 1. Onboarding: Guide them through the next steps based on their previous response. DO NOT repeat the welcome message.
-2. Onboarding Data Extraction: If the customer provides a product list, you MUST output a hidden command for each product in the format: [ADD_PRODUCT: Name | Max Price | Lowest Acceptable Price | Quantity]. Example: [ADD_PRODUCT: Nike Shoes | 50000 | 45000 | 10]. Put these commands on separate lines. Then reply conversationally acknowledging the products.
+2. Onboarding Data Extraction: If the customer provides a product list, you MUST output a hidden command for each product in the format: [ADD_PRODUCT: Name | Max Price | Lowest Acceptable Price | Quantity]. Example: [ADD_PRODUCT: Nike Shoes | 50000 | 45000 | 10]. If they provide a business name, output: [SET_BUSINESS: Business Name]. Put these commands on separate lines. Then reply conversationally acknowledging the details.
 3. Pricing & Negotiation: If they ask about other products, use the catalog info. But your main goal is selling my AI subscription.
 4. Human Handoff: If the customer is unreasonable, has complex technical questions, or explicitly asks for a human, you must include the exact phrase [HUMAN_HANDOFF] in your response.
 """
@@ -180,7 +199,7 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
             product_matches = re.findall(r"\[ADD_PRODUCT:\s*(.*?)\s*\|\s*(\d+(?:\.\d+)?)\s*\|\s*(\d+(?:\.\d+)?)\s*\|\s*(\d+)\s*\]", response_text)
             for match in product_matches:
                 name, max_p, min_p, qty = match
-                product = db.query(Product).filter(Product.merchant_id == account.user_id, Product.name.ilike(name.strip())).first()
+                product = db.query(Product).filter(Product.merchant_id == merchant_id, Product.name.ilike(name.strip())).first()
                 if not product:
                     # Generate a simple slug
                     new_slug = re.sub(r'[^a-z0-9]+', '-', name.strip().lower()).strip('-')
@@ -197,7 +216,7 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
                         max_price=float(max_p),
                         min_price=float(min_p),
                         quantity=int(qty),
-                        merchant_id=account.user_id
+                        merchant_id=merchant_id
                     )
                     db.add(product)
                 else:
@@ -209,13 +228,30 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
                 db.commit()
                 # Remove the hidden commands from the text sent to the user
                 response_text = re.sub(r"\[ADD_PRODUCT:.*?\]", "", response_text).strip()
+                
+            # Process SET_BUSINESS commands
+            business_match = re.search(r"\[SET_BUSINESS:\s*(.*?)\]", response_text)
+            if business_match and merchant_user:
+                new_name = business_match.group(1).strip()
+                merchant_user.business_name = new_name
+                db.commit()
+                response_text = re.sub(r"\[SET_BUSINESS:.*?\]", "", response_text).strip()
 
             # 2. Human Handoff
             if "[HUMAN_HANDOFF]" in response_text:
                 context.state = ConversationState.HUMAN_HANDOFF
                 db.commit()
                 response_text = response_text.replace("[HUMAN_HANDOFF]", "").strip()
-                # In a full system, this would trigger an alert to the Operations number.
+                
+                # Alert the merchant
+                if not is_platform_account and account.owner:
+                    merchant_phone = account.owner.username
+                    alert_message = f"🚨 *HUMAN HANDOFF REQUIRED* 🚨\nA customer at {from_phone} needs your help!\n\n*Last AI message:* {response_text}"
+                    from app.services.whatsapp import WhatsAppProvider
+                    provider = WhatsAppProvider(account.access_token)
+                    import asyncio
+                    asyncio.create_task(provider.send_text(merchant_phone, alert_message))
+
                 if not response_text:
                     response_text = "I am transferring you to a human agent who can help you further. Please hold."
             
