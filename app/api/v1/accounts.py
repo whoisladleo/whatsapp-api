@@ -30,7 +30,7 @@ async def validate_whatsapp_credentials(phone_number_id: str, access_token: str)
         except Exception:
             return False
 
-@router.post("/", response_model=AccountResponse, status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=AccountResponse, status_code=status.HTTP_201_CREATED)
 async def create_new_account(
     account_in: AccountCreate,
     db: Session = Depends(get_db),
@@ -44,7 +44,7 @@ async def create_new_account(
         )
     return create_account(db=db, account_in=account_in, user_id=current_user.id)
 
-@router.get("/", response_model=List[AccountResponse])
+@router.get("", response_model=List[AccountResponse])
 def read_accounts(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
