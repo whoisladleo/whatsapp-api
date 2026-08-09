@@ -118,20 +118,35 @@ def upload_product_image(
     if not db_product:
         raise HTTPException(status_code=404, detail="Product not found")
         
-    # Ensure upload directory exists
-    upload_dir = "static/uploads/products"
-    os.makedirs(upload_dir, exist_ok=True)
-    
-    # Save the file
     file_extension = file.filename.split(".")[-1]
     filename = f"{current_user.id}_{product_id}_{uuid.uuid4().hex[:8]}.{file_extension}"
-    file_path = os.path.join(upload_dir, filename)
     
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-        
-    # Update product image_url
-    image_url = f"/static/uploads/products/{filename}"
+    from app.core.config import settings
+    if settings.R2_ACCOUNT_ID and settings.R2_BUCKET_NAME:
+        import boto3
+        from botocore.client import Config
+        s3 = boto3.client(
+            's3',
+            endpoint_url=f"https://{settings.R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+            aws_access_key_id=settings.R2_ACCESS_KEY_ID,
+            aws_secret_access_key=settings.R2_SECRET_ACCESS_KEY,
+            config=Config(signature_version='s3v4'),
+        )
+        s3.upload_fileobj(
+            file.file, 
+            settings.R2_BUCKET_NAME, 
+            filename, 
+            ExtraArgs={'ContentType': file.content_type}
+        )
+        image_url = f"{settings.R2_PUBLIC_URL.rstrip('/')}/{filename}"
+    else:
+        # Fallback to local
+        upload_dir = "static/uploads/products"
+        os.makedirs(upload_dir, exist_ok=True)
+        file_path = os.path.join(upload_dir, filename)
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        image_url = f"/static/uploads/products/{filename}"
     db_product.image_url = image_url
     db.add(db_product)
     db.commit()
