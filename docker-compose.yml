@@ -36,3 +36,8 @@ services:
     command: celery -A app.core.celery_app worker --loglevel=info
     depends_on:
       - redis
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.core.celery_app inspect ping || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
