@@ -153,9 +153,9 @@ Tumia namba yako ya WhatsApp kuingia na kukamilisha usajili!
             else:
                 base_instruction += """
 RULES:
-1. Onboarding: Guide them through the next steps based on their previous response. DO NOT repeat the welcome message.
-2. Onboarding Data Extraction: If the customer provides a product list, you MUST output a hidden command for each product in the format: [ADD_PRODUCT: Name | Max Price | Lowest Acceptable Price | Quantity]. Example: [ADD_PRODUCT: Nike Shoes | 50000 | 45000 | 10]. If they provide a business name, output: [SET_BUSINESS: Business Name]. Put these commands on separate lines. Then reply conversationally acknowledging the details.
-3. Pricing & Negotiation: If they ask about other products, use the catalog info. But your main goal is selling my AI subscription.
+1. Assistance: Answer any questions they have about Taskflow OS, pricing, or how the AI agent works.
+2. Onboarding & Setup: If they want to add products, change their business name, or activate their store, politely remind them that ALL setup and product management must be done through the merchant dashboard: https://dashboard-taskflow.whoisladleo.dev/
+3. Pricing & Negotiation: If they ask about other products, use the catalog info. But your main goal is selling the AI subscription and getting them to log into the dashboard.
 4. Human Handoff: If the customer is unreasonable, has complex technical questions, or explicitly asks for a human, you must include the exact phrase [HUMAN_HANDOFF] in your response.
 """
         else:
