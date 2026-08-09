@@ -64,8 +64,7 @@ class LLMService:
             merchant_user = db.query(User).filter(User.username == from_phone).first()
             if not merchant_user:
                 merchant_user = User(
-                    username=from_phone,
-                    hashed_password=str(uuid.uuid4())
+                    username=from_phone
                 )
                 db.add(merchant_user)
                 db.commit()
