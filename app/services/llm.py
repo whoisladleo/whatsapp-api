@@ -247,8 +247,8 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
                 if not is_platform_account and account.owner:
                     merchant_phone = account.owner.username
                     alert_message = f"🚨 *HUMAN HANDOFF REQUIRED* 🚨\nA customer at {from_phone} needs your help!\n\n*Last AI message:* {response_text}"
-                    from app.services.whatsapp import WhatsAppProvider
-                    provider = WhatsAppProvider(account.access_token)
+                    from app.core.provider import WhatsAppProvider
+                    provider = WhatsAppProvider(account.access_token, account.phone_number_id)
                     import asyncio
                     asyncio.create_task(provider.send_text(merchant_phone, alert_message))
 
