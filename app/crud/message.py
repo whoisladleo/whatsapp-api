@@ -1,5 +1,5 @@
 from sqlalchemy.orm import Session
-from app.db.models import Message
+from app.db.models import Message, ConversationContext, ConversationState
 from typing import Dict, Any, List
 
 
@@ -47,3 +47,43 @@ def update_message_status(db: Session, whatsapp_message_id: str, status: str):
         {"status": status}
     )
     db.commit()
+
+
+def get_pending_handoffs_for_account(db: Session, account_id: int) -> List[Dict[str, Any]]:
+    """
+    Customers currently in ConversationState.HUMAN_HANDOFF whose most recent
+    inbound message belongs to this account. There is no direct
+    Customer/ConversationContext -> WhatsAppAccount link in the schema, so
+    the owning account is inferred from the latest inbound message, matching
+    the same inference used to route the handoff reminder task.
+    """
+    contexts = (
+        db.query(ConversationContext)
+        .filter(ConversationContext.state == ConversationState.HUMAN_HANDOFF)
+        .all()
+    )
+
+    results = []
+    for context in contexts:
+        customer = context.customer
+        if not customer:
+            continue
+
+        last_inbound = (
+            db.query(Message)
+            .filter(Message.from_phone == customer.phone_number, Message.direction == "inbound")
+            .order_by(Message.timestamp.desc())
+            .first()
+        )
+        if not last_inbound or last_inbound.account_id != account_id:
+            continue
+
+        results.append(
+            {
+                "customer_phone": customer.phone_number,
+                "handoff_at": context.handoff_at,
+                "last_message_body": last_inbound.body,
+            }
+        )
+
+    return results

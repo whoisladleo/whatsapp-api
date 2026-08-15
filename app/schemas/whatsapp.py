@@ -56,3 +56,9 @@ class MessageRead(BaseModel):
     timestamp: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class PendingHandoffRead(BaseModel):
+    customer_phone: str
+    handoff_at: Optional[datetime] = None
+    last_message_body: Optional[str] = None

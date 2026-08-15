@@ -19,6 +19,7 @@ from app.services.merchant_handler import handle_merchant_message
 from app.schemas.whatsapp import (
     MessageRead,
     MessageSend,
+    PendingHandoffRead,
     WhatsAppAccountCreate,
     WhatsAppAccountInDB,
     WhatsAppAccountUpdate,
@@ -281,6 +282,14 @@ async def handle_webhook(
                         print(f"Failed to forward webhook to {account.callback_url}: {e}")
 
     return {"status": "ok"}
+
+
+@router.get("/handoffs", response_model=list[PendingHandoffRead])
+def get_pending_handoffs(
+    account: WhatsAppAccount = Depends(get_whatsapp_account),
+    db: Session = Depends(get_db),
+):
+    return crud_message.get_pending_handoffs_for_account(db, account.id)
 
 
 @router.get("/messages", response_model=list[MessageRead])

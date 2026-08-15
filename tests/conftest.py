@@ -51,6 +51,19 @@ def _no_real_external_credentials(monkeypatch):
     monkeypatch.setattr(settings, "R2_PUBLIC_URL", None)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_celery_broker(monkeypatch):
+    """
+    Some request paths schedule follow-up work via Celery's apply_async(...)
+    at event time (e.g. the handoff reminder scheduled from llm.py). Without
+    a real broker, apply_async would attempt a real Redis connection. Stub
+    it to a no-op by default; a test that wants to assert scheduling
+    happened can re-patch it locally to something that records the call.
+    """
+    from app.tasks.handoff_reminders import send_handoff_reminder
+    monkeypatch.setattr(send_handoff_reminder, "apply_async", lambda *a, **kw: None)
+
+
 @pytest.fixture
 def db_session():
     session = TestingSessionLocal()

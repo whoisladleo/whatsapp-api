@@ -1,6 +1,14 @@
 import pytest
 
-from app.db.models import Product, User, WhatsAppAccount
+from app.db.models import (
+    ConversationContext,
+    ConversationState,
+    Customer,
+    Message,
+    Product,
+    User,
+    WhatsAppAccount,
+)
 from app.services.merchant_handler import handle_merchant_message
 
 
@@ -150,3 +158,88 @@ async def test_stock_lookup_is_scoped_to_merchant(db_session, merchant_account):
     )
 
     assert "not found" in reply
+
+
+async def _handed_off_customer(db_session, account, phone="255722223333"):
+    customer = Customer(phone_number=phone)
+    db_session.add(customer)
+    db_session.commit()
+    db_session.refresh(customer)
+
+    db_session.add(
+        Message(
+            from_phone=phone, type="text", body="need help",
+            direction="inbound", status="sent", account_id=account.id,
+        )
+    )
+    from datetime import datetime
+
+    context = ConversationContext(
+        customer_id=customer.id,
+        state=ConversationState.HUMAN_HANDOFF,
+        handoff_at=datetime.utcnow(),
+    )
+    db_session.add(context)
+    db_session.commit()
+    db_session.refresh(context)
+    return customer, context
+
+
+async def test_resume_missing_phone_shows_usage(db_session, merchant_account):
+    reply = await handle_merchant_message(db_session, merchant_account, "/resume", "255700000099")
+
+    assert "Usage" in reply
+
+
+async def test_resume_unknown_customer(db_session, merchant_account):
+    reply = await handle_merchant_message(
+        db_session, merchant_account, "/resume 255700000001", "255700000099"
+    )
+
+    assert "No conversation found" in reply
+
+
+async def test_resume_customer_with_no_history_on_this_account(db_session, merchant_account):
+    customer = Customer(phone_number="255722224444")
+    db_session.add(customer)
+    db_session.commit()
+
+    reply = await handle_merchant_message(
+        db_session, merchant_account, "/resume 255722224444", "255700000099"
+    )
+
+    assert "No conversation with 255722224444 found for this account" in reply
+
+
+async def test_resume_customer_not_in_handoff(db_session, merchant_account):
+    customer = Customer(phone_number="255722225555")
+    db_session.add(customer)
+    db_session.commit()
+    db_session.refresh(customer)
+    db_session.add(
+        Message(
+            from_phone="255722225555", type="text", body="hi",
+            direction="inbound", status="sent", account_id=merchant_account.id,
+        )
+    )
+    db_session.add(ConversationContext(customer_id=customer.id, state=ConversationState.NEGOTIATING))
+    db_session.commit()
+
+    reply = await handle_merchant_message(
+        db_session, merchant_account, "/resume 255722225555", "255700000099"
+    )
+
+    assert "not currently in a human handoff state" in reply
+
+
+async def test_resume_success(db_session, merchant_account):
+    customer, context = await _handed_off_customer(db_session, merchant_account)
+
+    reply = await handle_merchant_message(
+        db_session, merchant_account, f"/resume {customer.phone_number}", "255700000099"
+    )
+
+    db_session.refresh(context)
+    assert context.state == ConversationState.NEGOTIATING
+    assert context.handoff_at is None
+    assert "resumed" in reply.lower()

@@ -1,5 +1,3 @@
-import asyncio
-
 import httpx
 import pytest
 import respx
@@ -322,7 +320,9 @@ async def test_chat_history_included_and_empty_bodies_skipped(db_session, shop_a
 
 
 @respx.mock
-async def test_human_handoff_trigger_updates_state_and_alerts_merchant(db_session, shop_account, merchant, monkeypatch):
+async def test_human_handoff_trigger_updates_state_and_alerts_merchant(
+    db_session, shop_account, merchant, monkeypatch
+):
     alert_route = respx.post(url__regex=MESSAGES_URL_RE).mock(
         return_value=httpx.Response(200, json={"messages": [{"id": "wamid.alert"}]})
     )
@@ -332,8 +332,11 @@ async def test_human_handoff_trigger_updates_state_and_alerts_merchant(db_sessio
 
     service = _service_with_fake_client(handler=handoff_handler)
 
-    created_tasks = []
-    monkeypatch.setattr(asyncio, "create_task", lambda coro: created_tasks.append(coro))
+    scheduled = []
+    from app.tasks.handoff_reminders import send_handoff_reminder
+    monkeypatch.setattr(
+        send_handoff_reminder, "apply_async", lambda *a, **kw: scheduled.append((a, kw))
+    )
 
     result = await service.generate_response(
         message_body="I need a human",
@@ -348,20 +351,62 @@ async def test_human_handoff_trigger_updates_state_and_alerts_merchant(db_sessio
         ConversationContext.customer_id == customer.id
     ).first()
     assert context.state == ConversationState.HUMAN_HANDOFF
+    assert context.handoff_at is not None
 
-    assert len(created_tasks) == 1
-    await created_tasks[0]
     assert alert_route.called
     sent_body = alert_route.calls.last.request.content.decode()
     assert "255711116666" in sent_body
 
+    # The alert itself is logged as an outbound Message, unlike before.
+    alert_message = (
+        db_session.query(Message)
+        .filter(Message.to_phone == merchant.username, Message.direction == "outbound")
+        .first()
+    )
+    assert alert_message is not None
+    assert alert_message.status == "sent"
 
-async def test_human_handoff_with_empty_remaining_text_uses_default_message(db_session, shop_account, monkeypatch):
+    # A follow-up reminder is scheduled, keyed on the conversation context id.
+    assert len(scheduled) == 1
+    assert scheduled[0][0] == ([context.id],) or scheduled[0][1].get("args") == [context.id]
+
+
+@respx.mock
+async def test_human_handoff_alert_send_failure_is_logged_as_failed(db_session, shop_account, merchant):
+    respx.post(url__regex=MESSAGES_URL_RE).mock(return_value=httpx.Response(500))
+
+    async def handoff_handler(**kwargs):
+        return _FakeResponse("Let me get a human. [HUMAN_HANDOFF]")
+
+    service = _service_with_fake_client(handler=handoff_handler)
+
+    result = await service.generate_response(
+        message_body="I need a human",
+        from_phone="255711116667",
+        db=db_session,
+        account=shop_account,
+    )
+
+    assert result == "Let me get a human."
+    alert_message = (
+        db_session.query(Message)
+        .filter(Message.to_phone == merchant.username, Message.direction == "outbound")
+        .first()
+    )
+    assert alert_message is not None
+    assert alert_message.status in ("sent", "failed")
+
+
+@respx.mock
+async def test_human_handoff_with_empty_remaining_text_uses_default_message(db_session, shop_account):
+    respx.post(url__regex=MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "wamid.alert"}]})
+    )
+
     async def handoff_only_handler(**kwargs):
         return _FakeResponse("[HUMAN_HANDOFF]")
 
     service = _service_with_fake_client(handler=handoff_only_handler)
-    monkeypatch.setattr(asyncio, "create_task", lambda coro: coro.close())
 
     result = await service.generate_response(
         message_body="human please",
@@ -373,13 +418,11 @@ async def test_human_handoff_with_empty_remaining_text_uses_default_message(db_s
     assert result == "I am transferring you to a human agent who can help you further. Please hold."
 
 
-async def test_platform_account_handoff_does_not_alert_merchant(db_session, platform_account, monkeypatch):
+async def test_platform_account_handoff_does_not_alert_merchant(db_session, platform_account):
     async def handoff_handler(**kwargs):
         return _FakeResponse("[HUMAN_HANDOFF]")
 
     service = _service_with_fake_client(handler=handoff_handler)
-    created_tasks = []
-    monkeypatch.setattr(asyncio, "create_task", lambda coro: created_tasks.append(coro))
 
     await service.generate_response(
         message_body="human please",
@@ -388,7 +431,42 @@ async def test_platform_account_handoff_does_not_alert_merchant(db_session, plat
         account=platform_account,
     )
 
-    assert created_tasks == []
+    alert_message = (
+        db_session.query(Message)
+        .filter(Message.direction == "outbound")
+        .first()
+    )
+    assert alert_message is None
+
+
+@respx.mock
+async def test_human_handoff_schedule_failure_does_not_break_reply(
+    db_session, shop_account, merchant, monkeypatch
+):
+    respx.post(url__regex=MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "wamid.alert"}]})
+    )
+
+    async def handoff_handler(**kwargs):
+        return _FakeResponse("Let me get a human. [HUMAN_HANDOFF]")
+
+    service = _service_with_fake_client(handler=handoff_handler)
+
+    from app.tasks.handoff_reminders import send_handoff_reminder
+
+    def raising_apply_async(*a, **kw):
+        raise RuntimeError("broker unreachable")
+
+    monkeypatch.setattr(send_handoff_reminder, "apply_async", raising_apply_async)
+
+    result = await service.generate_response(
+        message_body="I need a human",
+        from_phone="255711116669",
+        db=db_session,
+        account=shop_account,
+    )
+
+    assert result == "Let me get a human."
 
 
 async def test_generate_content_exception_returns_fallback_message(db_session, shop_account):

@@ -3,6 +3,7 @@ from google.genai import types
 import os
 import re
 import uuid
+from datetime import datetime
 from typing import List, Optional
 from app.core.config import settings
 from sqlalchemy.orm import Session
@@ -201,17 +202,46 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
             # 2. Human Handoff
             if "[HUMAN_HANDOFF]" in response_text:
                 context.state = ConversationState.HUMAN_HANDOFF
+                context.handoff_at = datetime.utcnow()
                 db.commit()
                 response_text = response_text.replace("[HUMAN_HANDOFF]", "").strip()
-                
+
                 # Alert the merchant
                 if not is_platform_account and account.owner:
                     merchant_phone = account.owner.username
                     alert_message = f"🚨 *HUMAN HANDOFF REQUIRED* 🚨\nA customer at {from_phone} needs your help!\n\n*Last AI message:* {response_text}"
                     from app.core.provider import WhatsAppProvider
                     provider = WhatsAppProvider(account.access_token, account.phone_number_id)
-                    import asyncio
-                    asyncio.create_task(provider.send_text(merchant_phone, alert_message))
+                    try:
+                        alert_resp = await provider.send_text(merchant_phone, alert_message)
+                    except Exception as alert_err:
+                        print(f"Failed to send handoff alert to merchant: {alert_err}")
+                        alert_resp = None
+
+                    from app.crud import message as crud_message
+                    crud_message.create_message(
+                        db,
+                        {
+                            "to_phone": merchant_phone,
+                            "type": "text",
+                            "body": alert_message,
+                            "direction": "outbound",
+                            "status": "sent" if alert_resp else "failed",
+                            "raw": alert_resp or {},
+                        },
+                        account.id,
+                    )
+
+                    from app.tasks.handoff_reminders import (
+                        send_handoff_reminder,
+                        HANDOFF_REMINDER_DELAY_SECONDS,
+                    )
+                    try:
+                        send_handoff_reminder.apply_async(
+                            args=[context.id], countdown=HANDOFF_REMINDER_DELAY_SECONDS
+                        )
+                    except Exception as sched_err:
+                        print(f"Failed to schedule handoff reminder: {sched_err}")
 
                 if not response_text:
                     response_text = "I am transferring you to a human agent who can help you further. Please hold."

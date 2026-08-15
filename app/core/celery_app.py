@@ -8,7 +8,7 @@ celery_app = Celery(
     "taskflow",
     broker=broker_url,
     backend=result_backend,
-    include=["app.tasks.order_reminders"]
+    include=["app.tasks.order_reminders", "app.tasks.handoff_reminders"]
 )
 
 celery_app.conf.update(

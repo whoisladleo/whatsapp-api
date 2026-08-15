@@ -181,6 +181,7 @@ class ConversationContext(Base):
     failed_cycles = Column(Integer, default=0)
     current_product_intent = Column(String, nullable=True)
     last_offer = Column(Float, nullable=True)
+    handoff_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
