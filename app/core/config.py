@@ -31,6 +31,10 @@ class Settings(BaseSettings):
     WHATSAPP_VERSION: str = "v25.0"
     WHATSAPP_BASE_URL: str = "https://graph.facebook.com"
     WEBHOOK_VERIFY_TOKEN: Optional[str] = None
+    # Meta App Secret, used to verify the X-Hub-Signature-256 header on
+    # incoming webhook POSTs. If unset, signature verification is skipped
+    # (with a warning) rather than rejecting all webhook traffic.
+    WHATSAPP_APP_SECRET: Optional[str] = None
 
     # LLM
     GOOGLE_API_KEY: Optional[str] = None

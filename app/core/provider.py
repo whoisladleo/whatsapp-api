@@ -76,7 +76,7 @@ class WhatsAppProvider:
             "messaging_product": "whatsapp",
             "to": to,
             "type": media_type,
-            [media_type]: {"id": media_id},
+            media_type: {"id": media_id},
         }
         if caption:
             payload[media_type]["caption"] = caption

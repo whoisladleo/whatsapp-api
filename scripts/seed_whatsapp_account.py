@@ -24,7 +24,7 @@ def seed_test_account():
         user = db.query(User).first()
         if not user:
             print("No user found. Creating a dummy owner user...")
-            user = User(username="admin", hashed_password="hashed_password_dummy")
+            user = User(username="admin")
             db.add(user)
             db.commit()
             db.refresh(user)

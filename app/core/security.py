@@ -1,5 +1,10 @@
 from datetime import datetime, timedelta
-from typing import Any, Union
+from typing import Any, Optional, Union
+import hashlib
+import hmac
+import ipaddress
+import socket
+from urllib.parse import urlparse
 import jwt
 import secrets
 from app.core.config import settings
@@ -24,3 +29,39 @@ def create_access_token(
 def generate_otp(length: int = 6) -> str:
     """Generates a secure numeric OTP of the specified length."""
     return ''.join(str(secrets.randbelow(10)) for _ in range(length))
+
+
+def verify_meta_signature(raw_body: bytes, signature_header: Optional[str]) -> bool:
+    """Verifies Meta's X-Hub-Signature-256 header against the raw webhook body."""
+    if not signature_header or not signature_header.startswith("sha256="):
+        return False
+    expected = hmac.new(
+        settings.WHATSAPP_APP_SECRET.encode(), raw_body, hashlib.sha256
+    ).hexdigest()
+    provided = signature_header.removeprefix("sha256=")
+    return hmac.compare_digest(expected, provided)
+
+
+def is_safe_external_url(url: str) -> bool:
+    """
+    Rejects URLs pointing at loopback/private/link-local/reserved addresses,
+    to guard outbound requests (e.g. account callback_url forwarding) against SSRF.
+    """
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return False
+        for family, _, _, _, sockaddr in socket.getaddrinfo(parsed.hostname, None):
+            ip = ipaddress.ip_address(sockaddr[0])
+            if (
+                ip.is_private
+                or ip.is_loopback
+                or ip.is_link_local
+                or ip.is_reserved
+                or ip.is_multicast
+                or ip.is_unspecified
+            ):
+                return False
+        return True
+    except Exception:
+        return False

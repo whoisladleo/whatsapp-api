@@ -8,6 +8,7 @@ from app.db.session import get_db
 from app.db.models import User, WhatsAppAccount
 from app.core.config import settings
 from app.core.provider import WhatsAppProvider
+from app.core.security import is_safe_external_url, verify_meta_signature
 import httpx
 from app.core.webhook_parser import WebhookParser
 from app.crud import message as crud_message
@@ -33,12 +34,13 @@ from app.api.deps import get_current_user
 
 async def get_whatsapp_account(
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
     whatsapp_account_id: Optional[str] = Header(None, alias="X-WhatsApp-Account-ID"),
     x_account_id: Optional[str] = Header(None, alias="X-Account-ID"),
     x_account_id_query: Optional[str] = Query(None, alias="X-Account-ID"),
 ) -> WhatsAppAccount:
     account_id = whatsapp_account_id or x_account_id or x_account_id_query
-    
+
     if not account_id:
         raise HTTPException(status_code=400, detail="WhatsApp Account ID is required via header (X-WhatsApp-Account-ID) or query param")
 
@@ -46,7 +48,7 @@ async def get_whatsapp_account(
 
     # Try matching by internal ID (if numeric and small enough) or phone_number_id
     is_numeric = str(account_id).isdigit()
-    
+
     if is_numeric and len(str(account_id)) < 10:  # Safe bound for 32-bit int to prevent Postgres out-of-range errors
         account = query.filter(
             (WhatsAppAccount.id == int(account_id))
@@ -57,7 +59,9 @@ async def get_whatsapp_account(
             WhatsAppAccount.phone_number_id == str(account_id)
         ).first()
 
-    if not account:
+    # Scope to the authenticated user's own accounts; 404 (not 403) to avoid
+    # leaking whether an account id/phone_number_id exists for another user.
+    if not account or account.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="WhatsApp account not found")
     return account
 
@@ -155,7 +159,22 @@ async def verify_webhook(
 
 
 @router.post("/webhook")
-async def handle_webhook(request: Request, db: Session = Depends(get_db)):
+async def handle_webhook(
+    request: Request,
+    db: Session = Depends(get_db),
+    x_hub_signature_256: Optional[str] = Header(None, alias="X-Hub-Signature-256"),
+):
+    raw_body = await request.body()
+
+    if settings.WHATSAPP_APP_SECRET:
+        if not verify_meta_signature(raw_body, x_hub_signature_256):
+            raise HTTPException(status_code=403, detail="Invalid webhook signature")
+    else:
+        print(
+            "WARNING: WHATSAPP_APP_SECRET is not configured; skipping webhook "
+            "signature verification. Set it to prevent spoofed webhook payloads."
+        )
+
     data = await request.json()
     parsed_items = WebhookParser.parse_inbound(data)
 
@@ -250,11 +269,16 @@ async def handle_webhook(request: Request, db: Session = Depends(get_db)):
 
         # 3. Forward to callback if configured
         if account.callback_url:
-            async with httpx.AsyncClient() as client:
-                try:
-                    await client.post(account.callback_url, json=item, timeout=5.0)
-                except Exception as e:
-                    print(f"Failed to forward webhook to {account.callback_url}: {e}")
+            if not is_safe_external_url(account.callback_url):
+                print(
+                    f"Skipping forward to unsafe callback_url: {account.callback_url}"
+                )
+            else:
+                async with httpx.AsyncClient() as client:
+                    try:
+                        await client.post(account.callback_url, json=item, timeout=5.0)
+                    except Exception as e:
+                        print(f"Failed to forward webhook to {account.callback_url}: {e}")
 
     return {"status": "ok"}
 

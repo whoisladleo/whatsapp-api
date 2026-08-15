@@ -16,14 +16,16 @@ app = FastAPI(
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # CORS Middleware
+# Credentialed requests require an explicit origin allowlist per the CORS spec
+# (browsers reject "allow-origin: *" combined with "allow-credentials: true"),
+# so only enable credentials when explicit origins are configured.
+_cors_origins = [
+    str(origin).rstrip("/") for origin in settings.BACKEND_CORS_ORIGINS
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=(
-        [str(origin).rstrip("/") for origin in settings.BACKEND_CORS_ORIGINS]
-        if settings.BACKEND_CORS_ORIGINS
-        else ["*"]
-    ),
-    allow_credentials=True,
+    allow_origins=_cors_origins if _cors_origins else ["*"],
+    allow_credentials=bool(_cors_origins),
     allow_methods=["*"],
     allow_headers=["*"],
 )

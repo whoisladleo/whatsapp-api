@@ -5,6 +5,7 @@ from datetime import timedelta, datetime
 from app.db.session import get_db
 from app.core import security
 from app.core.config import settings
+from app.core.rate_limit import check_and_increment
 from app.schemas.auth import Token, OTPRequest, OTPVerify
 from app.crud import user as crud_user
 from app.core.provider import WhatsAppProvider
@@ -26,12 +27,18 @@ async def request_otp(
     db: Session = Depends(get_db)
 ):
     phone_number = otp_data.username.strip()
-    
+
+    if not check_and_increment(f"otp_req:{phone_number}", limit=3, window_seconds=300):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many OTP requests. Please wait a few minutes and try again.",
+        )
+
     # Pre-onboarding: Create user if they don't exist
     user = crud_user.get_user_by_username(db, phone_number)
     if not user:
         user = crud_user.create_user(db, username=phone_number)
-        
+
     # Generate OTP
     otp_code = security.generate_otp(6)
     expires_at = datetime.utcnow() + timedelta(minutes=5)
@@ -50,8 +57,15 @@ def verify_otp(
     db: Session = Depends(get_db)
 ):
     phone_number = otp_data.username.strip()
+
+    if not check_and_increment(f"otp_verify:{phone_number}", limit=5, window_seconds=300):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many attempts. Please request a new OTP.",
+        )
+
     user = crud_user.get_user_by_username(db, phone_number)
-    
+
     if not user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
