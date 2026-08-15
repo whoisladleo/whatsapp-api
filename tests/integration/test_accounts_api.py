@@ -1,0 +1,137 @@
+import httpx
+import pytest
+import respx
+
+from app.core.security import create_access_token
+from app.db.models import User
+
+BASE = "/api/v1/accounts"
+VALIDATE_URL_RE = r"https://graph\.facebook\.com/.+/PHONE1$"
+
+
+@pytest.fixture
+def other_user_headers(db_session):
+    other = User(username="255700000040")
+    db_session.add(other)
+    db_session.commit()
+    db_session.refresh(other)
+    return {"Authorization": f"Bearer {create_access_token(other.id)}"}
+
+
+def _account_payload(**overrides):
+    payload = {
+        "name": "My Shop",
+        "phone_number_id": "PHONE1",
+        "access_token": "meta-token",
+    }
+    payload.update(overrides)
+    return payload
+
+
+@respx.mock
+def test_create_account_validates_credentials_and_persists(client, auth_user):
+    _, headers = auth_user
+    route = respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
+
+    resp = client.post(BASE, json=_account_payload(), headers=headers)
+
+    assert resp.status_code == 201
+    assert route.called
+    body = resp.json()
+    assert body["phone_number_id"] == "PHONE1"
+    assert "access_token" not in body
+
+
+@respx.mock
+def test_create_account_rejects_invalid_credentials(client, auth_user):
+    _, headers = auth_user
+    respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(401))
+
+    resp = client.post(BASE, json=_account_payload(), headers=headers)
+
+    assert resp.status_code == 400
+
+
+@respx.mock
+def test_create_account_rejects_when_validation_request_errors(client, auth_user):
+    _, headers = auth_user
+    respx.get(url__regex=VALIDATE_URL_RE).mock(side_effect=httpx.ConnectError("boom"))
+
+    resp = client.post(BASE, json=_account_payload(), headers=headers)
+
+    assert resp.status_code == 400
+
+
+def test_create_account_requires_auth(client):
+    resp = client.post(BASE, json=_account_payload())
+
+    assert resp.status_code in (401, 403)
+
+
+@respx.mock
+def test_list_accounts_scoped_to_current_user(client, auth_user, other_user_headers):
+    _, headers = auth_user
+    respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
+    respx.get(url__regex=r"https://graph\.facebook\.com/.+/PHONE2$").mock(
+        return_value=httpx.Response(200)
+    )
+
+    client.post(BASE, json=_account_payload(name="Mine"), headers=headers)
+    client.post(
+        BASE,
+        json=_account_payload(name="Theirs", phone_number_id="PHONE2"),
+        headers=other_user_headers,
+    )
+
+    resp = client.get(BASE, headers=headers)
+
+    assert resp.status_code == 200
+    names = [a["name"] for a in resp.json()]
+    assert names == ["Mine"]
+
+
+@respx.mock
+def test_update_account_without_credential_change_skips_validation(client, auth_user):
+    _, headers = auth_user
+    respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
+    created = client.post(BASE, json=_account_payload(), headers=headers).json()
+
+    resp = client.put(
+        f"{BASE}/{created['id']}", json={"name": "Renamed"}, headers=headers
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["name"] == "Renamed"
+
+
+@respx.mock
+def test_update_account_not_found_for_other_user(client, auth_user, other_user_headers):
+    _, headers = auth_user
+    respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
+    created = client.post(BASE, json=_account_payload(), headers=headers).json()
+
+    resp = client.put(
+        f"{BASE}/{created['id']}", json={"name": "Hijacked"}, headers=other_user_headers
+    )
+
+    assert resp.status_code == 404
+
+
+@respx.mock
+def test_update_account_revalidates_when_token_changes(client, auth_user):
+    _, headers = auth_user
+    respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
+    created = client.post(BASE, json=_account_payload(), headers=headers).json()
+
+    revalidate_route = respx.get(url__regex=VALIDATE_URL_RE).mock(
+        return_value=httpx.Response(401)
+    )
+
+    resp = client.put(
+        f"{BASE}/{created['id']}",
+        json={"access_token": "new-bad-token"},
+        headers=headers,
+    )
+
+    assert resp.status_code == 400
+    assert revalidate_route.called

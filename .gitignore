@@ -56,6 +56,11 @@ Thumbs.db
 *.db
 *.sqlite3
 
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+
 # Alembic
 alembic/versions/__pycache__/
 
