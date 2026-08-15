@@ -319,7 +319,11 @@ async def send_message(
                 "whatsapp_message_id": msg_id,
                 "to_phone": msg.to,
                 "type": msg.type,
-                "body": msg.text_body or msg.template_name or msg.media_id,
+                "body": (
+                    msg.template_name if msg.type == "template" else
+                    msg.text_body if msg.type == "text" else
+                    msg.media_id
+                ),
                 "direction": "outbound",
                 "status": "sent",
                 "raw": response,
