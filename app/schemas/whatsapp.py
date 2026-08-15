@@ -15,7 +15,10 @@ class WhatsAppAccountBase(BaseModel):
 
 
 class WhatsAppAccountCreate(WhatsAppAccountBase):
-    pass
+    # Optional here (unlike the base): omit both to auto-assign a number
+    # from the pool, or supply both to bring your own Meta credentials.
+    phone_number_id: Optional[str] = None
+    access_token: Optional[str] = None
 
 
 class WhatsAppAccountUpdate(BaseModel):

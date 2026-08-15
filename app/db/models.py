@@ -27,6 +27,11 @@ class ConversationState(enum.Enum):
     HUMAN_HANDOFF = "HUMAN_HANDOFF"
     MANAGEMENT = "MANAGEMENT"
 
+class PhoneNumberStatus(enum.Enum):
+    AVAILABLE = "AVAILABLE"
+    ASSIGNED = "ASSIGNED"
+    RELEASED = "RELEASED"
+
 class User(Base):
     __tablename__ = "users"
 
@@ -75,6 +80,21 @@ class WhatsAppAccount(Base):
     owner = relationship("User", back_populates="accounts")
     media = relationship("MediaEntry", back_populates="account")
     messages = relationship("Message", back_populates="account")
+
+
+class PhoneNumberPool(Base):
+    __tablename__ = "phone_number_pool"
+
+    id = Column(Integer, primary_key=True, index=True)
+    phone_number_id = Column(String, unique=True, index=True, nullable=False)
+    display_name = Column(String, nullable=True)  # plain reference label, e.g. "Taskflow Store #4"
+    status = Column(Enum(PhoneNumberStatus), default=PhoneNumberStatus.AVAILABLE, nullable=False)
+    whatsapp_account_id = Column(Integer, ForeignKey("whatsapp_accounts.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    assigned_at = Column(DateTime, nullable=True)
+    released_at = Column(DateTime, nullable=True)
+
+    whatsapp_account = relationship("WhatsAppAccount")
 
 
 class MediaEntry(Base):

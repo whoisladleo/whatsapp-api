@@ -1,7 +1,8 @@
 import pytest
 
+from app.core.config import settings
 from app.core.security import create_access_token
-from app.db.models import User, WhatsAppAccount
+from app.db.models import PhoneNumberPool, User, WhatsAppAccount
 
 BASE = "/api/v1/whatsapp/accounts"
 
@@ -126,3 +127,54 @@ def test_messages_endpoint_missing_account_id_returns_400(client, owner_headers)
     resp = client.get("/api/v1/whatsapp/messages", headers=owner_headers)
 
     assert resp.status_code == 400
+
+
+def test_create_account_auto_assigns_from_pool_when_credentials_omitted(
+    client, owner_headers, db_session, monkeypatch
+):
+    monkeypatch.setattr(settings, "WHATSAPP_POOL_ACCESS_TOKEN", "platform-token")
+    db_session.add(PhoneNumberPool(phone_number_id="POOL_API_1"))
+    db_session.commit()
+
+    resp = client.post(BASE, json={"name": "Auto Shop"}, headers=owner_headers)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["phone_number_id"] == "POOL_API_1"
+    assert body["access_token"] == "platform-token"
+
+
+def test_create_account_pool_exhausted_returns_409(client, owner_headers):
+    resp = client.post(BASE, json={"name": "No Pool Shop"}, headers=owner_headers)
+
+    assert resp.status_code == 409
+
+
+def test_create_account_partial_credentials_returns_400(client, owner_headers):
+    resp = client.post(
+        BASE,
+        json={"name": "Half Creds Shop", "phone_number_id": "ONLY_PHONE"},
+        headers=owner_headers,
+    )
+
+    assert resp.status_code == 400
+
+
+def test_delete_account_releases_pool_number(
+    client, owner_headers, db_session, monkeypatch
+):
+    monkeypatch.setattr(settings, "WHATSAPP_POOL_ACCESS_TOKEN", "platform-token")
+    db_session.add(PhoneNumberPool(phone_number_id="POOL_API_2"))
+    db_session.commit()
+    created = client.post(BASE, json={"name": "Auto Shop 2"}, headers=owner_headers).json()
+
+    resp = client.delete(f"{BASE}/{created['id']}", headers=owner_headers)
+
+    assert resp.status_code == 200
+    pool_row = (
+        db_session.query(PhoneNumberPool)
+        .filter(PhoneNumberPool.phone_number_id == "POOL_API_2")
+        .first()
+    )
+    assert pool_row.status.value == "RELEASED"
+    assert pool_row.whatsapp_account_id is None

@@ -35,6 +35,12 @@ class Settings(BaseSettings):
     # incoming webhook POSTs. If unset, signature verification is skipped
     # (with a warning) rather than rejecting all webhook traffic.
     WHATSAPP_APP_SECRET: Optional[str] = None
+    # Shared platform-level access token used for numbers auto-assigned from
+    # the phone number pool (see PhoneNumberPool) — these all sit under
+    # Taskflow's own Meta Business Manager, so one System User token covers
+    # every pooled phone_number_id. Businesses that bring their own number
+    # (BYON) still supply their own access_token at account-creation time.
+    WHATSAPP_POOL_ACCESS_TOKEN: Optional[str] = None
 
     # LLM
     GOOGLE_API_KEY: Optional[str] = None

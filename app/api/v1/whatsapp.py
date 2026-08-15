@@ -73,7 +73,18 @@ def create_account(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    account = crud_account.create_whatsapp_account(db, account_in, current_user.id)
+    try:
+        account = crud_account.create_whatsapp_account(db, account_in, current_user.id)
+    except crud_account.PartialWhatsAppCredentialsError:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide both phone_number_id and access_token, or omit both to auto-assign a number from the pool.",
+        )
+    except crud_account.PhonePoolExhaustedError:
+        raise HTTPException(
+            status_code=409,
+            detail="No WhatsApp numbers are currently available in the pool. Try again shortly, or provide your own phone_number_id/access_token.",
+        )
     if not account:
         raise HTTPException(
             status_code=400, detail="WhatsApp account with this ID already exists"
