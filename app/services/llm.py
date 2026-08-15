@@ -6,6 +6,7 @@ import uuid
 from datetime import datetime
 from typing import List, Optional
 from app.core.config import settings
+from app.core.security import normalize_phone
 from sqlalchemy.orm import Session
 from app.db.models import Customer, ConversationContext, ConversationState, Product, WhatsAppAccount, Message, User
 
@@ -37,9 +38,15 @@ class LLMService:
             return "AI service is currently unavailable."
             
         # 1. Fetch customer & context
-        customer = db.query(Customer).filter(Customer.phone_number == from_phone).first()
+        # Comparisons/creation use the normalized form so numbers that reach
+        # us in different formats (e.g. leading-0 vs 255 country code) still
+        # resolve to the same Customer going forward — see
+        # app.core.security.normalize_phone for why storage itself isn't
+        # touched, only lookups/writes made from here on.
+        normalized_from_phone = normalize_phone(from_phone)
+        customer = db.query(Customer).filter(Customer.phone_number == normalized_from_phone).first()
         if not customer:
-            customer = Customer(phone_number=from_phone)
+            customer = Customer(phone_number=normalized_from_phone)
             db.add(customer)
             db.commit()
             db.refresh(customer)
@@ -61,11 +68,17 @@ class LLMService:
         
         merchant_user = None
         if is_platform_account:
-            # The person texting IS the merchant
-            merchant_user = db.query(User).filter(User.username == from_phone).first()
+            # The person texting IS the merchant. Note: this normalizes for
+            # lookup/creation here, but app/api/v1/auth.py's OTP login does
+            # not normalize `username` — a merchant created via this path
+            # with one phone format could theoretically fail to match a
+            # differently-formatted login attempt. Fixing that fully would
+            # mean normalizing auth.py's username handling too, which is
+            # out of scope for this change.
+            merchant_user = db.query(User).filter(User.username == normalized_from_phone).first()
             if not merchant_user:
                 merchant_user = User(
-                    username=from_phone
+                    username=normalized_from_phone
                 )
                 db.add(merchant_user)
                 db.commit()

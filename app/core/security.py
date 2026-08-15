@@ -3,6 +3,7 @@ from typing import Any, Optional, Union
 import hashlib
 import hmac
 import ipaddress
+import re
 import socket
 from urllib.parse import urlparse
 import jwt
@@ -40,6 +41,24 @@ def verify_meta_signature(raw_body: bytes, signature_header: Optional[str]) -> b
     ).hexdigest()
     provided = signature_header.removeprefix("sha256=")
     return hmac.compare_digest(expected, provided)
+
+
+def normalize_phone(phone: Optional[str]) -> Optional[str]:
+    """
+    Normalizes a phone number for comparison purposes only — this does not
+    change how numbers are stored anywhere, it's meant to be applied to both
+    sides of a comparison so "0712..." and "255712..." (the two formats this
+    codebase's WhatsApp-supplied numbers and manually-entered numbers most
+    commonly disagree on for Tanzanian numbers) compare equal. Strips all
+    non-digit characters, then collapses a leading local trunk-prefix "0"
+    into the "255" country code.
+    """
+    if not phone:
+        return phone
+    digits = re.sub(r"\D", "", phone)
+    if digits.startswith("0"):
+        digits = "255" + digits[1:]
+    return digits
 
 
 def is_safe_external_url(url: str) -> bool:

@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from typing import Optional
 import jwt
 from app.db.session import get_db
-from app.db.models import User, WhatsAppAccount
+from app.db.models import Message, User, WhatsAppAccount
 from app.core.config import settings
 from app.core.provider import WhatsAppProvider
 from app.core.security import is_safe_external_url, verify_meta_signature
@@ -13,9 +13,7 @@ import httpx
 from app.core.webhook_parser import WebhookParser
 from app.crud import message as crud_message
 from app.crud import whatsapp as crud_account
-from app.services.llm import llm_service
-from app.crud import knowledge as crud_knowledge
-from app.services.merchant_handler import handle_merchant_message
+from app.tasks.webhook_processing import process_inbound_message
 from app.schemas.whatsapp import (
     MessageRead,
     MessageSend,
@@ -202,95 +200,66 @@ async def handle_webhook(
         if not account:
             continue
 
-        # 1. Update status or Create new message
+        # Captured up front rather than read off `account` further down:
+        # dispatching process_inbound_message can (in tests, where Celery
+        # runs it eagerly/inline and it shares this request's DB session)
+        # close that session before this loop body finishes, which would
+        # detach `account` and make later attribute access raise
+        # DetachedInstanceError. In production the task uses its own
+        # independent session, so this wouldn't happen either way — but
+        # capturing plain values here is correct and cheap regardless.
+        account_id = account.id
+        account_ai_enabled = account.ai_enabled
+        account_callback_url = account.callback_url
+
+        # 1. Update status, or create the inbound message (deduping Meta
+        # retries of a delivery we've already processed — skip re-creating
+        # it and re-triggering AI/merchant processing/callback forwarding
+        # for it entirely).
         if item.get("event") == "status_update":
             crud_message.update_message_status(
                 db, item["whatsapp_message_id"], item["status"]
             )
         else:
-            crud_message.create_message(db, item, account.id)
-
-        # 2. Routing Logic
-        if (
-            item.get("direction") == "inbound"
-            and account.ai_enabled
-            and item.get("type") == "text"
-        ):
-            from_phone = item.get("from_phone")
-            message_body = item.get("body")
-            
-            # Simple merchant check: is the from_phone the owner's username?
-            # Assuming owner username is their phone number for the MVP.
-            is_merchant = (from_phone == account.owner.username)
-            
-            response_text = None
-            
-            if is_merchant:
-                # Route to Merchant Catalog Management
-                response_text = await handle_merchant_message(db, account, message_body, from_phone)
-            elif llm_service:
-                # Route to Customer AI Sales Engine
-                knowledge_content = None
-                if account.product_slug:
-                    kb = crud_knowledge.get_knowledge_base_by_slug(
-                        db, account.product_slug, account.user_id
-                    )
-                    if kb:
-                        knowledge_content = kb.content
-
-                response_text = await llm_service.generate_response(
-                    message_body=message_body,
-                    product_slug=account.product_slug,
-                    knowledge_content=knowledge_content,
-                    system_prompt=account.system_prompt,
-                    from_phone=from_phone,
-                    db=db,
-                    account=account
+            whatsapp_message_id = item.get("whatsapp_message_id")
+            if whatsapp_message_id:
+                already_processed = (
+                    db.query(Message)
+                    .filter(Message.whatsapp_message_id == whatsapp_message_id)
+                    .first()
+                    is not None
                 )
+                if already_processed:
+                    continue
 
-            # Send the response back
-            if response_text:
-                provider = WhatsAppProvider(account.access_token, account.phone_number_id)
-                resp = await provider.send_text(from_phone, response_text)
-                
-                if resp and "messages" in resp:
-                    # Meta API succeeded
-                    msg_id = resp["messages"][0].get("id")
-                    status = "sent"
-                else:
-                    # Meta API failed, but we still want to log the AI's response in our DB
-                    import uuid
-                    msg_id = f"failed_{uuid.uuid4().hex[:8]}"
-                    status = "failed"
-                    print(f"WhatsApp API Error: {resp}")
+            crud_message.create_message(db, item, account_id)
 
-                crud_message.create_message(
-                    db,
-                    {
-                        "whatsapp_message_id": msg_id,
-                        "to_phone": from_phone,
-                        "type": "text",
-                        "body": response_text,
-                        "direction": "outbound",
-                        "status": status,
-                        "raw": resp if resp else {},
-                    },
-                    account.id,
+            # 2. Routing logic — dispatched to a background task rather than
+            # awaited here, so a slow Gemini call or WhatsApp send can't
+            # hold up Meta's webhook ACK (which risks a retried delivery).
+            # Merchant-vs-customer routing, per-customer locking, and rate
+            # limiting all live inside the task (app/tasks/webhook_processing.py).
+            if (
+                item.get("direction") == "inbound"
+                and account_ai_enabled
+                and item.get("type") == "text"
+            ):
+                process_inbound_message.apply_async(
+                    args=[account_id, item.get("from_phone"), item.get("body")]
                 )
-
 
         # 3. Forward to callback if configured
-        if account.callback_url:
-            if not is_safe_external_url(account.callback_url):
+        if account_callback_url:
+            if not is_safe_external_url(account_callback_url):
                 print(
-                    f"Skipping forward to unsafe callback_url: {account.callback_url}"
+                    f"Skipping forward to unsafe callback_url: {account_callback_url}"
                 )
             else:
                 async with httpx.AsyncClient() as client:
                     try:
-                        await client.post(account.callback_url, json=item, timeout=5.0)
+                        await client.post(account_callback_url, json=item, timeout=5.0)
                     except Exception as e:
-                        print(f"Failed to forward webhook to {account.callback_url}: {e}")
+                        print(f"Failed to forward webhook to {account_callback_url}: {e}")
 
     return {"status": "ok"}
 

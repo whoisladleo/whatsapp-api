@@ -138,6 +138,52 @@ async def test_creates_customer_and_context_on_first_contact(db_session, shop_ac
     assert context.state == ConversationState.NEGOTIATING
 
 
+async def test_customer_lookup_normalizes_phone_across_formats(db_session, shop_account):
+    """
+    A customer messaging with a leading-0 number should resolve to the same
+    Customer row as one already stored in 255-country-code form — this is
+    the normalize_phone fix applied to the Customer lookup/creation point.
+    """
+    existing = Customer(phone_number="255722223333")
+    db_session.add(existing)
+    db_session.commit()
+    db_session.refresh(existing)
+
+    service = _service_with_fake_client()
+
+    await service.generate_response(
+        message_body="hello again",
+        from_phone="0722223333",
+        db=db_session,
+        account=shop_account,
+    )
+
+    assert db_session.query(Customer).count() == 1
+    assert db_session.query(Customer).filter(Customer.phone_number == "255722223333").one().id == existing.id
+
+
+async def test_platform_merchant_user_lookup_normalizes_phone_across_formats(
+    db_session, platform_account
+):
+    existing = User(username="255733334444")
+    db_session.add(existing)
+    db_session.commit()
+    db_session.refresh(existing)
+
+    service = _service_with_fake_client()
+
+    await service.generate_response(
+        message_body="hi",
+        from_phone="0733334444",
+        db=db_session,
+        account=platform_account,
+    )
+
+    # No new merchant_user row created for a differently-formatted version
+    # of the same existing username.
+    assert db_session.query(User).filter(User.username == "255733334444").count() == 1
+
+
 async def test_regular_account_catalog_uses_account_owner_products(db_session, shop_account, merchant):
     db_session.add(
         Product(slug="shoes", name="Shoes", max_price=50000, min_price=40000, quantity=3, merchant_id=merchant.id)

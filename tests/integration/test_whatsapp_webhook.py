@@ -160,15 +160,16 @@ def test_inbound_message_from_customer_routes_to_ai(client, db_session, merchant
     # Replace the whole module-level `llm_service` reference (not just a
     # method on the real singleton) so this test doesn't depend on whether
     # GOOGLE_API_KEY happens to be set in the environment — in CI it's
-    # unset, which makes the real `llm_service` None.
-    import app.api.v1.whatsapp as whatsapp_module
-    original = whatsapp_module.llm_service
-    whatsapp_module.llm_service = FakeLLMService()
+    # unset, which makes the real `llm_service` None. AI processing now
+    # happens inside the webhook_processing task module, not whatsapp.py.
+    import app.tasks.webhook_processing as webhook_processing_module
+    original = webhook_processing_module.llm_service
+    webhook_processing_module.llm_service = FakeLLMService()
     try:
         payload = _text_webhook_payload("PHONE_AI", "255711111111", "Hi, I want shoes")
         resp = client.post(WEBHOOK_URL, json=payload)
     finally:
-        whatsapp_module.llm_service = original
+        webhook_processing_module.llm_service = original
 
     assert resp.status_code == 200
     assert called_with.get("message_body") == "Hi, I want shoes"
@@ -202,6 +203,7 @@ def test_inbound_message_from_owner_routes_to_merchant_handler(
     )
     db_session.add(product)
     db_session.commit()
+    product_id = product.id
 
     send_route = respx.post(url__regex=MESSAGES_URL_RE).mock(
         return_value=httpx.Response(200, json={"messages": [{"id": "wamid.out2"}]})
@@ -215,8 +217,50 @@ def test_inbound_message_from_owner_routes_to_merchant_handler(
     assert resp.status_code == 200
     assert send_route.called
 
-    db_session.refresh(product)
-    assert product.quantity == 10
+    # The dispatched task's `finally: db.close()` expunges `product` from
+    # db_session's identity map (it shares that session in eager-mode
+    # tests) — re-query rather than refresh() the now-stale instance, same
+    # as the order_reminders task tests already do for the same reason.
+    reloaded_product = db_session.query(Product).filter(Product.id == product_id).first()
+    assert reloaded_product.quantity == 10
+
+    outbound = db_session.query(Message).filter(Message.direction == "outbound").first()
+    assert "Updated stock" in outbound.body
+
+
+@respx.mock
+def test_merchant_routing_normalizes_phone_format(client, db_session, merchant_owner):
+    """
+    merchant_owner.username is "255700000099" — a message arriving with the
+    same number in leading-0 form should still be recognized as the owner
+    and routed to the merchant handler, not the AI path (the is_merchant
+    check normalizes both sides for exactly this).
+    """
+    account = WhatsAppAccount(
+        name="Test Shop",
+        phone_number_id="PHONE_MERCH_NORM",
+        access_token="tok",
+        ai_enabled=True,
+        user_id=merchant_owner.id,
+    )
+    db_session.add(account)
+    product = Product(
+        slug="shoes", name="Shoes", max_price=50000, min_price=40000,
+        quantity=5, merchant_id=merchant_owner.id,
+    )
+    db_session.add(product)
+    db_session.commit()
+
+    send_route = respx.post(url__regex=MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "wamid.out-norm"}]})
+    )
+
+    assert merchant_owner.username == "255700000099"
+    payload = _text_webhook_payload("PHONE_MERCH_NORM", "0700000099", "/stock Shoes +5")
+    resp = client.post(WEBHOOK_URL, json=payload)
+
+    assert resp.status_code == 200
+    assert send_route.called
 
     outbound = db_session.query(Message).filter(Message.direction == "outbound").first()
     assert "Updated stock" in outbound.body
@@ -247,6 +291,65 @@ def test_unknown_phone_number_id_ignored(client, db_session):
 
     assert resp.status_code == 200
     assert db_session.query(Message).count() == 0
+
+
+# --- Idempotency (Meta webhook retries) --------------------------------------
+
+@respx.mock
+def test_duplicate_delivery_of_same_message_id_is_not_reprocessed(
+    client, db_session, merchant_owner
+):
+    account = WhatsAppAccount(
+        name="Test Shop",
+        phone_number_id="PHONE_DEDUPE",
+        access_token="tok",
+        ai_enabled=True,
+        callback_url="http://8.8.8.8/hook",
+        user_id=merchant_owner.id,
+    )
+    db_session.add(account)
+    db_session.commit()
+
+    send_route = respx.post(url__regex=MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "wamid.dedupe-out"}]})
+    )
+    callback_route = respx.post("http://8.8.8.8/hook").mock(
+        return_value=httpx.Response(200, json={})
+    )
+
+    called_with = []
+
+    async def fake_generate_response(**kwargs):
+        called_with.append(kwargs)
+        return "Hello from Amara!"
+
+    class FakeLLMService:
+        generate_response = staticmethod(fake_generate_response)
+
+    import app.tasks.webhook_processing as webhook_processing_module
+    original = webhook_processing_module.llm_service
+    webhook_processing_module.llm_service = FakeLLMService()
+    try:
+        payload = _text_webhook_payload(
+            "PHONE_DEDUPE", "255711119999", "Hi, retried delivery", msg_id="wamid.dupe1"
+        )
+        first_resp = client.post(WEBHOOK_URL, json=payload)
+        # Meta retries the exact same delivery (same whatsapp message id).
+        second_resp = client.post(WEBHOOK_URL, json=payload)
+    finally:
+        webhook_processing_module.llm_service = original
+
+    assert first_resp.status_code == 200
+    assert second_resp.status_code == 200
+
+    # Only one inbound message persisted, AI generated exactly one reply,
+    # only one outbound send happened, and the callback was only forwarded
+    # once — none of the per-item processing re-ran for the retry.
+    assert db_session.query(Message).filter(Message.direction == "inbound").count() == 1
+    assert db_session.query(Message).filter(Message.direction == "outbound").count() == 1
+    assert len(called_with) == 1
+    assert send_route.call_count == 1
+    assert callback_route.call_count == 1
 
 
 # --- Callback forwarding + SSRF guard ----------------------------------------
@@ -409,14 +512,14 @@ def test_ai_routing_uses_account_knowledge_base(client, db_session, merchant_own
     class FakeLLMService:
         generate_response = staticmethod(fake_generate_response)
 
-    import app.api.v1.whatsapp as whatsapp_module
-    original = whatsapp_module.llm_service
-    whatsapp_module.llm_service = FakeLLMService()
+    import app.tasks.webhook_processing as webhook_processing_module
+    original = webhook_processing_module.llm_service
+    webhook_processing_module.llm_service = FakeLLMService()
     try:
         payload = _text_webhook_payload("PHONE_KB", "255711112222", "When do you ship?")
         resp = client.post(WEBHOOK_URL, json=payload)
     finally:
-        whatsapp_module.llm_service = original
+        webhook_processing_module.llm_service = original
 
     assert resp.status_code == 200
     assert called_with.get("knowledge_content") == "We ship in 2 days."
@@ -444,14 +547,14 @@ def test_ai_reply_logged_as_failed_when_meta_send_fails(client, db_session, merc
     class FakeLLMService:
         generate_response = staticmethod(fake_generate_response)
 
-    import app.api.v1.whatsapp as whatsapp_module
-    original = whatsapp_module.llm_service
-    whatsapp_module.llm_service = FakeLLMService()
+    import app.tasks.webhook_processing as webhook_processing_module
+    original = webhook_processing_module.llm_service
+    webhook_processing_module.llm_service = FakeLLMService()
     try:
         payload = _text_webhook_payload("PHONE_FAIL", "255711113333", "Hi")
         resp = client.post(WEBHOOK_URL, json=payload)
     finally:
-        whatsapp_module.llm_service = original
+        webhook_processing_module.llm_service = original
 
     assert resp.status_code == 200
     outbound = db_session.query(Message).filter(Message.direction == "outbound").first()

@@ -6,6 +6,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 import app.core.rate_limit as rate_limit_module
+from app.core.celery_app import celery_app
 from app.core.config import settings
 from app.core.security import create_access_token
 from app.db.models import Base, User
@@ -15,6 +16,17 @@ from app.db.session import get_db
 # fake for the whole test session so tests never need a running Redis and
 # rate-limit counters can be deterministically reset between tests.
 rate_limit_module._redis_client = fakeredis.FakeRedis()
+
+# process_inbound_message (app/tasks/webhook_processing.py) is dispatched via
+# apply_async from the webhook handler. Rather than stub that out like the
+# handoff reminder task below, run it eagerly (synchronously, in-process, no
+# broker needed) so webhook integration tests can keep asserting on its side
+# effects (Message rows, WhatsApp sends) immediately after client.post()
+# returns, instead of every such test having to call the task directly.
+# task_eager_propagates surfaces bugs inside the task as a loud test failure
+# rather than a silently-wrong assertion.
+celery_app.conf.task_always_eager = True
+celery_app.conf.task_eager_propagates = True
 
 engine = create_engine(
     "sqlite:///:memory:",
@@ -71,6 +83,18 @@ def db_session():
         yield session
     finally:
         session.close()
+
+
+@pytest.fixture(autouse=True)
+def _webhook_task_uses_test_session(monkeypatch, db_session):
+    """
+    process_inbound_message calls the module-level SessionLocal directly
+    (it's a Celery task, not a FastAPI route, so get_db's dependency
+    override doesn't apply) — redirect it to the same session the test uses,
+    same as the order_reminders/handoff_reminders task tests already do.
+    """
+    from app.tasks import webhook_processing
+    monkeypatch.setattr(webhook_processing, "SessionLocal", lambda: db_session)
 
 
 @pytest.fixture

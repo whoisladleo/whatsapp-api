@@ -112,3 +112,32 @@ def test_generate_otp_custom_length():
 
     assert len(otp) == 4
     assert otp.isdigit()
+
+
+# --- normalize_phone ---------------------------------------------------------
+
+def test_normalize_phone_leading_zero_becomes_country_code():
+    assert security.normalize_phone("0712345678") == "255712345678"
+
+
+def test_normalize_phone_plus_prefix_stripped():
+    assert security.normalize_phone("+255712345678") == "255712345678"
+
+
+def test_normalize_phone_already_normalized_unchanged():
+    assert security.normalize_phone("255712345678") == "255712345678"
+
+
+def test_normalize_phone_strips_non_digit_separators():
+    assert security.normalize_phone("+255 712 345 678") == "255712345678"
+
+
+def test_normalize_phone_equivalent_formats_compare_equal():
+    assert security.normalize_phone("0712345678") == security.normalize_phone(
+        "+255712345678"
+    )
+
+
+def test_normalize_phone_none_and_empty_passthrough():
+    assert security.normalize_phone(None) is None
+    assert security.normalize_phone("") == ""
