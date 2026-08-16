@@ -43,6 +43,31 @@ def test_request_otp_reuses_existing_user(client, db_session):
 
 
 @respx.mock
+def test_request_and_verify_otp_with_different_phone_formats_match_same_user(
+    client, db_session
+):
+    """
+    A merchant who requests an OTP typing their number in local format
+    (leading 0) must still be able to verify with the international format
+    (255...) WhatsApp itself would supply, and vice versa — both must
+    resolve to the same User row via normalize_phone, not create two.
+    """
+    _mock_send_text()
+
+    client.post("/api/v1/auth/request-otp", json={"username": "0712345678"})
+    user = db_session.query(User).filter(User.username == PHONE).first()
+    assert user is not None
+    otp_code = user.otp_code
+
+    resp = client.post(
+        "/api/v1/auth/verify-otp", json={"username": PHONE, "otp_code": otp_code}
+    )
+
+    assert resp.status_code == 200
+    assert db_session.query(User).count() == 1
+
+
+@respx.mock
 def test_verify_otp_success_returns_token(client, db_session):
     _mock_send_text()
     client.post("/api/v1/auth/request-otp", json={"username": PHONE})

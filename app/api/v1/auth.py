@@ -6,6 +6,7 @@ from app.db.session import get_db
 from app.core import security
 from app.core.config import settings
 from app.core.rate_limit import check_and_increment
+from app.core.security import normalize_phone
 from app.schemas.auth import Token, OTPRequest, OTPVerify
 from app.crud import user as crud_user
 from app.core.provider import WhatsAppProvider
@@ -26,7 +27,7 @@ async def request_otp(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db)
 ):
-    phone_number = otp_data.username.strip()
+    phone_number = normalize_phone(otp_data.username.strip())
 
     if not check_and_increment(f"otp_req:{phone_number}", limit=3, window_seconds=300):
         raise HTTPException(
@@ -56,7 +57,7 @@ def verify_otp(
     otp_data: OTPVerify,
     db: Session = Depends(get_db)
 ):
-    phone_number = otp_data.username.strip()
+    phone_number = normalize_phone(otp_data.username.strip())
 
     if not check_and_increment(f"otp_verify:{phone_number}", limit=5, window_seconds=300):
         raise HTTPException(
