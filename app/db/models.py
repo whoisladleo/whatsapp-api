@@ -22,6 +22,10 @@ class InstallmentStatus(enum.Enum):
     PAID = "PAID"
     OVERDUE = "OVERDUE"
 
+class PaymentType(enum.Enum):
+    FULL = "FULL"
+    INSTALLMENT = "INSTALLMENT"
+
 class ConversationState(enum.Enum):
     NEGOTIATING = "NEGOTIATING"
     HUMAN_HANDOFF = "HUMAN_HANDOFF"
@@ -168,6 +172,11 @@ class Order(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     customer_id = Column(Integer, ForeignKey("customers.id"))
+    product_id = Column(Integer, ForeignKey("products.id"), nullable=True)
+    account_id = Column(Integer, ForeignKey("whatsapp_accounts.id"), nullable=True)
+    quantity = Column(Integer, default=1)
+    payment_type = Column(Enum(PaymentType), nullable=True)
+    tunzaa_transaction_id = Column(String, nullable=True)
     status = Column(Enum(OrderStatus), default=OrderStatus.PENDING)
     agreed_price = Column(Float, nullable=True)
     tunzaa_link = Column(String, nullable=True)
@@ -176,6 +185,8 @@ class Order(Base):
 
     customer = relationship("Customer", back_populates="orders")
     installments = relationship("Installment", back_populates="order")
+    product = relationship("Product")
+    account = relationship("WhatsAppAccount")
 
 
 class Installment(Base):

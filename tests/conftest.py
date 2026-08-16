@@ -67,13 +67,24 @@ def _no_real_external_credentials(monkeypatch):
 def _no_real_celery_broker(monkeypatch):
     """
     Some request paths schedule follow-up work via Celery's apply_async(...)
-    at event time (e.g. the handoff reminder scheduled from llm.py). Without
-    a real broker, apply_async would attempt a real Redis connection. Stub
-    it to a no-op by default; a test that wants to assert scheduling
-    happened can re-patch it locally to something that records the call.
+    at event time (e.g. the handoff reminder scheduled from llm.py, and the
+    soft-nudge/scarcity-nudge/auto-cancel reminders scheduled at order
+    creation in LLMService._close_deal). Without a real broker, apply_async
+    would attempt a real Redis connection — and running these eagerly would
+    also re-hit the same nested-event-loop problem process_inbound_message's
+    _run_async exists to solve, since scheduling happens from within an
+    already-running loop. Stub them to no-ops by default; a test that wants
+    to assert scheduling happened can re-patch locally to something that
+    records the call, and task *bodies* are still tested directly (called
+    synchronously, not via apply_async) in their respective test modules.
     """
     from app.tasks.handoff_reminders import send_handoff_reminder
+    from app.tasks.order_reminders import auto_cancel_order, send_scarcity_nudge, send_soft_nudge
+
     monkeypatch.setattr(send_handoff_reminder, "apply_async", lambda *a, **kw: None)
+    monkeypatch.setattr(send_soft_nudge, "apply_async", lambda *a, **kw: None)
+    monkeypatch.setattr(send_scarcity_nudge, "apply_async", lambda *a, **kw: None)
+    monkeypatch.setattr(auto_cancel_order, "apply_async", lambda *a, **kw: None)
 
 
 @pytest.fixture

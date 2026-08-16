@@ -3,6 +3,7 @@ import httpx
 from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
 import uuid
+from app.core.config import settings
 from app.db.models import Order, Customer
 
 class TunzaaService:
@@ -12,7 +13,13 @@ class TunzaaService:
         self.base_url = base_url
         self._cached_token = None
         self._token_expiry = None
-    
+
+    def _environment_header(self) -> Dict[str, str]:
+        # Required by the real Malipo/Tunzaa API on every authenticated
+        # request; missing it either gets the request rejected or routed to
+        # the wrong environment.
+        return {"X-Environment": settings.TUNZAA_ENVIRONMENT}
+
     async def get_token(self) -> str:
         # Check cache
         if self._cached_token and self._token_expiry and datetime.utcnow() < self._token_expiry:
@@ -23,19 +30,25 @@ class TunzaaService:
             "api_key": self.api_key,
             "secret_key": self.secret_key
         }
-        
+
         async with httpx.AsyncClient() as client:
             try:
                 response = await client.post(
                     f"{self.base_url}/accounts/request/token",
                     json=payload,
+                    headers=self._environment_header(),
                     timeout=10.0
                 )
                 response.raise_for_status()
                 data = response.json()
                 self._cached_token = data.get("access_token")
-                # Assume 1 hour expiry
-                self._token_expiry = datetime.utcnow() + timedelta(minutes=55)
+                # Real response includes expires_in (seconds); refresh 5
+                # minutes early as a safety margin. Fall back to a
+                # conservative default only if the field is unexpectedly
+                # missing.
+                expires_in = data.get("expires_in", 3600)
+                margin = min(300, max(0, expires_in - 1))
+                self._token_expiry = datetime.utcnow() + timedelta(seconds=expires_in - margin)
                 return self._cached_token
             except Exception as e:
                 print(f"Tunzaa token error: {e}")
@@ -50,12 +63,13 @@ class TunzaaService:
             "amount": str(int(amount)),
             "reference": reference
         }
-        
+
         headers = {
             "Authorization": f"Bearer {await self.get_token()}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            **self._environment_header(),
         }
-        
+
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.post(
@@ -94,9 +108,10 @@ class TunzaaService:
         
         headers = {
             "Authorization": f"Bearer {await self.get_token()}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            **self._environment_header(),
         }
-        
+
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.post(

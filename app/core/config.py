@@ -50,6 +50,16 @@ class Settings(BaseSettings):
     # Tunzaa
     TUNZAA_API_KEY: Optional[str] = None
     TUNZAA_SECRET_KEY: Optional[str] = None
+    # Required by the real Malipo/Tunzaa API on every authenticated request
+    # (X-Environment header) — defaults to "sandbox" so a misconfigured
+    # deployment fails safe rather than accidentally hitting production.
+    TUNZAA_ENVIRONMENT: str = "sandbox"
+
+    # Template used for order-reminder nudges sent outside the 24h WhatsApp
+    # customer-service window (see app/tasks/order_reminders.py). Defaults to
+    # Meta's always-approved sample template; production use requires a real
+    # template approved for this account in Meta Business Manager.
+    WHATSAPP_REMINDER_TEMPLATE_NAME: str = "hello_world"
 
     # Cloudflare R2
     R2_ACCOUNT_ID: Optional[str] = None

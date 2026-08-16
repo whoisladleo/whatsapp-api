@@ -3,6 +3,7 @@ from typing import Any, Optional, Union
 import hashlib
 import hmac
 import ipaddress
+import json
 import re
 import socket
 from urllib.parse import urlparse
@@ -41,6 +42,22 @@ def verify_meta_signature(raw_body: bytes, signature_header: Optional[str]) -> b
     ).hexdigest()
     provided = signature_header.removeprefix("sha256=")
     return hmac.compare_digest(expected, provided)
+
+
+def verify_tunzaa_signature(payload: dict, signature_header: Optional[str]) -> bool:
+    """
+    Verifies Tunzaa/Malipo's X-Signature header: HMAC-SHA256 of the JSON
+    payload re-serialized with alphabetically sorted keys (equivalent to
+    Python's json.dumps(payload, sort_keys=True), which is exactly what this
+    uses) against settings.TUNZAA_SECRET_KEY. Per Tunzaa's own webhook docs.
+    """
+    if not signature_header:
+        return False
+    canonical = json.dumps(payload, sort_keys=True)
+    expected = hmac.new(
+        settings.TUNZAA_SECRET_KEY.encode(), canonical.encode(), hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature_header)
 
 
 def normalize_phone(phone: Optional[str]) -> Optional[str]:

@@ -1,14 +1,70 @@
 from google import genai
 from google.genai import types
+import logging
 import os
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional
 from app.core.config import settings
 from app.core.security import normalize_phone
 from sqlalchemy.orm import Session
-from app.db.models import Customer, ConversationContext, ConversationState, Product, WhatsAppAccount, Message, User
+from app.db.models import (
+    Customer,
+    ConversationContext,
+    ConversationState,
+    Installment,
+    InstallmentStatus,
+    Order,
+    OrderStatus,
+    PaymentType,
+    Product,
+    WhatsAppAccount,
+    Message,
+    User,
+)
+
+logger = logging.getLogger(__name__)
+
+# How long a reservation (and the matching order_reminders schedule) holds
+# stock before auto_cancel_order releases it — see app/tasks/order_reminders.py.
+RESERVATION_WINDOW = timedelta(hours=48)
+
+_AGREEMENT_RE = re.compile(
+    r"\[AGREEMENT_REACHED:\s*product=(?P<product>.+?)\s+price=(?P<price>[\d.]+)\s+payment=(?P<payment>full|installment)\s*\]",
+    re.IGNORECASE,
+)
+
+
+def _parse_and_strip_agreement(text: str):
+    """
+    Extracts the [AGREEMENT_REACHED: product=... price=... payment=...]
+    marker the model is instructed to emit once a deal closes (regular-
+    merchant branch only — see the system prompt below), the same way
+    [HUMAN_HANDOFF] is parsed. Always strips the marker from what the
+    customer sees, whether or not it parses; a malformed marker just means
+    no order gets created.
+    """
+    match = _AGREEMENT_RE.search(text)
+    if not match:
+        return text, None
+
+    cleaned = _AGREEMENT_RE.sub("", text).strip()
+
+    try:
+        price = float(match.group("price"))
+    except ValueError:
+        return cleaned, None
+
+    product_name = match.group("product").strip()
+    if not product_name:
+        return cleaned, None
+
+    return cleaned, {
+        "product_name": product_name,
+        "price": price,
+        "payment_type": match.group("payment").lower(),
+    }
 
 class LLMService:
     def __init__(self, api_key: str):
@@ -22,6 +78,137 @@ class LLMService:
         
         with open(kb_path, 'r') as f:
             return f.read()
+
+    async def _close_deal(
+        self,
+        db: Session,
+        account: WhatsAppAccount,
+        customer: Customer,
+        normalized_from_phone: str,
+        agreement: dict,
+        context: ConversationContext,
+    ) -> Optional[str]:
+        """
+        Validates a parsed AGREEMENT_REACHED marker against the real catalog
+        (server-side enforcement of min/max price and stock — the prompt's
+        "SECRET FLOOR" instruction alone doesn't stop a prompt-injected
+        model from claiming an out-of-band price), reserves stock, creates
+        the Order, and dispatches the real Tunzaa payment. Returns a short
+        note to append to the customer-facing reply, or None if nothing
+        happened (invalid agreement — the model's own reply still goes out
+        as-is; this is expected to be rare/adversarial-only since the model
+        is instructed to stay within the catalog's own bounds).
+        """
+        product = (
+            db.query(Product)
+            .filter(Product.merchant_id == account.user_id, Product.name.ilike(agreement["product_name"]))
+            .first()
+        )
+        price = agreement["price"]
+        if not product:
+            logger.warning(f"AGREEMENT_REACHED for unknown product '{agreement['product_name']}'; ignoring.")
+            return None
+        if not (product.min_price <= price <= product.max_price):
+            logger.warning(
+                f"AGREEMENT_REACHED price {price} outside [{product.min_price}, {product.max_price}] "
+                f"for '{product.name}'; ignoring (possible prompt injection)."
+            )
+            return None
+        if product.quantity < 1:
+            logger.warning(f"AGREEMENT_REACHED for '{product.name}' but it's out of stock; ignoring.")
+            return None
+
+        payment_type = (
+            PaymentType.INSTALLMENT if agreement["payment_type"] == "installment" else PaymentType.FULL
+        )
+
+        # Reserve: decrement stock now (soft-lock during the hold window,
+        # not deferred to payment success) so a second customer can't be
+        # sold the same unit while this one is paying.
+        product.quantity -= 1
+        order = Order(
+            customer_id=customer.id,
+            product_id=product.id,
+            account_id=account.id,
+            quantity=1,
+            agreed_price=price,
+            payment_type=payment_type,
+            status=OrderStatus.PENDING,
+            reserved_until=datetime.utcnow() + RESERVATION_WINDOW,
+        )
+        db.add(order)
+        db.commit()
+        db.refresh(order)
+
+        context.last_offer = price
+        db.commit()
+
+        self._schedule_reminders(order.id)
+
+        note = await self._dispatch_payment(db, order, product, normalized_from_phone, payment_type)
+        return note
+
+    async def _dispatch_payment(
+        self, db: Session, order: Order, product: Product, phone: str, payment_type: PaymentType
+    ) -> str:
+        from app.services.tunzaa import tunzaa_service
+
+        try:
+            if payment_type == PaymentType.FULL:
+                resp = await tunzaa_service.initiate_payment(
+                    phone=phone, amount=order.agreed_price, reference=f"order-{order.id}"
+                )
+                order.tunzaa_transaction_id = resp.get("transactionID")
+                db.commit()
+                return (
+                    f"A payment request for TZS {order.agreed_price:,.0f} has been sent to your "
+                    "phone — please approve it to complete your order."
+                )
+            else:
+                resp = await tunzaa_service.create_installment_plan(order, product.name)
+                for inst in resp.get("installments", []):
+                    try:
+                        due_date = datetime.strptime(inst["due_date"], "%Y-%m-%d")
+                    except (KeyError, ValueError):
+                        due_date = datetime.utcnow()
+                    db.add(
+                        Installment(
+                            order_id=order.id,
+                            tunzaa_installment_id=str(inst.get("installment_id")) if inst.get("installment_id") else None,
+                            amount_due=float(inst.get("amount", 0) or 0),
+                            due_date=due_date,
+                            status=InstallmentStatus.PENDING,
+                        )
+                    )
+                db.commit()
+                return "Your installment plan has been created! We'll be in touch with payment details."
+        except Exception as e:
+            logger.error(f"Tunzaa dispatch failed for order {order.id}: {e}")
+            # This order never got as far as an accepted payment attempt —
+            # release the reservation rather than leave it dangling.
+            product.quantity += order.quantity or 1
+            order.status = OrderStatus.CANCELLED
+            db.commit()
+            return "Something went wrong setting up your payment — please try again in a moment."
+
+    def _schedule_reminders(self, order_id: int) -> None:
+        from app.tasks.order_reminders import (
+            SCARCITY_NUDGE_DELAY_SECONDS,
+            SOFT_NUDGE_DELAY_SECONDS,
+            AUTO_CANCEL_DELAY_SECONDS,
+            auto_cancel_order,
+            send_scarcity_nudge,
+            send_soft_nudge,
+        )
+        for task, delay in (
+            (send_soft_nudge, SOFT_NUDGE_DELAY_SECONDS),
+            (send_scarcity_nudge, SCARCITY_NUDGE_DELAY_SECONDS),
+            (auto_cancel_order, AUTO_CANCEL_DELAY_SECONDS),
+        ):
+            try:
+                task.apply_async(args=[order_id], countdown=delay)
+            except Exception as sched_err:
+                logger.error(f"Failed to schedule {task.name}: {sched_err}")
 
     async def generate_response(
         self, 
@@ -181,7 +368,8 @@ Your goal is to politely assist customers, answer questions, and sell products f
 RULES:
 1. Selling: Be helpful and persuasive. Try to close the sale.
 2. Pricing & Negotiation: Use the provided catalog max and min prices to negotiate. Never sell below the minimum price.
-3. Human Handoff: If the customer is unreasonable, has complex technical questions, or explicitly asks for a human, you must include the exact phrase [HUMAN_HANDOFF] in your response.
+3. Closing the Deal: Once the customer has clearly agreed to buy a specific product at a specific price, ask whether they'd like to pay in full or in installments. Once they answer, confirm the deal and end your response with the exact marker [AGREEMENT_REACHED: product=<product name> price=<agreed price> payment=<full|installment>] (e.g. [AGREEMENT_REACHED: product=Shoes price=45000 payment=full]). Only include this marker once you have both a specific agreed price AND a payment method choice from the customer — never guess or assume either.
+4. Human Handoff: If the customer is unreasonable, has complex technical questions, or explicitly asks for a human, you must include the exact phrase [HUMAN_HANDOFF] in your response.
 """
         
         base_instruction += """
@@ -259,9 +447,33 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
                 if not response_text:
                     response_text = "I am transferring you to a human agent who can help you further. Please hold."
             
-            # If agreement is reached, we would normally trigger Tunzaa integration here.
-            # E.g. "[AGREEMENT_REACHED: 45000]"
-            
+            # 3. Deal closing (AGREEMENT_REACHED). Only the regular-merchant
+            # prompt branch above ever instructs the model to emit this
+            # marker (the platform account sells the Taskflow subscription,
+            # not the catalog products), but strip it unconditionally
+            # regardless of branch as defense in depth against it leaking
+            # into a customer-facing message. If a handoff also fired above,
+            # handoff wins — don't create an order for a conversation
+            # simultaneously being escalated to a human.
+            response_text, agreement = _parse_and_strip_agreement(response_text)
+            if agreement:
+                if is_platform_account or context.state == ConversationState.HUMAN_HANDOFF:
+                    logger.warning(
+                        "AGREEMENT_REACHED marker seen on an ineligible turn "
+                        f"(is_platform_account={is_platform_account}, "
+                        f"handoff={context.state == ConversationState.HUMAN_HANDOFF}); ignoring."
+                    )
+                else:
+                    try:
+                        note = await self._close_deal(
+                            db, account, customer, normalized_from_phone, agreement, context
+                        )
+                    except Exception as deal_err:
+                        logger.error(f"Order/payment completion failed: {deal_err}")
+                        note = None
+                    if note:
+                        response_text = f"{response_text}\n\n{note}".strip()
+
             return response_text
         except Exception as e:
             print(f"LLM Error: {e}")

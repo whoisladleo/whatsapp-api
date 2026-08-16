@@ -6,14 +6,21 @@ from app.db.models import (
     ConversationContext,
     ConversationState,
     Customer,
+    Installment,
     Message,
+    Order,
+    OrderStatus,
+    PaymentType,
     Product,
     User,
     WhatsAppAccount,
 )
-from app.services.llm import LLMService
+from app.services.llm import LLMService, _parse_and_strip_agreement
 
 MESSAGES_URL_RE = r"https://graph\.facebook\.com/.+/messages$"
+TOKEN_URL = "https://pay.tunzaa.co.tz/api/v1/accounts/request/token"
+PAYMENT_URL = "https://pay.tunzaa.co.tz/api/v1/payments/initiate-payment"
+INSTALLMENT_URL = "https://pay.tunzaa.co.tz/api/v1/installments/create"
 
 
 class _FakeModels:
@@ -72,6 +79,18 @@ def shop_account(db_session, merchant):
     db_session.commit()
     db_session.refresh(account)
     return account
+
+
+@pytest.fixture
+def shoes(db_session, merchant):
+    p = Product(
+        slug="deal-shoes", name="Shoes", max_price=50000, min_price=40000,
+        quantity=3, merchant_id=merchant.id,
+    )
+    db_session.add(p)
+    db_session.commit()
+    db_session.refresh(p)
+    return p
 
 
 @pytest.fixture
@@ -529,3 +548,382 @@ async def test_generate_content_exception_returns_fallback_message(db_session, s
     )
 
     assert result == "I'm sorry, I'm having trouble processing your request right now."
+
+
+# --- _parse_and_strip_agreement (pure function) -----------------------------
+
+
+def test_parse_agreement_extracts_multi_word_product_and_strips_marker():
+    text, agreement = _parse_and_strip_agreement(
+        "Great, let's do it! [AGREEMENT_REACHED: product=Running Shoes price=45000 payment=full]"
+    )
+
+    assert text == "Great, let's do it!"
+    assert agreement == {"product_name": "Running Shoes", "price": 45000.0, "payment_type": "full"}
+
+
+def test_parse_agreement_case_insensitive():
+    text, agreement = _parse_and_strip_agreement(
+        "[agreement_reached: PRODUCT=Shoes PRICE=45000 PAYMENT=INSTALLMENT]"
+    )
+
+    assert agreement["payment_type"] == "installment"
+    assert agreement["product_name"] == "Shoes"
+
+
+def test_parse_agreement_no_marker_present():
+    text, agreement = _parse_and_strip_agreement("Just a normal reply.")
+
+    assert text == "Just a normal reply."
+    assert agreement is None
+
+
+def test_parse_agreement_missing_field_not_matched():
+    original = "Deal! [AGREEMENT_REACHED: product=Shoes price=45000]"
+
+    text, agreement = _parse_and_strip_agreement(original)
+
+    assert agreement is None
+    assert text == original  # regex didn't match at all, nothing stripped
+
+
+def test_parse_agreement_blank_product_name_returns_none():
+    # Two spaces between "product=" and "price=" lets the non-greedy .+?
+    # capture a single whitespace character, which strips to empty.
+    text, agreement = _parse_and_strip_agreement(
+        "Deal! [AGREEMENT_REACHED: product=  price=45000 payment=full]"
+    )
+
+    assert agreement is None
+    assert "AGREEMENT_REACHED" not in text
+
+
+def test_parse_agreement_unparseable_price_returns_none():
+    text, agreement = _parse_and_strip_agreement(
+        "Deal! [AGREEMENT_REACHED: product=Shoes price=45.65.23 payment=full]"
+    )
+
+    assert agreement is None
+    assert "AGREEMENT_REACHED" not in text  # still stripped even though unusable
+
+
+# --- Deal closing: full end-to-end via generate_response --------------------
+
+
+@respx.mock
+async def test_agreement_full_payment_creates_order_and_dispatches(db_session, shop_account, shoes):
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "tok-1"}))
+    payment_route = respx.post(PAYMENT_URL).mock(
+        return_value=httpx.Response(200, json={"statusCode": 202, "success": True, "transactionID": "MOCK_TXN_1"})
+    )
+
+    async def handler(**kwargs):
+        return _FakeResponse(
+            "Deal! [AGREEMENT_REACHED: product=Shoes price=45000 payment=full]"
+        )
+
+    service = _service_with_fake_client(handler=handler)
+
+    result = await service.generate_response(
+        message_body="I'll take the shoes for 45000, full payment",
+        from_phone="255711130000",
+        db=db_session,
+        account=shop_account,
+    )
+
+    assert "AGREEMENT_REACHED" not in result
+    assert "sent to your phone" in result
+
+    order = db_session.query(Order).filter(Order.agreed_price == 45000).first()
+    assert order is not None
+    assert order.product_id == shoes.id
+    assert order.account_id == shop_account.id
+    assert order.quantity == 1
+    assert order.payment_type == PaymentType.FULL
+    assert order.status == OrderStatus.PENDING
+    assert order.reserved_until is not None
+    assert order.tunzaa_transaction_id == "MOCK_TXN_1"
+    assert payment_route.called
+
+    db_session.refresh(shoes)
+    assert shoes.quantity == 2  # reserved at creation time, decremented from 3
+
+    customer = db_session.query(Customer).filter(Customer.phone_number == "255711130000").first()
+    context = db_session.query(ConversationContext).filter(ConversationContext.customer_id == customer.id).first()
+    assert context.last_offer == 45000
+
+
+@respx.mock
+async def test_agreement_installment_creates_order_and_installment_rows(db_session, shop_account, shoes):
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "tok-1"}))
+    respx.post(INSTALLMENT_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "customer": {"customer_id": 1234, "first_name": "John"},
+                "plan": {"plan_id": 1001, "status": "active", "total_amount": "45000.00"},
+                "installments": [
+                    {"installment_id": 10000, "installment_number": 1, "amount": "22500.00", "due_date": "2026-08-16", "status": "PENDING"},
+                    {"installment_id": 10001, "installment_number": 2, "amount": "22500.00", "due_date": "2026-11-14", "status": "PENDING"},
+                ],
+            },
+        )
+    )
+
+    async def handler(**kwargs):
+        return _FakeResponse(
+            "Sawa! [AGREEMENT_REACHED: product=Shoes price=45000 payment=installment]"
+        )
+
+    service = _service_with_fake_client(handler=handler)
+
+    result = await service.generate_response(
+        message_body="I'll pay in installments",
+        from_phone="255711130001",
+        db=db_session,
+        account=shop_account,
+    )
+
+    assert "installment plan has been created" in result
+
+    order = db_session.query(Order).filter(Order.agreed_price == 45000).first()
+    assert order.payment_type == PaymentType.INSTALLMENT
+
+    installments = db_session.query(Installment).filter(Installment.order_id == order.id).all()
+    assert len(installments) == 2
+    assert {i.tunzaa_installment_id for i in installments} == {"10000", "10001"}
+    assert all(i.amount_due == 22500.0 for i in installments)
+
+
+async def test_agreement_price_below_min_ignored(db_session, shop_account, shoes):
+    async def handler(**kwargs):
+        return _FakeResponse(
+            "Deal! [AGREEMENT_REACHED: product=Shoes price=1000 payment=full]"
+        )
+
+    service = _service_with_fake_client(handler=handler)
+
+    result = await service.generate_response(
+        message_body="1000 tzs please",
+        from_phone="255711130002",
+        db=db_session,
+        account=shop_account,
+    )
+
+    assert "AGREEMENT_REACHED" not in result
+    assert db_session.query(Order).count() == 0
+    db_session.refresh(shoes)
+    assert shoes.quantity == 3  # untouched
+
+
+async def test_agreement_unknown_product_ignored(db_session, shop_account, shoes):
+    async def handler(**kwargs):
+        return _FakeResponse(
+            "Deal! [AGREEMENT_REACHED: product=Nonexistent Widget price=45000 payment=full]"
+        )
+
+    service = _service_with_fake_client(handler=handler)
+
+    result = await service.generate_response(
+        message_body="widget please",
+        from_phone="255711130003",
+        db=db_session,
+        account=shop_account,
+    )
+
+    assert "AGREEMENT_REACHED" not in result
+    assert db_session.query(Order).count() == 0
+
+
+async def test_agreement_out_of_stock_ignored(db_session, shop_account, shoes):
+    shoes.quantity = 0
+    db_session.commit()
+
+    async def handler(**kwargs):
+        return _FakeResponse(
+            "Deal! [AGREEMENT_REACHED: product=Shoes price=45000 payment=full]"
+        )
+
+    service = _service_with_fake_client(handler=handler)
+
+    result = await service.generate_response(
+        message_body="I'll take it",
+        from_phone="255711130004",
+        db=db_session,
+        account=shop_account,
+    )
+
+    assert "AGREEMENT_REACHED" not in result
+    assert db_session.query(Order).count() == 0
+
+
+async def test_agreement_and_handoff_together_handoff_wins(db_session, shop_account, shoes, merchant, monkeypatch):
+    async def fake_alert(self, to, body, preview_url=False):
+        return {"messages": [{"id": "wamid.alert"}]}
+
+    monkeypatch.setattr("app.core.provider.WhatsAppProvider.send_text", fake_alert)
+
+    async def handler(**kwargs):
+        return _FakeResponse(
+            "Let me get a human. [HUMAN_HANDOFF] [AGREEMENT_REACHED: product=Shoes price=45000 payment=full]"
+        )
+
+    service = _service_with_fake_client(handler=handler)
+
+    await service.generate_response(
+        message_body="actually let me talk to a person, and I'll take the shoes for 45000 full",
+        from_phone="255711130005",
+        db=db_session,
+        account=shop_account,
+    )
+
+    assert db_session.query(Order).count() == 0
+    db_session.refresh(shoes)
+    assert shoes.quantity == 3
+
+
+@respx.mock
+async def test_agreement_tunzaa_dispatch_failure_releases_reservation(db_session, shop_account, shoes):
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "tok-1"}))
+    respx.post(PAYMENT_URL).mock(return_value=httpx.Response(500))
+
+    async def handler(**kwargs):
+        return _FakeResponse(
+            "Deal! [AGREEMENT_REACHED: product=Shoes price=45000 payment=full]"
+        )
+
+    service = _service_with_fake_client(handler=handler)
+
+    result = await service.generate_response(
+        message_body="I'll take it",
+        from_phone="255711130006",
+        db=db_session,
+        account=shop_account,
+    )
+
+    assert "went wrong setting up your payment" in result
+
+    order = db_session.query(Order).filter(Order.agreed_price == 45000).first()
+    assert order.status == OrderStatus.CANCELLED
+
+    db_session.refresh(shoes)
+    assert shoes.quantity == 3  # decremented then released back
+
+
+async def test_agreement_close_deal_exception_does_not_lose_reply(db_session, shop_account, shoes, monkeypatch):
+    async def handler(**kwargs):
+        return _FakeResponse(
+            "Deal! [AGREEMENT_REACHED: product=Shoes price=45000 payment=full]"
+        )
+
+    service = _service_with_fake_client(handler=handler)
+
+    async def raising_close_deal(*a, **kw):
+        raise RuntimeError("unexpected DB error")
+
+    monkeypatch.setattr(service, "_close_deal", raising_close_deal)
+
+    result = await service.generate_response(
+        message_body="I'll take it",
+        from_phone="255711130007",
+        db=db_session,
+        account=shop_account,
+    )
+
+    # The valid AI reply survives even though the order-completion side
+    # effect blew up — it's not replaced by the generic Gemini-error fallback.
+    assert result == "Deal!"
+    assert db_session.query(Order).count() == 0
+
+
+@respx.mock
+async def test_agreement_installment_with_missing_due_date_defaults_gracefully(db_session, shop_account, shoes):
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "tok-1"}))
+    respx.post(INSTALLMENT_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "plan": {"plan_id": 1001},
+                "installments": [
+                    {"installment_id": 1, "amount": "45000.00"},  # no due_date key at all
+                ],
+            },
+        )
+    )
+
+    async def handler(**kwargs):
+        return _FakeResponse(
+            "Sawa! [AGREEMENT_REACHED: product=Shoes price=45000 payment=installment]"
+        )
+
+    service = _service_with_fake_client(handler=handler)
+
+    result = await service.generate_response(
+        message_body="installments please",
+        from_phone="255711130009",
+        db=db_session,
+        account=shop_account,
+    )
+
+    assert "installment plan has been created" in result
+    installment = db_session.query(Installment).filter(Installment.tunzaa_installment_id == "1").first()
+    assert installment is not None
+    assert installment.due_date is not None  # defaulted rather than raising
+
+
+async def test_agreement_reminder_schedule_failure_does_not_break_order_creation(
+    db_session, shop_account, shoes, monkeypatch
+):
+    from app.tasks.order_reminders import send_soft_nudge
+
+    def raising_apply_async(*a, **kw):
+        raise RuntimeError("broker unreachable")
+
+    monkeypatch.setattr(send_soft_nudge, "apply_async", raising_apply_async)
+
+    async def handler(**kwargs):
+        return _FakeResponse(
+            "Deal! [AGREEMENT_REACHED: product=Shoes price=45000 payment=full]"
+        )
+
+    service = _service_with_fake_client(handler=handler)
+
+    import respx as respx_module
+    with respx_module.mock:
+        respx_module.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "tok-1"}))
+        respx_module.post(PAYMENT_URL).mock(
+            return_value=httpx.Response(200, json={"transactionID": "MOCK_TXN_2"})
+        )
+        result = await service.generate_response(
+            message_body="I'll take it",
+            from_phone="255711130010",
+            db=db_session,
+            account=shop_account,
+        )
+
+    assert "sent to your phone" in result
+    assert db_session.query(Order).count() == 1
+
+
+async def test_agreement_ignored_on_platform_account(db_session, platform_account, merchant):
+    db_session.add(
+        Product(slug="platform-widget", name="Widget", max_price=100, min_price=50, quantity=5, merchant_id=merchant.id)
+    )
+    db_session.commit()
+
+    async def handler(**kwargs):
+        return _FakeResponse(
+            "Sure! [AGREEMENT_REACHED: product=Widget price=75 payment=full]"
+        )
+
+    service = _service_with_fake_client(handler=handler)
+
+    result = await service.generate_response(
+        message_body="I'll take a widget",
+        from_phone="255711130008",
+        db=db_session,
+        account=platform_account,
+    )
+
+    assert "AGREEMENT_REACHED" not in result
+    assert db_session.query(Order).count() == 0

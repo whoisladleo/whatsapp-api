@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 import httpx
 import respx
 
+from app.core.config import settings
 from app.db.models import Customer, Order
 from app.services.tunzaa import TunzaaService
 
@@ -48,6 +49,37 @@ async def test_get_token_refetches_after_expiry():
     assert token1 == "tok-1"
     assert token2 == "tok-2"
     assert route.call_count == 2
+
+
+@respx.mock
+async def test_get_token_uses_real_expires_in_field():
+    service = _service()
+    respx.post(TOKEN_URL).mock(
+        return_value=httpx.Response(200, json={"access_token": "tok-1", "expires_in": 120})
+    )
+
+    await service.get_token()
+
+    # margin = min(300, max(0, 120-1)) = 119, so expiry ~= now + 1s.
+    assert service._token_expiry <= datetime.utcnow() + timedelta(seconds=5)
+    assert service._token_expiry > datetime.utcnow()
+
+
+@respx.mock
+async def test_x_environment_header_sent_on_token_and_payment_requests(monkeypatch):
+    monkeypatch.setattr(settings, "TUNZAA_ENVIRONMENT", "sandbox")
+    service = _service()
+    token_route = respx.post(TOKEN_URL).mock(
+        return_value=httpx.Response(200, json={"access_token": "tok-1"})
+    )
+    payment_route = respx.post(PAYMENT_URL).mock(
+        return_value=httpx.Response(200, json={"transactionID": "MOCK_TXN"})
+    )
+
+    await service.initiate_payment("255711111111", 45000, "order-1")
+
+    assert token_route.calls.last.request.headers["X-Environment"] == "sandbox"
+    assert payment_route.calls.last.request.headers["X-Environment"] == "sandbox"
 
 
 @respx.mock
@@ -102,6 +134,7 @@ async def test_create_installment_plan_payload(db_session):
     assert sent["total_amount"] == 90000.0
     assert sent["name"] == "Shoes - 3 Month Plan"
     assert sent["payment_frequency"] == "monthly"
+    assert installment_route.calls.last.request.headers["X-Environment"] == settings.TUNZAA_ENVIRONMENT
 
 
 @respx.mock

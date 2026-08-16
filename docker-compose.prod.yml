@@ -21,9 +21,11 @@ services:
       - WEBHOOK_VERIFY_TOKEN=${WEBHOOK_VERIFY_TOKEN}
       - WHATSAPP_APP_SECRET=${WHATSAPP_APP_SECRET}
       - WHATSAPP_POOL_ACCESS_TOKEN=${WHATSAPP_POOL_ACCESS_TOKEN}
+      - WHATSAPP_REMINDER_TEMPLATE_NAME=${WHATSAPP_REMINDER_TEMPLATE_NAME:-hello_world}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
       - TUNZAA_API_KEY=${TUNZAA_API_KEY}
       - TUNZAA_SECRET_KEY=${TUNZAA_SECRET_KEY}
+      - TUNZAA_ENVIRONMENT=${TUNZAA_ENVIRONMENT:-sandbox}
       - WORKERS_PER_CORE=${WORKERS_PER_CORE:-1}
       - MAX_WORKERS=${MAX_WORKERS:-4}
       - TIMEOUT=${TIMEOUT:-120}
@@ -60,8 +62,16 @@ services:
       - PHONE_NUMBER_ID=${PHONE_NUMBER_ID}
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      # AI/merchant message processing (app/tasks/webhook_processing.py) and
+      # order-completion Tunzaa dispatch (app/services/llm.py) both run in
+      # this worker process, not the api service — it needs the same
+      # GOOGLE_API_KEY/Tunzaa credentials the api service has, or the AI
+      # sales path silently no-ops (llm_service is None without a key).
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - WHATSAPP_REMINDER_TEMPLATE_NAME=${WHATSAPP_REMINDER_TEMPLATE_NAME:-hello_world}
       - TUNZAA_API_KEY=${TUNZAA_API_KEY}
       - TUNZAA_SECRET_KEY=${TUNZAA_SECRET_KEY}
+      - TUNZAA_ENVIRONMENT=${TUNZAA_ENVIRONMENT:-sandbox}
     command: celery -A app.core.celery_app worker --loglevel=info
     depends_on:
       - redis

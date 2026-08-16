@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import json
 
 import jwt
 import pytest
@@ -44,6 +45,43 @@ def test_verify_meta_signature_tampered_body(monkeypatch):
     sig = "sha256=" + hmac.new(b"topsecret", b"original", hashlib.sha256).hexdigest()
 
     assert security.verify_meta_signature(b"tampered", sig) is False
+
+
+# --- verify_tunzaa_signature -------------------------------------------------
+
+def test_verify_tunzaa_signature_valid(monkeypatch):
+    monkeypatch.setattr(settings, "TUNZAA_SECRET_KEY", "malipo-secret")
+    payload = {"transaction_id": "T1", "status": "COMPLETED", "reference_id": "order-1"}
+    canonical = json.dumps(payload, sort_keys=True)
+    sig = hmac.new(b"malipo-secret", canonical.encode(), hashlib.sha256).hexdigest()
+
+    assert security.verify_tunzaa_signature(payload, sig) is True
+
+
+def test_verify_tunzaa_signature_key_order_independent(monkeypatch):
+    """The signer may serialize keys in a different order than they were
+    received in the dict — canonicalization must sort keys before signing,
+    matching python's json.dumps(payload, sort_keys=True) per Tunzaa's docs."""
+    monkeypatch.setattr(settings, "TUNZAA_SECRET_KEY", "malipo-secret")
+    payload = {"status": "COMPLETED", "reference_id": "order-1", "transaction_id": "T1"}
+    canonical = json.dumps(
+        {"transaction_id": "T1", "status": "COMPLETED", "reference_id": "order-1"}, sort_keys=True
+    )
+    sig = hmac.new(b"malipo-secret", canonical.encode(), hashlib.sha256).hexdigest()
+
+    assert security.verify_tunzaa_signature(payload, sig) is True
+
+
+def test_verify_tunzaa_signature_invalid(monkeypatch):
+    monkeypatch.setattr(settings, "TUNZAA_SECRET_KEY", "malipo-secret")
+
+    assert security.verify_tunzaa_signature({"a": 1}, "0" * 64) is False
+
+
+def test_verify_tunzaa_signature_missing_header(monkeypatch):
+    monkeypatch.setattr(settings, "TUNZAA_SECRET_KEY", "malipo-secret")
+
+    assert security.verify_tunzaa_signature({"a": 1}, None) is False
 
 
 # --- is_safe_external_url ---------------------------------------------------
