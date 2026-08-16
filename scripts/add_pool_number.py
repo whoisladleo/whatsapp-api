@@ -1,5 +1,11 @@
 import os
 import sys
+
+# Running this as `python scripts/add_pool_number.py` puts scripts/ (not the
+# project root) on sys.path[0], so `app` can't be imported without this —
+# same fix already applied in scripts/simulate_whatsapp.py.
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from dotenv import load_dotenv
