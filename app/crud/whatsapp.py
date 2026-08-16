@@ -16,6 +16,10 @@ class PhonePoolExhaustedError(Exception):
     """Raised when no credentials were supplied and the pool has no AVAILABLE numbers."""
 
 
+class PoolAccessTokenNotConfiguredError(Exception):
+    """Raised when an auto-assign is requested but WHATSAPP_POOL_ACCESS_TOKEN isn't set."""
+
+
 def claim_available_pool_number(db: Session) -> Optional[PhoneNumberPool]:
     """
     Atomically claims one AVAILABLE pool row via a conditional UPDATE rather
@@ -74,6 +78,10 @@ def create_whatsapp_account(
 
     pool_number = None
     if not phone_number_id and not access_token:
+        if not settings.WHATSAPP_POOL_ACCESS_TOKEN:
+            # Fail before claiming a pool row — otherwise the claim commits
+            # independently and there's nothing to link it to.
+            raise PoolAccessTokenNotConfiguredError()
         pool_number = claim_available_pool_number(db)
         if not pool_number:
             raise PhonePoolExhaustedError()
@@ -104,7 +112,19 @@ def create_whatsapp_account(
 
     db_account = WhatsAppAccount(**account_data, user_id=user_id)
     db.add(db_account)
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        if pool_number:
+            # The pool claim already committed independently (see
+            # claim_available_pool_number) so a failure here would
+            # otherwise leak the row as permanently ASSIGNED with no
+            # linked account. Release it back to AVAILABLE.
+            pool_number.status = PhoneNumberStatus.AVAILABLE
+            pool_number.assigned_at = None
+            db.commit()
+        raise
     db.refresh(db_account)
 
     if pool_number:

@@ -10,6 +10,7 @@ from app.crud.account import (
     create_account, get_account_by_id, get_accounts_by_user,
     update_account, delete_account,
     PartialWhatsAppCredentialsError, PhonePoolExhaustedError,
+    PoolAccessTokenNotConfiguredError,
 )
 from app.api.deps import get_current_user
 from app.core.config import settings
@@ -64,6 +65,11 @@ async def create_new_account(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="No WhatsApp numbers are currently available in the pool. Try again shortly, or provide your own phone_number_id/access_token.",
+        )
+    except PoolAccessTokenNotConfiguredError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Auto-assign is temporarily unavailable (pool credentials not configured). Provide your own phone_number_id/access_token instead.",
         )
     if not account:
         raise HTTPException(

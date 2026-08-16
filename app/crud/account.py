@@ -3,7 +3,11 @@ from app.db.models import WhatsAppAccount
 from app.schemas.account import AccountCreate, AccountUpdate
 from app.schemas.whatsapp import WhatsAppAccountCreate, WhatsAppAccountUpdate
 from app.crud import whatsapp as crud_whatsapp
-from app.crud.whatsapp import PartialWhatsAppCredentialsError, PhonePoolExhaustedError
+from app.crud.whatsapp import (
+    PartialWhatsAppCredentialsError,
+    PhonePoolExhaustedError,
+    PoolAccessTokenNotConfiguredError,
+)
 from typing import List, Optional
 
 # This module is a thin adapter over app/crud/whatsapp.py — the single
@@ -17,6 +21,7 @@ from typing import List, Optional
 __all__ = [
     "PartialWhatsAppCredentialsError",
     "PhonePoolExhaustedError",
+    "PoolAccessTokenNotConfiguredError",
     "get_account_by_id",
     "get_accounts_by_user",
     "create_account",
