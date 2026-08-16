@@ -408,7 +408,14 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
                 ],
             )
 
-            response_text = response.content[0].text
+            # This model returns extended-thinking content blocks before the
+            # text block non-deterministically (confirmed live — the same
+            # prompt sometimes returns [ThinkingBlock, TextBlock] and
+            # sometimes just [TextBlock]), so content[0] isn't reliably the
+            # reply — filter for the actual text block(s) instead.
+            response_text = "".join(
+                block.text for block in response.content if block.type == "text"
+            )
             
             # Post-process response for special triggers
             

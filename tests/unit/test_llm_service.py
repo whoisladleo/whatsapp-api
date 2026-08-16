@@ -37,13 +37,19 @@ class _FakeAnthropicClient:
 
 
 class _FakeContentBlock:
-    def __init__(self, text):
-        self.text = text
+    def __init__(self, text=None, type="text"):
+        self.type = type
+        if text is not None:
+            self.text = text
 
 
 class _FakeResponse:
-    def __init__(self, text):
-        self.content = [_FakeContentBlock(text)]
+    def __init__(self, text, thinking_first=False):
+        blocks = []
+        if thinking_first:
+            blocks.append(_FakeContentBlock(type="thinking"))
+        blocks.append(_FakeContentBlock(text=text))
+        self.content = blocks
 
 
 def _service_with_fake_client(handler=None, captured=None):
@@ -155,6 +161,28 @@ async def test_creates_customer_and_context_on_first_contact(db_session, shop_ac
     ).first()
     assert context is not None
     assert context.state == ConversationState.NEGOTIATING
+
+
+async def test_extracts_text_when_thinking_block_precedes_it(db_session, shop_account):
+    """
+    claude-sonnet-5 sometimes returns an extended-thinking block before the
+    text block (confirmed live, non-deterministic for the same prompt) —
+    response.content[0] isn't reliably the reply, so the extraction must
+    filter for the actual text block(s) rather than blindly index [0].
+    """
+    async def thinking_then_text_handler(**kwargs):
+        return _FakeResponse("The real reply.", thinking_first=True)
+
+    service = _service_with_fake_client(handler=thinking_then_text_handler)
+
+    result = await service.generate_response(
+        message_body="hello",
+        from_phone="255711118888",
+        db=db_session,
+        account=shop_account,
+    )
+
+    assert result == "The real reply."
 
 
 async def test_customer_lookup_normalizes_phone_across_formats(db_session, shop_account):
