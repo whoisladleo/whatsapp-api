@@ -161,6 +161,8 @@ class Customer(Base):
     id = Column(Integer, primary_key=True, index=True)
     phone_number = Column(String, unique=True, index=True, nullable=False)
     delivery_address = Column(String, nullable=True)
+    delivery_latitude = Column(Float, nullable=True)
+    delivery_longitude = Column(Float, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     orders = relationship("Order", back_populates="customer")
@@ -177,6 +179,7 @@ class Order(Base):
     quantity = Column(Integer, default=1)
     payment_type = Column(Enum(PaymentType), nullable=True)
     tunzaa_transaction_id = Column(String, nullable=True)
+    tunzaa_plan_id = Column(String, nullable=True)
     status = Column(Enum(OrderStatus), default=OrderStatus.PENDING)
     agreed_price = Column(Float, nullable=True)
     tunzaa_link = Column(String, nullable=True)

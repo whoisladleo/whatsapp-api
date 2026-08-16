@@ -144,3 +144,46 @@ def test_parses_multiple_entries_and_changes():
 def test_empty_payload_returns_empty_list():
     assert WebhookParser.parse_inbound({}) == []
     assert WebhookParser.parse_inbound({"entry": []}) == []
+
+
+def test_parses_named_location_message():
+    message = {
+        "from": "255711111111",
+        "id": "wamid.loc1",
+        "timestamp": "1234567890",
+        "type": "location",
+        "location": {
+            "latitude": -6.7924,
+            "longitude": 39.2083,
+            "name": "My Shop",
+            "address": "123 Main St, Dar es Salaam",
+        },
+    }
+    parsed = WebhookParser.parse_inbound(_envelope(_base_value(messages=[message])))
+
+    assert len(parsed) == 1
+    item = parsed[0]
+    assert item["type"] == "location"
+    assert item["body"] == "My Shop"
+    assert item["location"] == {
+        "latitude": -6.7924,
+        "longitude": 39.2083,
+        "name": "My Shop",
+        "address": "123 Main St, Dar es Salaam",
+    }
+
+
+def test_parses_raw_pin_location_message_falls_back_to_coordinates():
+    message = {
+        "from": "255711111111",
+        "id": "wamid.loc2",
+        "timestamp": "1234567890",
+        "type": "location",
+        "location": {"latitude": -6.7924, "longitude": 39.2083},
+    }
+    parsed = WebhookParser.parse_inbound(_envelope(_base_value(messages=[message])))
+
+    item = parsed[0]
+    assert item["body"] == "📍 -6.7924,39.2083"
+    assert item["location"]["name"] is None
+    assert item["location"]["address"] is None

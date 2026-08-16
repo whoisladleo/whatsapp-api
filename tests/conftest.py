@@ -67,9 +67,11 @@ def _no_real_external_credentials(monkeypatch):
 def _no_real_celery_broker(monkeypatch):
     """
     Some request paths schedule follow-up work via Celery's apply_async(...)
-    at event time (e.g. the handoff reminder scheduled from llm.py, and the
+    at event time (e.g. the handoff reminder scheduled from llm.py, the
     soft-nudge/scarcity-nudge/auto-cancel reminders scheduled at order
-    creation in LLMService._close_deal). Without a real broker, apply_async
+    creation in LLMService._close_deal, and the location-capture task
+    dispatched from the webhook handler on an inbound location message).
+    Without a real broker, apply_async
     would attempt a real Redis connection — and running these eagerly would
     also re-hit the same nested-event-loop problem process_inbound_message's
     _run_async exists to solve, since scheduling happens from within an
@@ -80,11 +82,13 @@ def _no_real_celery_broker(monkeypatch):
     """
     from app.tasks.handoff_reminders import send_handoff_reminder
     from app.tasks.order_reminders import auto_cancel_order, send_scarcity_nudge, send_soft_nudge
+    from app.tasks.location_capture import capture_customer_location
 
     monkeypatch.setattr(send_handoff_reminder, "apply_async", lambda *a, **kw: None)
     monkeypatch.setattr(send_soft_nudge, "apply_async", lambda *a, **kw: None)
     monkeypatch.setattr(send_scarcity_nudge, "apply_async", lambda *a, **kw: None)
     monkeypatch.setattr(auto_cancel_order, "apply_async", lambda *a, **kw: None)
+    monkeypatch.setattr(capture_customer_location, "apply_async", lambda *a, **kw: None)
 
 
 @pytest.fixture

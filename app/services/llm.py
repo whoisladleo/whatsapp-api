@@ -162,10 +162,13 @@ class LLMService:
                 db.commit()
                 return (
                     f"A payment request for TZS {order.agreed_price:,.0f} has been sent to your "
-                    "phone — please approve it to complete your order."
+                    "phone — please approve it to complete your order. While you're at it, please "
+                    "share your delivery location using WhatsApp's location-sharing feature (the 📎 "
+                    "attach icon) so we know where to deliver it."
                 )
             else:
                 resp = await tunzaa_service.create_installment_plan(order, product.name)
+                order.tunzaa_plan_id = str(resp.get("plan", {}).get("plan_id")) if resp.get("plan", {}).get("plan_id") else None
                 for inst in resp.get("installments", []):
                     try:
                         due_date = datetime.strptime(inst["due_date"], "%Y-%m-%d")
@@ -181,7 +184,11 @@ class LLMService:
                         )
                     )
                 db.commit()
-                return "Your installment plan has been created! We'll be in touch with payment details."
+                return (
+                    "Your installment plan has been created! We'll be in touch with payment "
+                    "details. Please also share your delivery location using WhatsApp's "
+                    "location-sharing feature (the 📎 attach icon) so we know where to deliver it."
+                )
         except Exception as e:
             logger.error(f"Tunzaa dispatch failed for order {order.id}: {e}")
             # This order never got as far as an accepted payment attempt —

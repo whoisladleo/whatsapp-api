@@ -561,3 +561,99 @@ def test_ai_reply_logged_as_failed_when_meta_send_fails(client, db_session, merc
     assert outbound is not None
     assert outbound.status == "failed"
     assert outbound.whatsapp_message_id.startswith("failed_")
+
+
+def _location_webhook_payload(phone_number_id: str, from_phone: str, msg_id="wamid.loc1"):
+    return {
+        "entry": [
+            {
+                "id": "entry1",
+                "changes": [
+                    {
+                        "value": {
+                            "messaging_product": "whatsapp",
+                            "metadata": {
+                                "display_phone_number": "255700000000",
+                                "phone_number_id": phone_number_id,
+                            },
+                            "messages": [
+                                {
+                                    "from": from_phone,
+                                    "id": msg_id,
+                                    "timestamp": "1700000000",
+                                    "type": "location",
+                                    "location": {
+                                        "latitude": -6.7924,
+                                        "longitude": 39.2083,
+                                        "name": "My Shop",
+                                        "address": "123 Main St",
+                                    },
+                                }
+                            ],
+                        },
+                        "field": "messages",
+                    }
+                ],
+            }
+        ]
+    }
+
+
+def test_inbound_location_message_dispatches_capture_task(client, db_session, merchant_owner):
+    account = WhatsAppAccount(
+        name="Loc Shop",
+        phone_number_id="PHONE_LOC",
+        access_token="tok",
+        ai_enabled=True,
+        user_id=merchant_owner.id,
+    )
+    db_session.add(account)
+    db_session.commit()
+    db_session.refresh(account)
+
+    import app.tasks.location_capture as location_capture_module
+
+    calls = []
+    original = location_capture_module.capture_customer_location.apply_async
+    location_capture_module.capture_customer_location.apply_async = lambda args=None, **kw: calls.append(args)
+    try:
+        payload = _location_webhook_payload("PHONE_LOC", "255711114444")
+        resp = client.post(WEBHOOK_URL, json=payload)
+    finally:
+        location_capture_module.capture_customer_location.apply_async = original
+
+    assert resp.status_code == 200
+    assert len(calls) == 1
+    assert calls[0] == [account.id, "255711114444", -6.7924, 39.2083, "My Shop", "123 Main St"]
+
+    inbound = db_session.query(Message).filter(Message.direction == "inbound").first()
+    assert inbound is not None
+    assert inbound.type == "location"
+    assert inbound.body == "My Shop"
+
+
+def test_inbound_location_message_dispatches_even_when_ai_disabled(client, db_session, merchant_owner):
+    account = WhatsAppAccount(
+        name="Loc Shop 2",
+        phone_number_id="PHONE_LOC2",
+        access_token="tok",
+        ai_enabled=False,
+        user_id=merchant_owner.id,
+    )
+    db_session.add(account)
+    db_session.commit()
+    db_session.refresh(account)
+
+    import app.tasks.location_capture as location_capture_module
+
+    calls = []
+    original = location_capture_module.capture_customer_location.apply_async
+    location_capture_module.capture_customer_location.apply_async = lambda args=None, **kw: calls.append(args)
+    try:
+        payload = _location_webhook_payload("PHONE_LOC2", "255711115555")
+        resp = client.post(WEBHOOK_URL, json=payload)
+    finally:
+        location_capture_module.capture_customer_location.apply_async = original
+
+    assert resp.status_code == 200
+    assert len(calls) == 1

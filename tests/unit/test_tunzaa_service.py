@@ -185,3 +185,59 @@ async def test_create_installment_plan_raises_on_http_error(db_session):
 
     with pytest.raises(httpx.HTTPStatusError):
         await service.create_installment_plan(order, "Shoes")
+
+
+GET_PLAN_URL = "https://pay.tunzaa.co.tz/api/v1/installments/1001"
+
+
+@respx.mock
+async def test_get_installment_plan_fetches_with_environment_header(monkeypatch):
+    service = _service()
+    monkeypatch.setattr(settings, "TUNZAA_ENVIRONMENT", "sandbox")
+    respx.post(TOKEN_URL).mock(
+        return_value=httpx.Response(200, json={"access_token": "tok-1"})
+    )
+    route = respx.get(GET_PLAN_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "plan": {"plan_id": 1001, "remaining_balance": "0.00"},
+                "installments": [],
+            },
+        )
+    )
+
+    result = await service.get_installment_plan("1001", include_payments=True)
+
+    assert result["plan"]["plan_id"] == 1001
+    assert route.calls.last.request.headers["X-Environment"] == "sandbox"
+    assert route.calls.last.request.url.params["include_payments"] == "true"
+
+
+@respx.mock
+async def test_get_installment_plan_without_include_payments_omits_param():
+    service = _service()
+    respx.post(TOKEN_URL).mock(
+        return_value=httpx.Response(200, json={"access_token": "tok-1"})
+    )
+    route = respx.get(GET_PLAN_URL).mock(
+        return_value=httpx.Response(200, json={"plan": {}, "installments": []})
+    )
+
+    await service.get_installment_plan("1001")
+
+    assert "include_payments" not in route.calls.last.request.url.params
+
+
+@respx.mock
+async def test_get_installment_plan_raises_on_http_error():
+    service = _service()
+    respx.post(TOKEN_URL).mock(
+        return_value=httpx.Response(200, json={"access_token": "tok-1"})
+    )
+    respx.get(GET_PLAN_URL).mock(return_value=httpx.Response(500))
+
+    import pytest
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await service.get_installment_plan("1001")

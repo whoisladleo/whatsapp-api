@@ -12,6 +12,7 @@ celery_app = Celery(
         "app.tasks.order_reminders",
         "app.tasks.handoff_reminders",
         "app.tasks.webhook_processing",
+        "app.tasks.location_capture",
     ]
 )
 

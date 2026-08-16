@@ -13,6 +13,7 @@ import httpx
 from app.core.webhook_parser import WebhookParser
 from app.crud import message as crud_message
 from app.tasks.webhook_processing import process_inbound_message
+from app.tasks.location_capture import capture_customer_location
 from app.schemas.whatsapp import (
     MessageRead,
     MessageSend,
@@ -151,6 +152,25 @@ async def handle_webhook(
             ):
                 process_inbound_message.apply_async(
                     args=[account_id, item.get("from_phone"), item.get("body")]
+                )
+            elif (
+                item.get("direction") == "inbound"
+                and item.get("type") == "location"
+                and item.get("location")
+            ):
+                # Not gated on account_ai_enabled — capturing a delivery
+                # location is a fulfillment signal, not an AI/merchant
+                # conversation action, so it's accepted regardless.
+                loc = item["location"]
+                capture_customer_location.apply_async(
+                    args=[
+                        account_id,
+                        item.get("from_phone"),
+                        loc.get("latitude"),
+                        loc.get("longitude"),
+                        loc.get("name"),
+                        loc.get("address"),
+                    ]
                 )
 
         # 3. Forward to callback if configured

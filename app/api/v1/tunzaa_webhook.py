@@ -85,33 +85,36 @@ async def handle_tunzaa_webhook(
         return {"status": "ignored", "reason": "Already processed"}
 
     if status_value == "COMPLETED":
-        order.status = OrderStatus.PAID
         if transaction_id:
             order.tunzaa_transaction_id = transaction_id
-        db.commit()
 
-        # Update the matching installment, if this was one leg of an
-        # installment plan rather than a one-off payment. The exact shape of
-        # an installment-specific callback (vs. a one-off payment callback)
-        # wasn't fully verifiable against Tunzaa's docs — this keeps the
-        # prior best-effort matching logic, now reading the correct
-        # top-level field names.
         installment_id = data.get("installment_id")
-        if installment_id:
-            installment = db.query(Installment).filter(
-                Installment.order_id == order.id,
-                Installment.tunzaa_installment_id == installment_id,
-            ).first()
-            if installment:
-                installment.status = InstallmentStatus.PAID
-                db.commit()
+        if installment_id and order.tunzaa_plan_id:
+            # One leg of a multi-installment plan. Tunzaa tracks cumulative
+            # payment at the plan level (paid_amount/remaining_balance), not
+            # just a binary paid/unpaid per installment — reconcile against
+            # that authoritative state instead of assuming this one callback
+            # means the whole order is paid. This is what correctly absorbs
+            # an over/under-paid installment: whatever Tunzaa's ledger says
+            # is still owed drives our Order.status, not this callback alone.
+            await _reconcile_installment_plan(db, order, installment_id)
+        else:
+            # One-off FULL payment (no installment_id), or an
+            # installment order with no captured plan id to reconcile
+            # against (e.g. pre-existing data) — no plan-level balance to
+            # check, so this single callback is authoritative on its own.
+            order.status = OrderStatus.PAID
+            if installment_id:
+                _mark_single_installment_paid(db, order, installment_id)
+
+        db.commit()
 
         # Stock was already decremented at reservation time (order creation
         # in app/services/llm.py) — nothing further to do there. Just
         # confirm to the customer.
         await _notify_customer(db, order, "payment_complete")
 
-        return {"status": "success", "message": "Order marked as PAID"}
+        return {"status": "success", "message": f"Order status: {order.status.value}"}
 
     elif status_value in ("FAILED", "CANCELLED"):
         order.status = OrderStatus.FAILED
@@ -125,6 +128,71 @@ async def handle_tunzaa_webhook(
         return {"status": "success", "message": "Order marked as FAILED"}
 
     return {"status": "ignored", "reason": "Unhandled status"}
+
+
+def _mark_single_installment_paid(db: Session, order: Order, installment_id) -> None:
+    installment = db.query(Installment).filter(
+        Installment.order_id == order.id,
+        Installment.tunzaa_installment_id == installment_id,
+    ).first()
+    if installment:
+        installment.status = InstallmentStatus.PAID
+
+
+async def _reconcile_installment_plan(db: Session, order: Order, installment_id) -> None:
+    """
+    Fetches the plan's authoritative state from Tunzaa (paid_amount/
+    remaining_balance at the plan level, plus each installment's own
+    status) and syncs our local rows from it, rather than trusting this
+    one callback's fields in isolation. Falls back to the simpler
+    single-installment-matching behavior (and marks the order PAID
+    outright, matching this handler's pre-reconciliation behavior) if the
+    Tunzaa call itself fails, so a transient network error doesn't leave
+    the order stuck.
+    """
+    from app.services.tunzaa import tunzaa_service
+
+    try:
+        plan_data = await tunzaa_service.get_installment_plan(
+            order.tunzaa_plan_id, include_payments=True
+        )
+    except Exception as e:
+        logger.warning(
+            f"get_installment_plan failed for order {order.id} "
+            f"(plan {order.tunzaa_plan_id}); falling back to single-"
+            f"installment matching: {e}"
+        )
+        order.status = OrderStatus.PAID
+        _mark_single_installment_paid(db, order, installment_id)
+        return
+
+    for inst_data in plan_data.get("installments", []):
+        remote_id = inst_data.get("installment_id")
+        if remote_id is None:
+            continue
+        local = db.query(Installment).filter(
+            Installment.order_id == order.id,
+            Installment.tunzaa_installment_id == str(remote_id),
+        ).first()
+        if not local:
+            continue
+        remote_status = (inst_data.get("status") or "").upper()
+        if remote_status == "PAID":
+            local.status = InstallmentStatus.PAID
+        elif remote_status == "OVERDUE":
+            local.status = InstallmentStatus.OVERDUE
+
+    remaining_balance = plan_data.get("plan", {}).get("remaining_balance")
+    try:
+        remaining = float(remaining_balance) if remaining_balance is not None else None
+    except (TypeError, ValueError):
+        remaining = None
+
+    if remaining is not None and remaining <= 0:
+        order.status = OrderStatus.PAID
+    # else: leave order PENDING — the plan still has a balance outstanding,
+    # regardless of whether this particular leg was paid exactly, under, or
+    # over what was due.
 
 
 def _release_reservation(db: Session, order: Order) -> None:

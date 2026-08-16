@@ -126,4 +126,42 @@ class TunzaaService:
             print(f"Tunzaa create_installment error: {e}")
             raise
 
+    async def get_installment_plan(self, plan_id: str, include_payments: bool = False) -> Dict[str, Any]:
+        """
+        Fetches a plan's authoritative state — total_amount/paid_amount/
+        remaining_balance at the plan level, plus each installment's own
+        status. This is the real source of truth for how much has actually
+        been paid on a plan (Tunzaa tracks cumulative payment at the plan
+        level, not just a binary paid/unpaid per installment), used to
+        reconcile our local Installment/Order rows after a webhook callback
+        rather than trusting a single callback's fields in isolation.
+
+        NOTE: this exact REST path (GET /installments/{plan_id}) is inferred
+        from Tunzaa's own MCP grounding tool's parameter description
+        ("Append ?include_payments=true...") and follows the same
+        /installments/... convention as create_installment_plan — it has NOT
+        been verified against Tunzaa's real API docs the way the other
+        endpoints in this file were. Confirm this path before relying on it
+        in production.
+        """
+        headers = {
+            "Authorization": f"Bearer {await self.get_token()}",
+            **self._environment_header(),
+        }
+        params = {"include_payments": "true"} if include_payments else None
+
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    f"{self.base_url}/installments/{plan_id}",
+                    params=params,
+                    headers=headers,
+                    timeout=10.0
+                )
+                response.raise_for_status()
+                return response.json()
+        except Exception as e:
+            print(f"Tunzaa get_installment_plan error: {e}")
+            raise
+
 tunzaa_service = TunzaaService()

@@ -175,7 +175,7 @@ def test_payment_completed_marks_order_paid_and_notifies_customer(client, db_ses
     resp = _post(client, {"status": "COMPLETED", "reference_id": f"order-{order.id}", "transaction_id": "T1"})
 
     assert resp.status_code == 200
-    assert resp.json() == {"status": "success", "message": "Order marked as PAID"}
+    assert resp.json() == {"status": "success", "message": "Order status: PAID"}
     db_session.refresh(order)
     assert order.status == OrderStatus.PAID
     assert order.tunzaa_transaction_id == "T1"
@@ -217,6 +217,171 @@ def test_payment_completed_with_unknown_installment_id_does_not_crash(client, db
     assert resp.status_code == 200
     db_session.refresh(order)
     assert order.status == OrderStatus.PAID
+
+
+# --- installment-plan reconciliation (order.tunzaa_plan_id set) -------------
+
+
+def _mock_get_installment_plan(monkeypatch, response=None, raise_error=False):
+    async def fake(self, plan_id, include_payments=False):
+        if raise_error:
+            raise RuntimeError("network down")
+        return response
+
+    monkeypatch.setattr("app.services.tunzaa.TunzaaService.get_installment_plan", fake)
+
+
+@pytest.fixture
+def plan_order(db_session, order):
+    order.tunzaa_plan_id = "1001"
+    db_session.add(
+        Installment(
+            order_id=order.id, tunzaa_installment_id="10000", amount_due=15000,
+            due_date=order.created_at, status=InstallmentStatus.PENDING,
+        )
+    )
+    db_session.commit()
+    db_session.refresh(order)
+    return order
+
+
+def test_installment_reconciliation_order_stays_pending_with_remaining_balance(
+    client, db_session, plan_order, monkeypatch
+):
+    _mock_get_installment_plan(
+        monkeypatch,
+        response={
+            "plan": {"plan_id": 1001, "remaining_balance": "30000.00"},
+            "installments": [{"installment_id": 10000, "status": "PAID"}],
+        },
+    )
+
+    resp = _post(
+        client,
+        {"status": "COMPLETED", "reference_id": f"order-{plan_order.id}", "installment_id": "10000"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "success", "message": "Order status: PENDING"}
+    db_session.refresh(plan_order)
+    assert plan_order.status == OrderStatus.PENDING
+
+    installment = (
+        db_session.query(Installment)
+        .filter(Installment.order_id == plan_order.id, Installment.tunzaa_installment_id == "10000")
+        .first()
+    )
+    assert installment.status == InstallmentStatus.PAID
+
+
+def test_installment_reconciliation_marks_order_paid_when_balance_zero(
+    client, db_session, plan_order, monkeypatch
+):
+    _mock_get_installment_plan(
+        monkeypatch,
+        response={
+            "plan": {"plan_id": 1001, "remaining_balance": "0.00"},
+            "installments": [{"installment_id": 10000, "status": "PAID"}],
+        },
+    )
+
+    resp = _post(
+        client,
+        {"status": "COMPLETED", "reference_id": f"order-{plan_order.id}", "installment_id": "10000"},
+    )
+
+    assert resp.status_code == 200
+    db_session.refresh(plan_order)
+    assert plan_order.status == OrderStatus.PAID
+
+
+def test_installment_reconciliation_marks_overdue_installment(
+    client, db_session, plan_order, monkeypatch
+):
+    _mock_get_installment_plan(
+        monkeypatch,
+        response={
+            "plan": {"plan_id": 1001, "remaining_balance": "15000.00"},
+            "installments": [{"installment_id": 10000, "status": "OVERDUE"}],
+        },
+    )
+
+    _post(client, {"status": "COMPLETED", "reference_id": f"order-{plan_order.id}", "installment_id": "10000"})
+
+    installment = (
+        db_session.query(Installment)
+        .filter(Installment.order_id == plan_order.id, Installment.tunzaa_installment_id == "10000")
+        .first()
+    )
+    assert installment.status == InstallmentStatus.OVERDUE
+
+
+def test_installment_reconciliation_falls_back_when_get_plan_fails(
+    client, db_session, plan_order, monkeypatch
+):
+    _mock_get_installment_plan(monkeypatch, raise_error=True)
+
+    resp = _post(
+        client,
+        {"status": "COMPLETED", "reference_id": f"order-{plan_order.id}", "installment_id": "10000"},
+    )
+
+    assert resp.status_code == 200
+    db_session.refresh(plan_order)
+    assert plan_order.status == OrderStatus.PAID
+
+    installment = (
+        db_session.query(Installment)
+        .filter(Installment.order_id == plan_order.id, Installment.tunzaa_installment_id == "10000")
+        .first()
+    )
+    assert installment.status == InstallmentStatus.PAID
+
+
+def test_installment_reconciliation_unparseable_remaining_balance_leaves_order_pending(
+    client, db_session, plan_order, monkeypatch
+):
+    _mock_get_installment_plan(
+        monkeypatch,
+        response={"plan": {"plan_id": 1001, "remaining_balance": "not-a-number"}, "installments": []},
+    )
+
+    resp = _post(
+        client,
+        {"status": "COMPLETED", "reference_id": f"order-{plan_order.id}", "installment_id": "10000"},
+    )
+
+    assert resp.status_code == 200
+    db_session.refresh(plan_order)
+    assert plan_order.status == OrderStatus.PENDING
+
+
+def test_installment_reconciliation_ignores_unmatched_installment_ids(
+    client, db_session, plan_order, monkeypatch
+):
+    _mock_get_installment_plan(
+        monkeypatch,
+        response={
+            "plan": {"plan_id": 1001, "remaining_balance": "30000.00"},
+            "installments": [
+                {"installment_id": None},
+                {"installment_id": 99999, "status": "PAID"},
+            ],
+        },
+    )
+
+    resp = _post(
+        client,
+        {"status": "COMPLETED", "reference_id": f"order-{plan_order.id}", "installment_id": "10000"},
+    )
+
+    assert resp.status_code == 200
+    installment = (
+        db_session.query(Installment)
+        .filter(Installment.order_id == plan_order.id, Installment.tunzaa_installment_id == "10000")
+        .first()
+    )
+    assert installment.status == InstallmentStatus.PENDING
 
 
 def test_payment_completed_notify_failure_still_logs_failed_message(client, db_session, order, monkeypatch):

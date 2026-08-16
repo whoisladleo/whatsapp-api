@@ -22,6 +22,7 @@ class WebhookParser:
                     msg_id = message.get("id")
 
                     body = ""
+                    location = None
                     if msg_type == "text":
                         body = message.get("text", {}).get("body", "")
                     elif msg_type == "button":
@@ -34,18 +35,33 @@ class WebhookParser:
                         )
                     elif msg_type in ["image", "document", "audio", "video"]:
                         body = message.get(msg_type, {}).get("id", "")
-
-                    parsed_messages.append(
-                        {
-                            "phone_number_id": phone_number_id,
-                            "whatsapp_message_id": msg_id,
-                            "from_phone": from_phone,
-                            "type": msg_type,
-                            "body": body,
-                            "direction": "inbound",
-                            "raw": message,
+                    elif msg_type == "location":
+                        loc = message.get("location", {})
+                        latitude = loc.get("latitude")
+                        longitude = loc.get("longitude")
+                        name = loc.get("name")
+                        address = loc.get("address")
+                        location = {
+                            "latitude": latitude,
+                            "longitude": longitude,
+                            "name": name,
+                            "address": address,
                         }
-                    )
+                        label = name or address
+                        body = label if label else f"📍 {latitude},{longitude}"
+
+                    item = {
+                        "phone_number_id": phone_number_id,
+                        "whatsapp_message_id": msg_id,
+                        "from_phone": from_phone,
+                        "type": msg_type,
+                        "body": body,
+                        "direction": "inbound",
+                        "raw": message,
+                    }
+                    if location is not None:
+                        item["location"] = location
+                    parsed_messages.append(item)
 
                 # Handle Status Updates (delivered, read, etc)
                 for status in value.get("statuses", []):
