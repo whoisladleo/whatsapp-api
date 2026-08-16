@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api.v1 import auth, whatsapp, knowledge, tunzaa_webhook, accounts, products
+from app.api.v1 import auth, whatsapp, knowledge, tunzaa_webhook, accounts, products, orders
 from app.core.config import settings
 
 from fastapi.staticfiles import StaticFiles
@@ -46,6 +46,9 @@ app.include_router(
 )
 app.include_router(
     products.router, prefix=f"{settings.API_V1_STR}/products", tags=["products"]
+)
+app.include_router(
+    orders.router, prefix=f"{settings.API_V1_STR}/orders", tags=["orders"]
 )
 
 
