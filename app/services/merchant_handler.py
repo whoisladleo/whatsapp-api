@@ -1,5 +1,6 @@
 from sqlalchemy.orm import Session
-from app.db.models import WhatsAppAccount, Product, ConversationContext, ConversationState, Customer, Message
+from app.db.models import WhatsAppAccount, Product
+from app.crud import message as crud_message
 import re
 
 async def handle_merchant_message(db: Session, account: WhatsAppAccount, message_body: str, from_phone: str) -> str:
@@ -22,34 +23,12 @@ async def handle_merchant_message(db: Session, account: WhatsAppAccount, message
         if not phone:
             return "Usage: `/resume 2557XXXXXXXX`"
 
-        customer = db.query(Customer).filter(Customer.phone_number == phone).first()
-        if not customer:
-            return f"No conversation found for {phone}."
-
-        # NOTE: Customer/ConversationContext are global in this schema (not
-        # scoped per merchant/account). As a safeguard against one merchant
-        # resuming a conversation that actually belongs to a different
-        # merchant's customer, require that this customer has previously
-        # messaged *this* account before allowing the resume.
-        has_history_with_account = (
-            db.query(Message)
-            .filter(Message.from_phone == phone, Message.account_id == account.id)
-            .first()
-        )
-        if not has_history_with_account:
-            return f"No conversation with {phone} found for this account."
-
-        context = (
-            db.query(ConversationContext)
-            .filter(ConversationContext.customer_id == customer.id)
-            .first()
-        )
-        if not context or context.state != ConversationState.HUMAN_HANDOFF:
-            return f"{phone} is not currently in a human handoff state."
-
-        context.state = ConversationState.NEGOTIATING
-        context.handoff_at = None
-        db.commit()
+        try:
+            crud_message.resume_conversation_for_account(db, account.id, phone)
+        except crud_message.ConversationNotFoundError as e:
+            return str(e)
+        except crud_message.ConversationNotInHandoffError as e:
+            return str(e)
         return f"Conversation with {phone} resumed. Amara will respond to their next message."
 
     if body.lower().startswith("/stock "):

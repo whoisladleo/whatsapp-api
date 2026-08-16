@@ -1,6 +1,14 @@
 from sqlalchemy.orm import Session
-from app.db.models import Message, ConversationContext, ConversationState
+from app.db.models import Customer, Message, ConversationContext, ConversationState
 from typing import Dict, Any, List
+
+
+class ConversationNotFoundError(Exception):
+    """No conversation with this phone number exists, or none of its history belongs to this account."""
+
+
+class ConversationNotInHandoffError(Exception):
+    """The conversation exists but isn't currently in HUMAN_HANDOFF state."""
 
 
 def create_message(
@@ -46,6 +54,47 @@ def update_message_status(db: Session, whatsapp_message_id: str, status: str):
     db.query(Message).filter(Message.whatsapp_message_id == whatsapp_message_id).update(
         {"status": status}
     )
+    db.commit()
+
+
+def resume_conversation_for_account(db: Session, account_id: int, phone: str) -> None:
+    """
+    Flips a HUMAN_HANDOFF conversation back to NEGOTIATING. Shared by the
+    WhatsApp `/resume` merchant command (app/services/merchant_handler.py)
+    and the HTTP endpoint (POST /whatsapp/handoffs/{phone}/resume) so the
+    logic — including the account-scoping safeguard below — lives in one
+    place. Raises rather than returning a message string so each caller can
+    format the outcome for its own transport (WhatsApp reply text vs. an
+    HTTP status code).
+
+    NOTE: Customer/ConversationContext are global in this schema (not
+    scoped per merchant/account). As a safeguard against one merchant
+    resuming a conversation that actually belongs to a different merchant's
+    customer, require that this customer has previously messaged *this*
+    account before allowing the resume.
+    """
+    customer = db.query(Customer).filter(Customer.phone_number == phone).first()
+    if not customer:
+        raise ConversationNotFoundError(f"No conversation found for {phone}.")
+
+    has_history_with_account = (
+        db.query(Message)
+        .filter(Message.from_phone == phone, Message.account_id == account_id)
+        .first()
+    )
+    if not has_history_with_account:
+        raise ConversationNotFoundError(f"No conversation with {phone} found for this account.")
+
+    context = (
+        db.query(ConversationContext)
+        .filter(ConversationContext.customer_id == customer.id)
+        .first()
+    )
+    if not context or context.state != ConversationState.HUMAN_HANDOFF:
+        raise ConversationNotInHandoffError(f"{phone} is not currently in a human handoff state.")
+
+    context.state = ConversationState.NEGOTIATING
+    context.handoff_at = None
     db.commit()
 
 

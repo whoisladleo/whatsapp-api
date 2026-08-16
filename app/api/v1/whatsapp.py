@@ -197,6 +197,22 @@ def get_pending_handoffs(
     return crud_message.get_pending_handoffs_for_account(db, account.id)
 
 
+@router.post("/handoffs/{phone}/resume")
+def resume_handoff(
+    phone: str,
+    account: WhatsAppAccount = Depends(get_whatsapp_account),
+    db: Session = Depends(get_db),
+):
+    """HTTP equivalent of the WhatsApp `/resume` merchant command, for a dashboard inbox."""
+    try:
+        crud_message.resume_conversation_for_account(db, account.id, phone)
+    except crud_message.ConversationNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except crud_message.ConversationNotInHandoffError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"status": "resumed", "phone": phone}
+
+
 @router.get("/messages", response_model=list[MessageRead])
 def get_message_history(
     limit: int = 100,

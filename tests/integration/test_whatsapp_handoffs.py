@@ -138,3 +138,88 @@ def test_excludes_negotiating_conversations(client, db_session, owner_and_accoun
 
     assert resp.status_code == 200
     assert resp.json() == []
+
+
+def _seed_handoff(db_session, account, phone, state=ConversationState.HUMAN_HANDOFF):
+    customer = Customer(phone_number=phone)
+    db_session.add(customer)
+    db_session.commit()
+    db_session.refresh(customer)
+    db_session.add(
+        Message(
+            from_phone=phone, type="text", body="hi",
+            direction="inbound", status="sent", account_id=account.id,
+        )
+    )
+    db_session.add(ConversationContext(customer_id=customer.id, state=state, handoff_at=datetime.utcnow()))
+    db_session.commit()
+    return customer
+
+
+def test_resume_requires_auth(client, owner_and_account):
+    _, account, _ = owner_and_account
+
+    resp = client.post(
+        f"{URL}/255722229093/resume", headers={"X-WhatsApp-Account-ID": str(account.id)}
+    )
+
+    assert resp.status_code in (401, 403)
+
+
+def test_resume_succeeds_and_flips_state_back_to_negotiating(client, db_session, owner_and_account):
+    _, account, headers = owner_and_account
+    headers = {**headers, "X-WhatsApp-Account-ID": str(account.id)}
+    _seed_handoff(db_session, account, "255722229093")
+
+    resp = client.post(f"{URL}/255722229093/resume", headers=headers)
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "resumed", "phone": "255722229093"}
+    customer = db_session.query(Customer).filter(Customer.phone_number == "255722229093").one()
+    context = (
+        db_session.query(ConversationContext)
+        .filter(ConversationContext.customer_id == customer.id)
+        .one()
+    )
+    assert context.state == ConversationState.NEGOTIATING
+    assert context.handoff_at is None
+
+
+def test_resume_404_when_no_conversation(client, owner_and_account):
+    _, account, headers = owner_and_account
+    headers = {**headers, "X-WhatsApp-Account-ID": str(account.id)}
+
+    resp = client.post(f"{URL}/255700009999/resume", headers=headers)
+
+    assert resp.status_code == 404
+
+
+def test_resume_404_when_history_belongs_to_a_different_account(client, db_session, owner_and_account):
+    _, account, headers = owner_and_account
+    headers = {**headers, "X-WhatsApp-Account-ID": str(account.id)}
+
+    other_owner = User(username="255700000803")
+    db_session.add(other_owner)
+    db_session.commit()
+    db_session.refresh(other_owner)
+    other_account = WhatsAppAccount(
+        name="Other Shop 2", phone_number_id="OTHER_HANDOFF_PHONE_2", access_token="tok", user_id=other_owner.id,
+    )
+    db_session.add(other_account)
+    db_session.commit()
+    db_session.refresh(other_account)
+    _seed_handoff(db_session, other_account, "255722229094")
+
+    resp = client.post(f"{URL}/255722229094/resume", headers=headers)
+
+    assert resp.status_code == 404
+
+
+def test_resume_400_when_not_in_handoff_state(client, db_session, owner_and_account):
+    _, account, headers = owner_and_account
+    headers = {**headers, "X-WhatsApp-Account-ID": str(account.id)}
+    _seed_handoff(db_session, account, "255722229095", state=ConversationState.NEGOTIATING)
+
+    resp = client.post(f"{URL}/255722229095/resume", headers=headers)
+
+    assert resp.status_code == 400
