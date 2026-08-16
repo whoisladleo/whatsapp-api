@@ -393,10 +393,12 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
         
         try:
             # 5. Call Claude
+            # temperature is deprecated/rejected for this model (confirmed
+            # live against the real API — not documented ahead of time) —
+            # omitted rather than guessing at a replacement parameter.
             response = await self.client.messages.create(
                 model=self.model_id,
                 max_tokens=1024,
-                temperature=0.7,
                 system=base_instruction,
                 messages=[
                     {
