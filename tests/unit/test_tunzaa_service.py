@@ -8,9 +8,9 @@ from app.core.config import settings
 from app.db.models import Customer, Order
 from app.services.tunzaa import TunzaaService
 
-TOKEN_URL = "https://pay.tunzaa.co.tz/api/v1/accounts/request/token"
-PAYMENT_URL = "https://pay.tunzaa.co.tz/api/v1/payments/initiate-payment"
-INSTALLMENT_URL = "https://pay.tunzaa.co.tz/api/v1/installments/create"
+TOKEN_URL = "https://pay.tunzaa.co.tz/accounts/request/token"
+PAYMENT_URL = "https://pay.tunzaa.co.tz/payments/initiate-payment"
+INSTALLMENT_URL = "https://pay.tunzaa.co.tz/installments/create"
 
 
 def _service():
@@ -187,7 +187,7 @@ async def test_create_installment_plan_raises_on_http_error(db_session):
         await service.create_installment_plan(order, "Shoes")
 
 
-GET_PLAN_URL = "https://pay.tunzaa.co.tz/api/v1/installments/1001"
+GET_PLAN_URL = "https://pay.tunzaa.co.tz/installments/1001"
 
 
 @respx.mock

@@ -7,7 +7,7 @@ from app.core.config import settings
 from app.db.models import Order, Customer
 
 class TunzaaService:
-    def __init__(self, api_key: str = None, secret_key: str = None, base_url: str = "https://pay.tunzaa.co.tz/api/v1"):
+    def __init__(self, api_key: str = None, secret_key: str = None, base_url: str = "https://pay.tunzaa.co.tz"):
         self.api_key = api_key or os.environ.get("TUNZAA_API_KEY", "")
         self.secret_key = secret_key or os.environ.get("TUNZAA_SECRET_KEY", "")
         self.base_url = base_url
@@ -136,13 +136,10 @@ class TunzaaService:
         reconcile our local Installment/Order rows after a webhook callback
         rather than trusting a single callback's fields in isolation.
 
-        NOTE: this exact REST path (GET /installments/{plan_id}) is inferred
-        from Tunzaa's own MCP grounding tool's parameter description
-        ("Append ?include_payments=true...") and follows the same
-        /installments/... convention as create_installment_plan — it has NOT
-        been verified against Tunzaa's real API docs the way the other
-        endpoints in this file were. Confirm this path before relying on it
-        in production.
+        Verified against the real sandbox API (GET /installments/{plan_id}
+        ?include_payments=true) — the response includes plan/installments in
+        the shape used below, plus payment_history/progress fields this
+        method doesn't currently use.
         """
         headers = {
             "Authorization": f"Bearer {await self.get_token()}",

@@ -18,9 +18,9 @@ from app.db.models import (
 from app.services.llm import LLMService, _parse_and_strip_agreement
 
 MESSAGES_URL_RE = r"https://graph\.facebook\.com/.+/messages$"
-TOKEN_URL = "https://pay.tunzaa.co.tz/api/v1/accounts/request/token"
-PAYMENT_URL = "https://pay.tunzaa.co.tz/api/v1/payments/initiate-payment"
-INSTALLMENT_URL = "https://pay.tunzaa.co.tz/api/v1/installments/create"
+TOKEN_URL = "https://pay.tunzaa.co.tz/accounts/request/token"
+PAYMENT_URL = "https://pay.tunzaa.co.tz/payments/initiate-payment"
+INSTALLMENT_URL = "https://pay.tunzaa.co.tz/installments/create"
 
 
 class _FakeModels:
