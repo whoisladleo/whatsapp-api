@@ -19,6 +19,14 @@ jobs:
         include:
           - image: whoisladleo/whatsapp-api
             dockerfile: ./Dockerfile.prod
+          # Same codebase/image as the API — Dockerfile.prod's default CMD
+          # (./scripts/run.sh) starts the web server. Published under this
+          # separate tag purely so Coolify can deploy it as its own resource
+          # with the start command overridden to:
+          #   celery -A app.core.celery_app worker --loglevel=info
+          # (matches docker-compose.prod.yml's celery_worker service).
+          - image: whoisladleo/whatsapp-api-celery
+            dockerfile: ./Dockerfile.prod
 
     steps:
       - name: Checkout code
