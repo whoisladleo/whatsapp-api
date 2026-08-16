@@ -24,7 +24,10 @@ else
 fi
 
 # Start app
-if [ "$RUN_MODE" = "production" ]; then
+if [ "$PROCESS_TYPE" = "celery_worker" ]; then
+  echo "Starting Celery worker..."
+  exec celery -A app.core.celery_app worker --loglevel=info
+elif [ "$RUN_MODE" = "production" ]; then
   port=${PORT:-8000}
   echo "Starting Gunicorn in production mode on port $port..."
   exec gunicorn -c app/core/gunicorn_conf.py main:app
