@@ -158,6 +158,70 @@ def test_list_orders_filters_by_account_id(client, merchant_headers, order, acco
     assert resp.json() == []
 
 
+def test_get_order_detail_includes_payment_progress(client, merchant_headers, db_session, order):
+    order.paid_amount = 15000
+    order.remaining_balance = 30000
+    db_session.commit()
+
+    resp = client.get(f"{BASE}/{order.id}", headers=merchant_headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["paid_amount"] == 15000
+    assert body["remaining_balance"] == 30000
+    # agreed_price=45000 on the `order` fixture -> 15000/45000 = 33.33%
+    assert body["percentage_complete"] == pytest.approx(33.33)
+
+
+def test_payment_history_requires_installment_plan(client, merchant_headers, order):
+    resp = client.get(f"{BASE}/{order.id}/payment-history", headers=merchant_headers)
+    assert resp.status_code == 400
+
+
+def test_payment_history_not_found(client, merchant_headers):
+    resp = client.get(f"{BASE}/999999/payment-history", headers=merchant_headers)
+    assert resp.status_code == 404
+
+
+@respx.mock
+def test_payment_history_returns_tunzaa_data(client, merchant_headers, db_session, order):
+    order.tunzaa_plan_id = "1001"
+    db_session.commit()
+
+    respx.post("https://pay.tunzaa.co.tz/accounts/request/token").mock(
+        return_value=httpx.Response(200, json={"access_token": "tok-1"})
+    )
+    respx.get("https://pay.tunzaa.co.tz/installments/1001").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "plan": {"plan_id": 1001, "remaining_balance": "30000.00"},
+                "installments": [],
+                "payment_history": [{"amount": "15000.00", "date": "2026-08-16"}],
+            },
+        )
+    )
+
+    resp = client.get(f"{BASE}/{order.id}/payment-history", headers=merchant_headers)
+
+    assert resp.status_code == 200
+    assert resp.json() == [{"amount": "15000.00", "date": "2026-08-16"}]
+
+
+@respx.mock
+def test_payment_history_returns_502_when_tunzaa_unreachable(
+    client, merchant_headers, db_session, order
+):
+    order.tunzaa_plan_id = "1001"
+    db_session.commit()
+
+    respx.post("https://pay.tunzaa.co.tz/accounts/request/token").mock(
+        side_effect=httpx.ConnectError("boom")
+    )
+
+    resp = client.get(f"{BASE}/{order.id}/payment-history", headers=merchant_headers)
+    assert resp.status_code == 502
+
+
 def test_get_order_detail_includes_delivery_address_and_installments(
     client, merchant_headers, db_session, order, customer
 ):

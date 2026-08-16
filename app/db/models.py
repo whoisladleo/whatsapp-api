@@ -180,6 +180,12 @@ class Order(Base):
     payment_type = Column(Enum(PaymentType), nullable=True)
     tunzaa_transaction_id = Column(String, nullable=True)
     tunzaa_plan_id = Column(String, nullable=True)
+    # Only meaningful for INSTALLMENT orders; synced from Tunzaa's
+    # plan-level paid_amount/remaining_balance on each reconciliation
+    # (see app/api/v1/tunzaa_webhook.py) rather than computed locally —
+    # Tunzaa's ledger is the source of truth for this, not ours.
+    paid_amount = Column(Float, nullable=True)
+    remaining_balance = Column(Float, nullable=True)
     status = Column(Enum(OrderStatus), default=OrderStatus.PENDING)
     agreed_price = Column(Float, nullable=True)
     tunzaa_link = Column(String, nullable=True)

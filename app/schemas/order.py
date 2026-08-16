@@ -31,3 +31,9 @@ class OrderDetail(OrderRead):
     delivery_address: Optional[str] = None
     tunzaa_transaction_id: Optional[str] = None
     installments: List[InstallmentRead] = []
+    # Only populated for INSTALLMENT orders, synced from Tunzaa's own
+    # plan-level ledger on each payment webhook — see
+    # app/api/v1/tunzaa_webhook.py's _reconcile_installment_plan.
+    paid_amount: Optional[float] = None
+    remaining_balance: Optional[float] = None
+    percentage_complete: Optional[float] = None

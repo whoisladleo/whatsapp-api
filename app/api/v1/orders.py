@@ -48,6 +48,44 @@ def get_order(
     return order
 
 
+@router.get("/{order_id}/payment-history")
+async def get_order_payment_history(
+    order_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Live pass-through of Tunzaa's own payment_history for an installment
+    order — deliberately not persisted locally (Tunzaa stays the source of
+    truth for individual payment events, same principle as
+    paid_amount/remaining_balance). Returned as-is/untyped: this project
+    has only ever observed an empty payment_history array in testing (no
+    real payment has been made against a sandbox order), so the shape of a
+    populated entry isn't confirmed and isn't worth guessing at with a
+    strict schema.
+    """
+    order = get_order_for_merchant(db, order_id, current_user.id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if not order.tunzaa_plan_id:
+        raise HTTPException(
+            status_code=400,
+            detail="This order has no associated installment plan.",
+        )
+
+    from app.services.tunzaa import tunzaa_service
+
+    try:
+        plan_data = await tunzaa_service.get_installment_plan(
+            order.tunzaa_plan_id, include_payments=True
+        )
+    except Exception as e:
+        logger.error(f"Failed to fetch payment history for order {order_id}: {e}")
+        raise HTTPException(status_code=502, detail="Could not reach Tunzaa right now.")
+
+    return plan_data.get("payment_history", [])
+
+
 @router.post("/{order_id}/cancel", response_model=OrderDetail)
 async def cancel_existing_order(
     order_id: int,

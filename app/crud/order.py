@@ -10,6 +10,10 @@ class OrderNotCancellableError(Exception):
     """Raised when trying to cancel an order that isn't PENDING."""
 
 
+class OrderHasNoPaymentPlanError(Exception):
+    """Raised when payment history is requested for an order with no tunzaa_plan_id (not an installment order, or predates plan-id capture)."""
+
+
 def _to_order_read(order: Order) -> OrderRead:
     return OrderRead(
         id=order.id,
@@ -27,11 +31,18 @@ def _to_order_read(order: Order) -> OrderRead:
 
 def _to_order_detail(order: Order) -> OrderDetail:
     base = _to_order_read(order)
+    percentage_complete = None
+    if order.paid_amount is not None and order.agreed_price:
+        percentage_complete = round((order.paid_amount / order.agreed_price) * 100, 2)
+
     return OrderDetail(
         **base.model_dump(),
         delivery_address=order.customer.delivery_address if order.customer else None,
         tunzaa_transaction_id=order.tunzaa_transaction_id,
         installments=order.installments,
+        paid_amount=order.paid_amount,
+        remaining_balance=order.remaining_balance,
+        percentage_complete=percentage_complete,
     )
 
 

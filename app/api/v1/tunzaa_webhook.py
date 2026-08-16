@@ -182,17 +182,22 @@ async def _reconcile_installment_plan(db: Session, order: Order, installment_id)
         elif remote_status == "OVERDUE":
             local.status = InstallmentStatus.OVERDUE
 
-    remaining_balance = plan_data.get("plan", {}).get("remaining_balance")
-    try:
-        remaining = float(remaining_balance) if remaining_balance is not None else None
-    except (TypeError, ValueError):
-        remaining = None
+    plan = plan_data.get("plan", {})
+    order.paid_amount = _parse_float(plan.get("paid_amount"))
+    order.remaining_balance = _parse_float(plan.get("remaining_balance"))
 
-    if remaining is not None and remaining <= 0:
+    if order.remaining_balance is not None and order.remaining_balance <= 0:
         order.status = OrderStatus.PAID
     # else: leave order PENDING — the plan still has a balance outstanding,
     # regardless of whether this particular leg was paid exactly, under, or
     # over what was due.
+
+
+def _parse_float(value) -> Optional[float]:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _release_reservation(db: Session, order: Order) -> None:
