@@ -280,7 +280,7 @@ async def test_platform_account_first_message_sends_exact_welcome(db_session, pl
 
     instruction = captured["system"]
     assert "Welcome Message" in instruction
-    assert "Habari! My name is *Amara*" in instruction
+    assert "Hi, I'm *Amara*" in instruction
 
     # The merchant (person texting the platform account) is created as a User.
     merchant_user = db_session.query(User).filter(User.username == "255722220000").first()
