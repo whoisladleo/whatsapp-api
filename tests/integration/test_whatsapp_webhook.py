@@ -159,7 +159,7 @@ def test_inbound_message_from_customer_routes_to_ai(client, db_session, merchant
 
     # Replace the whole module-level `llm_service` reference (not just a
     # method on the real singleton) so this test doesn't depend on whether
-    # GOOGLE_API_KEY happens to be set in the environment — in CI it's
+    # ANTHROPIC_API_KEY happens to be set in the environment — in CI it's
     # unset, which makes the real `llm_service` None. AI processing now
     # happens inside the webhook_processing task module, not whatsapp.py.
     import app.tasks.webhook_processing as webhook_processing_module

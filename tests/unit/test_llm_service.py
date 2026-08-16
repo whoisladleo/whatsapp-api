@@ -23,27 +23,27 @@ PAYMENT_URL = "https://pay.tunzaa.co.tz/payments/initiate-payment"
 INSTALLMENT_URL = "https://pay.tunzaa.co.tz/installments/create"
 
 
-class _FakeModels:
+class _FakeMessages:
     def __init__(self, handler):
         self._handler = handler
 
-    async def generate_content(self, model, contents, config):
-        return await self._handler(model=model, contents=contents, config=config)
+    async def create(self, **kwargs):
+        return await self._handler(**kwargs)
 
 
-class _FakeAio:
+class _FakeAnthropicClient:
     def __init__(self, handler):
-        self.models = _FakeModels(handler)
+        self.messages = _FakeMessages(handler)
 
 
-class _FakeGenAIClient:
-    def __init__(self, handler):
-        self.aio = _FakeAio(handler)
+class _FakeContentBlock:
+    def __init__(self, text):
+        self.text = text
 
 
 class _FakeResponse:
     def __init__(self, text):
-        self.text = text
+        self.content = [_FakeContentBlock(text)]
 
 
 def _service_with_fake_client(handler=None, captured=None):
@@ -54,7 +54,7 @@ def _service_with_fake_client(handler=None, captured=None):
             captured.update(kwargs)
         return _FakeResponse("Sure, here is some info.")
 
-    service.client = _FakeGenAIClient(handler or default_handler)
+    service.client = _FakeAnthropicClient(handler or default_handler)
     return service
 
 
@@ -219,7 +219,7 @@ async def test_regular_account_catalog_uses_account_owner_products(db_session, s
         account=shop_account,
     )
 
-    instruction = captured["config"].system_instruction
+    instruction = captured["system"]
     assert "Shoes" in instruction
     assert "Available Products" in instruction
     assert "Test Shop" in instruction
@@ -236,7 +236,7 @@ async def test_regular_account_no_products_shows_placeholder(db_session, shop_ac
         account=shop_account,
     )
 
-    assert "No products currently available." in captured["config"].system_instruction
+    assert "No products currently available." in captured["system"]
 
 
 async def test_platform_account_first_message_sends_exact_welcome(db_session, platform_account):
@@ -250,7 +250,7 @@ async def test_platform_account_first_message_sends_exact_welcome(db_session, pl
         account=platform_account,
     )
 
-    instruction = captured["config"].system_instruction
+    instruction = captured["system"]
     assert "Welcome Message" in instruction
     assert "Habari! My name is *Amara*" in instruction
 
@@ -283,7 +283,7 @@ async def test_platform_account_subsequent_message_uses_assistance_rules(db_sess
         account=platform_account,
     )
 
-    instruction = captured["config"].system_instruction
+    instruction = captured["system"]
     assert "Welcome Message" not in instruction
     assert "You CANNOT add products" in instruction
 
@@ -301,7 +301,7 @@ async def test_knowledge_content_and_system_prompt_included(db_session, shop_acc
         system_prompt="Always mention free returns.",
     )
 
-    instruction = captured["config"].system_instruction
+    instruction = captured["system"]
     assert "Ships in 2 days." in instruction
     assert "Always mention free returns." in instruction
 
@@ -347,7 +347,7 @@ async def test_falls_back_to_knowledge_base_file_when_no_content_passed(db_sessi
         product_slug="shoes-kb",
     )
 
-    assert "File-based KB text" in captured["config"].system_instruction
+    assert "File-based KB text" in captured["system"]
 
 
 async def test_chat_history_included_and_empty_bodies_skipped(db_session, shop_account):
@@ -379,7 +379,7 @@ async def test_chat_history_included_and_empty_bodies_skipped(db_session, shop_a
         account=shop_account,
     )
 
-    contents = captured["contents"]
+    contents = captured["messages"][0]["content"]
     assert "Customer: Hi there" in contents
     assert "Amara: Hello! How can I help?" in contents
 
@@ -536,7 +536,7 @@ async def test_human_handoff_schedule_failure_does_not_break_reply(
 
 async def test_generate_content_exception_returns_fallback_message(db_session, shop_account):
     async def raising_handler(**kwargs):
-        raise RuntimeError("Gemini is down")
+        raise RuntimeError("Claude is down")
 
     service = _service_with_fake_client(handler=raising_handler)
 
@@ -834,7 +834,7 @@ async def test_agreement_close_deal_exception_does_not_lose_reply(db_session, sh
     )
 
     # The valid AI reply survives even though the order-completion side
-    # effect blew up — it's not replaced by the generic Gemini-error fallback.
+    # effect blew up — it's not replaced by the generic Claude-error fallback.
     assert result == "Deal!"
     assert db_session.query(Order).count() == 0
 

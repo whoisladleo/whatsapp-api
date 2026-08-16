@@ -28,7 +28,7 @@ services:
       # this container (Redis is the separate `redis` service below).
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
-      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - TUNZAA_API_KEY=${TUNZAA_API_KEY}
       - TUNZAA_SECRET_KEY=${TUNZAA_SECRET_KEY}
       - TUNZAA_ENVIRONMENT=${TUNZAA_ENVIRONMENT:-sandbox}
@@ -71,9 +71,9 @@ services:
       # AI/merchant message processing (app/tasks/webhook_processing.py) and
       # order-completion Tunzaa dispatch (app/services/llm.py) both run in
       # this worker process, not the api service — it needs the same
-      # GOOGLE_API_KEY/Tunzaa credentials the api service has, or the AI
+      # ANTHROPIC_API_KEY/Tunzaa credentials the api service has, or the AI
       # sales path silently no-ops (llm_service is None without a key).
-      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - WHATSAPP_REMINDER_TEMPLATE_NAME=${WHATSAPP_REMINDER_TEMPLATE_NAME:-hello_world}
       - TUNZAA_API_KEY=${TUNZAA_API_KEY}
       - TUNZAA_SECRET_KEY=${TUNZAA_SECRET_KEY}
@@ -91,3 +91,4 @@ services:
       options:
         max-size: "10mb"
         max-file: "3"
+        

@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     WHATSAPP_POOL_ACCESS_TOKEN: Optional[str] = None
 
     # LLM
-    GOOGLE_API_KEY: Optional[str] = None
+    ANTHROPIC_API_KEY: Optional[str] = None
 
     VITE_API_URL: Optional[str] = None
 

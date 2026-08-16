@@ -141,7 +141,7 @@ async def handle_webhook(
             crud_message.create_message(db, item, account_id)
 
             # 2. Routing logic — dispatched to a background task rather than
-            # awaited here, so a slow Gemini call or WhatsApp send can't
+            # awaited here, so a slow Claude call or WhatsApp send can't
             # hold up Meta's webhook ACK (which risks a retried delivery).
             # Merchant-vs-customer routing, per-customer locking, and rate
             # limiting all live inside the task (app/tasks/webhook_processing.py).

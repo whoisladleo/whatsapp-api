@@ -1,5 +1,4 @@
-from google import genai
-from google.genai import types
+import anthropic
 import logging
 import os
 import re
@@ -68,8 +67,8 @@ def _parse_and_strip_agreement(text: str):
 
 class LLMService:
     def __init__(self, api_key: str):
-        self.client = genai.Client(api_key=api_key) if api_key else None
-        self.model_id = 'gemini-3-flash-preview'
+        self.client = anthropic.AsyncAnthropic(api_key=api_key) if api_key else None
+        self.model_id = 'claude-sonnet-5'
 
     def _get_knowledge_base(self, product_slug: str) -> str:
         kb_path = f"knowledge/{product_slug}.md"
@@ -393,17 +392,21 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
             base_instruction += f"\n\nAdditional merchant instructions: {system_prompt}"
         
         try:
-            # 5. Call Gemini
-            response = await self.client.aio.models.generate_content(
+            # 5. Call Claude
+            response = await self.client.messages.create(
                 model=self.model_id,
-                contents=f"Recent Conversation:\n{chat_history_str}\n\nRespond as Amara:",
-                config=types.GenerateContentConfig(
-                    system_instruction=base_instruction,
-                    temperature=0.7,
-                )
+                max_tokens=1024,
+                temperature=0.7,
+                system=base_instruction,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": f"Recent Conversation:\n{chat_history_str}\n\nRespond as Amara:",
+                    }
+                ],
             )
-            
-            response_text = response.text
+
+            response_text = response.content[0].text
             
             # Post-process response for special triggers
             
@@ -486,4 +489,4 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
             print(f"LLM Error: {e}")
             return "I'm sorry, I'm having trouble processing your request right now."
 
-llm_service = LLMService(api_key=settings.GOOGLE_API_KEY) if settings.GOOGLE_API_KEY else None
+llm_service = LLMService(api_key=settings.ANTHROPIC_API_KEY) if settings.ANTHROPIC_API_KEY else None

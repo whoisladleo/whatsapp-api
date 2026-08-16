@@ -26,7 +26,7 @@ LOCK_RETRY_COUNTDOWN_SECONDS = 2
 LOCK_MAX_RETRIES = 5  # ~10s of total contention before giving up
 
 # Caps how many AI-generated replies a given customer can receive from a
-# given account per hour, to bound Gemini + WhatsApp-send cost from a single
+# given account per hour, to bound Claude + WhatsApp-send cost from a single
 # number. Does not apply to merchant-command processing, which is
 # operational rather than abuse-prone the way inbound customer chat is.
 AI_REPLY_RATE_LIMIT = 20
@@ -82,7 +82,7 @@ def process_inbound_message(
     """
     Handles a single inbound customer/merchant text message: routes it to
     either the merchant command handler or the AI sales engine, sends the
-    reply, and logs it. Moved off the webhook request path so a slow Gemini
+    reply, and logs it. Moved off the webhook request path so a slow Claude
     call or WhatsApp send can't hold up Meta's webhook ACK and risk a
     retried (duplicate) delivery.
 
