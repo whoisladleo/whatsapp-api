@@ -23,6 +23,7 @@ class WhatsAppAccountCreate(WhatsAppAccountBase):
 
 class WhatsAppAccountUpdate(BaseModel):
     name: Optional[str] = None
+    phone_number_id: Optional[str] = None
     access_token: Optional[str] = None
     verify_token: Optional[str] = None
     callback_url: Optional[str] = None

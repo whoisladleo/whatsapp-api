@@ -108,6 +108,14 @@ def test_get_messages_200_via_legacy_header(client, owner_and_account):
     assert resp.status_code == 200
 
 
+def test_get_messages_missing_account_id_returns_400(client, owner_and_account):
+    _, _, headers = owner_and_account
+
+    resp = client.get("/api/v1/whatsapp/messages", headers=headers)
+
+    assert resp.status_code == 400
+
+
 def test_get_messages_404_for_nonexistent_account(client, owner_and_account):
     _, _, headers = owner_and_account
 

@@ -12,7 +12,11 @@ class AccountBase(BaseModel):
     system_prompt: Optional[str] = None
 
 class AccountCreate(AccountBase):
-    access_token: str
+    # Optional here (unlike AccountBase): omit both phone_number_id and
+    # access_token to auto-assign a number from the pool, or supply both to
+    # bring your own Meta credentials. Mirrors WhatsAppAccountCreate.
+    phone_number_id: Optional[str] = None
+    access_token: Optional[str] = None
 
 class AccountUpdate(BaseModel):
     name: Optional[str] = None

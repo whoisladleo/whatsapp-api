@@ -12,15 +12,11 @@ from app.core.security import is_safe_external_url, verify_meta_signature
 import httpx
 from app.core.webhook_parser import WebhookParser
 from app.crud import message as crud_message
-from app.crud import whatsapp as crud_account
 from app.tasks.webhook_processing import process_inbound_message
 from app.schemas.whatsapp import (
     MessageRead,
     MessageSend,
     PendingHandoffRead,
-    WhatsAppAccountCreate,
-    WhatsAppAccountInDB,
-    WhatsAppAccountUpdate,
 )
 
 router = APIRouter()
@@ -63,97 +59,6 @@ async def get_whatsapp_account(
     if not account or account.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="WhatsApp account not found")
     return account
-
-
-@router.post("/accounts", response_model=WhatsAppAccountInDB)
-def create_account(
-    account_in: WhatsAppAccountCreate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    try:
-        account = crud_account.create_whatsapp_account(db, account_in, current_user.id)
-    except crud_account.PartialWhatsAppCredentialsError:
-        raise HTTPException(
-            status_code=400,
-            detail="Provide both phone_number_id and access_token, or omit both to auto-assign a number from the pool.",
-        )
-    except crud_account.PhonePoolExhaustedError:
-        raise HTTPException(
-            status_code=409,
-            detail="No WhatsApp numbers are currently available in the pool. Try again shortly, or provide your own phone_number_id/access_token.",
-        )
-    if not account:
-        raise HTTPException(
-            status_code=400, detail="WhatsApp account with this ID already exists"
-        )
-    return account
-
-
-@router.get("/accounts", response_model=list[WhatsAppAccountInDB])
-def list_accounts(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-    skip: int = 0,
-    limit: int = 100,
-):
-    return crud_account.get_multi_by_user(db, current_user.id, skip=skip, limit=limit)
-
-
-@router.get("/accounts/{account_id}", response_model=WhatsAppAccountInDB)
-def get_account(
-    account_id: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    account = (
-        db.query(WhatsAppAccount)
-        .filter(
-            WhatsAppAccount.id == account_id, WhatsAppAccount.user_id == current_user.id
-        )
-        .first()
-    )
-    if not account:
-        raise HTTPException(status_code=404, detail="WhatsApp account not found")
-    return account
-
-
-@router.patch("/accounts/{account_id}", response_model=WhatsAppAccountInDB)
-def update_account(
-    account_id: int,
-    account_in: WhatsAppAccountUpdate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    db_account = (
-        db.query(WhatsAppAccount)
-        .filter(
-            WhatsAppAccount.id == account_id, WhatsAppAccount.user_id == current_user.id
-        )
-        .first()
-    )
-    if not db_account:
-        raise HTTPException(status_code=404, detail="WhatsApp account not found")
-    return crud_account.update_whatsapp_account(db, db_account, account_in)
-
-
-@router.delete("/accounts/{account_id}")
-def delete_account(
-    account_id: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    db_account = (
-        db.query(WhatsAppAccount)
-        .filter(
-            WhatsAppAccount.id == account_id, WhatsAppAccount.user_id == current_user.id
-        )
-        .first()
-    )
-    if not db_account:
-        raise HTTPException(status_code=404, detail="WhatsApp account not found")
-    crud_account.delete_whatsapp_account(db, db_account)
-    return {"status": "deleted"}
 
 
 @router.get("/webhook")

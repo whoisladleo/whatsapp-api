@@ -8,7 +8,8 @@ from app.db.models import User
 from app.schemas.account import AccountCreate, AccountUpdate, AccountResponse
 from app.crud.account import (
     create_account, get_account_by_id, get_accounts_by_user,
-    update_account, delete_account
+    update_account, delete_account,
+    PartialWhatsAppCredentialsError, PhonePoolExhaustedError,
 )
 from app.api.deps import get_current_user
 from app.core.config import settings
@@ -36,13 +37,40 @@ async def create_new_account(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    is_valid = await validate_whatsapp_credentials(account_in.phone_number_id, account_in.access_token)
-    if not is_valid:
+    # Only validate against Meta when the merchant supplied BOTH of their own
+    # credentials (bring-your-own-number). Omitting both fields means
+    # auto-assign from the pool — there's nothing to validate yet, the pool
+    # number is Taskflow's own, already-verified number. Supplying exactly
+    # one is an incomplete/invalid combination handled below by
+    # create_account raising PartialWhatsAppCredentialsError, which gives a
+    # clearer message than a Meta-validation call against a half-empty pair
+    # ever could.
+    if account_in.phone_number_id and account_in.access_token:
+        is_valid = await validate_whatsapp_credentials(account_in.phone_number_id, account_in.access_token)
+        if not is_valid:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid Meta Phone Number ID or Access Token."
+            )
+
+    try:
+        account = create_account(db=db, account_in=account_in, user_id=current_user.id)
+    except PartialWhatsAppCredentialsError:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid Meta Phone Number ID or Access Token."
+            detail="Provide both phone_number_id and access_token, or omit both to auto-assign a number from the pool.",
         )
-    return create_account(db=db, account_in=account_in, user_id=current_user.id)
+    except PhonePoolExhaustedError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="No WhatsApp numbers are currently available in the pool. Try again shortly, or provide your own phone_number_id/access_token.",
+        )
+    if not account:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="WhatsApp account with this ID already exists",
+        )
+    return account
 
 @router.get("", response_model=List[AccountResponse])
 def read_accounts(
@@ -75,3 +103,15 @@ async def update_existing_account(
             )
             
     return update_account(db=db, db_account=db_account, account_in=account_in)
+
+@router.delete("/{account_id}")
+def delete_existing_account(
+    account_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    db_account = get_account_by_id(db=db, account_id=account_id, user_id=current_user.id)
+    if not db_account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    delete_account(db=db, db_account=db_account)
+    return {"status": "deleted"}
