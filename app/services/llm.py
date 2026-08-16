@@ -34,6 +34,38 @@ _AGREEMENT_RE = re.compile(
     re.IGNORECASE,
 )
 
+_QUOTE_RE = re.compile(
+    r"\[QUOTE:\s*product=(?P<product>.+?)\s+price=(?P<price>[\d.]+)\s*\]",
+    re.IGNORECASE,
+)
+
+
+def _parse_and_strip_quote(text: str):
+    """
+    Extracts the [QUOTE: product=... price=...] marker the model is
+    instructed to emit whenever it states a specific price during
+    negotiation but hasn't closed the deal yet — used to schedule a
+    "still interested?" follow-up if the customer goes quiet (see
+    app/tasks/quote_nudges.py). Same parse-and-always-strip pattern as
+    _parse_and_strip_agreement.
+    """
+    match = _QUOTE_RE.search(text)
+    if not match:
+        return text, None
+
+    cleaned = _QUOTE_RE.sub("", text).strip()
+
+    try:
+        price = float(match.group("price"))
+    except ValueError:
+        return cleaned, None
+
+    product_name = match.group("product").strip()
+    if not product_name:
+        return cleaned, None
+
+    return cleaned, {"product_name": product_name, "price": price}
+
 
 def _parse_and_strip_agreement(text: str):
     """
@@ -140,6 +172,11 @@ class LLMService:
         db.refresh(order)
 
         context.last_offer = price
+        # No longer just a quote — it's a real order now, so nothing to
+        # nudge the customer about.
+        context.pending_quote_price = None
+        context.pending_quote_at = None
+        context.quote_nudge_count = 0
         db.commit()
 
         self._schedule_reminders(order.id)
@@ -216,6 +253,41 @@ class LLMService:
             except Exception as sched_err:
                 logger.error(f"Failed to schedule {task.name}: {sched_err}")
 
+    def _track_quote(
+        self, db: Session, account: WhatsAppAccount, context: ConversationContext, quote: dict
+    ) -> None:
+        """
+        Records an outstanding [QUOTE: ...] and schedules the first
+        "still interested?" nudge. Resolves the product name defensively
+        the same way _close_deal does — a quote for a product that doesn't
+        actually exist in the catalog isn't tracked (nothing sensible to
+        nudge the customer about).
+        """
+        from app.tasks.quote_nudges import QUOTE_NUDGE_INTERVALS_SECONDS, send_quote_nudge
+
+        product = (
+            db.query(Product)
+            .filter(Product.merchant_id == account.user_id, Product.name.ilike(quote["product_name"]))
+            .first()
+        )
+        if not product:
+            logger.warning(f"QUOTE for unknown product '{quote['product_name']}'; not tracking a nudge.")
+            return
+
+        context.current_product_intent = product.name
+        context.pending_quote_price = quote["price"]
+        context.pending_quote_at = datetime.utcnow()
+        context.quote_nudge_count = 0
+        db.commit()
+
+        try:
+            send_quote_nudge.apply_async(
+                args=[context.id, account.id, context.pending_quote_at.isoformat(), 1],
+                countdown=QUOTE_NUDGE_INTERVALS_SECONDS[0],
+            )
+        except Exception as sched_err:
+            logger.error(f"Failed to schedule quote nudge for context {context.id}: {sched_err}")
+
     async def generate_response(
         self, 
         message_body: str, 
@@ -250,6 +322,18 @@ class LLMService:
             db.add(context)
             db.commit()
             db.refresh(context)
+
+        # The customer just sent a new message, so they're no longer
+        # "quiet" — proactively clear any outstanding quote-nudge state
+        # regardless of what (if anything) this turn's reply ends up being.
+        # This is the main defense against a stale nudge firing later; the
+        # nudge task itself also re-checks validity at fire time as a
+        # second layer (see app/tasks/quote_nudges.py).
+        if context.pending_quote_at is not None:
+            context.pending_quote_price = None
+            context.pending_quote_at = None
+            context.quote_nudge_count = 0
+            db.commit()
 
         # If already in handoff, don't generate AI response
         if context.state == ConversationState.HUMAN_HANDOFF:
@@ -347,11 +431,13 @@ VOICE — this is you speaking as yourself, not a description of a product:
 - Ask before you tell — a couple of discovery questions earn the right to pitch. Don't front-load everything in one message.
 - Never claim a specific number or result you don't actually have for THIS shop (no invented stats or "other shops saw X%"). Speak in outcomes instead ("I catch the messages you're currently losing").
 - Never invent a delivery cost, timeframe, or payment option — only quote what the shop has actually told you (via their knowledge base / instructions below). If you don't have it, say you'll confirm rather than making something up.
+- When replying in Swahili, phrase things the way a real Tanzanian shop owner actually texts — casual and natural. Don't translate the English example lines below word-for-word; use them for the point being made, not the exact phrasing.
+- Before asking anything, check the conversation history above. Never ask a question you've already asked, and never ask about something the customer already told you (even loosely or indirectly) — move on to matching a benefit or continuing naturally instead.
 
-DISCOVERY — if you don't already know, ask one of these before pitching:
-- About how many messages do they get from customers in a day?
-- What eats the most time — replying fast, or the price negotiation itself?
-- Have they ever lost track of an interested customer who never followed up?
+DISCOVERY — ask about ONE of these before pitching, in your own natural phrasing (only if you don't already have the answer from earlier in the conversation):
+- how many customer messages they get in a day
+- what eats their time most — replying fast, or the price negotiation itself
+- whether they've ever lost track of an interested customer who never followed up
 
 MATCH THE BENEFIT TO WHAT THEY TELL YOU:
 - "I get asked the same questions all day" -> "I take care of that — price, availability, how to order — answered the moment they ask, so you're not typing the same reply fifty times a day."
@@ -392,7 +478,8 @@ RULES:
 3. Don't just answer and go quiet — push toward a confirmed order. Once the customer has clearly agreed to buy a specific product at a specific price, confirm it back naturally (e.g. "Just to confirm: [item] at [price], sound right?"), ask whether they'd like to pay in full or in installments, then ask if they'd like pickup or delivery. Once you have both a specific agreed price AND a payment method choice, confirm the deal and end your response with the exact marker [AGREEMENT_REACHED: product=<product name> price=<agreed price> payment=<full|installment>] (e.g. [AGREEMENT_REACHED: product=Shoes price=45000 payment=full]). Only include this marker once both are explicit — never guess or assume either.
 4. Payment: describe it accurately — a payment request gets sent directly to the customer's phone for them to approve, not a menu of payment apps to choose from. Don't name specific mobile money providers.
 5. Delivery: if they want delivery, ask where and roughly when. After the order is confirmed you'll separately ask them to share their exact location via WhatsApp's location-sharing feature — you don't need to collect a written address yourself. Only quote a delivery cost or timeframe if it's actually in your knowledge/instructions below; otherwise say the shop will confirm it.
-6. Human Handoff: If the customer is unreasonable, has complex technical questions, or explicitly asks for a human, you must include the exact phrase [HUMAN_HANDOFF] in your response.
+6. Quoting: whenever you state a specific price to the customer during negotiation but haven't closed the deal yet, end your response with the marker [QUOTE: product=<product name> price=<price>] (e.g. [QUOTE: product=Shoes price=45000]). Don't include this once you've already emitted [AGREEMENT_REACHED] for the same deal.
+7. Human Handoff: If the customer is unreasonable, has complex technical questions, or explicitly asks for a human, you must include the exact phrase [HUMAN_HANDOFF] in your response.
 """
         
         base_instruction += """
@@ -511,6 +598,13 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
                         note = None
                     if note:
                         response_text = f"{response_text}\n\n{note}".strip()
+
+            # 4. Price quoted but not yet agreed (QUOTE). Superseded by a
+            # handoff or an agreement reached in this same turn — either
+            # means there's nothing to nudge about.
+            response_text, quote = _parse_and_strip_quote(response_text)
+            if quote and not agreement and not is_platform_account and context.state != ConversationState.HUMAN_HANDOFF:
+                self._track_quote(db, account, context, quote)
 
             return response_text
         except Exception as e:

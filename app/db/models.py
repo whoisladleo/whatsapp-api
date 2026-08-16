@@ -222,6 +222,13 @@ class ConversationContext(Base):
     current_product_intent = Column(String, nullable=True)
     last_offer = Column(Float, nullable=True)
     handoff_at = Column(DateTime, nullable=True)
+    # Tracks an outstanding price quote the customer hasn't acted on yet, so
+    # app/tasks/quote_nudges.py can follow up if they go quiet. Cleared
+    # proactively on the customer's next message and when a deal closes —
+    # see LLMService.generate_response / _close_deal.
+    pending_quote_price = Column(Float, nullable=True)
+    pending_quote_at = Column(DateTime, nullable=True)
+    quote_nudge_count = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
