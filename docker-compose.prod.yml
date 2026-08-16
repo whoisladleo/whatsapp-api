@@ -22,6 +22,12 @@ services:
       - WHATSAPP_APP_SECRET=${WHATSAPP_APP_SECRET}
       - WHATSAPP_POOL_ACCESS_TOKEN=${WHATSAPP_POOL_ACCESS_TOKEN}
       - WHATSAPP_REMINDER_TEMPLATE_NAME=${WHATSAPP_REMINDER_TEMPLATE_NAME:-hello_world}
+      # The api service dispatches Celery tasks directly (webhook_processing,
+      # location_capture, order/handoff reminder scheduling) — without this,
+      # celery_app.py falls back to localhost:6379, which doesn't exist in
+      # this container (Redis is the separate `redis` service below).
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
       - TUNZAA_API_KEY=${TUNZAA_API_KEY}
       - TUNZAA_SECRET_KEY=${TUNZAA_SECRET_KEY}
