@@ -25,7 +25,7 @@ engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
-def add_pool_number(phone_number_id: str, display_name: str = None):
+def add_pool_number(phone_number_id: str, display_name: str = None, two_step_pin: str = None):
     """
     Registers an already-provisioned Meta phone_number_id (verified and set
     up in Meta Business Manager outside this codebase) as AVAILABLE in the
@@ -49,6 +49,7 @@ def add_pool_number(phone_number_id: str, display_name: str = None):
         entry = PhoneNumberPool(
             phone_number_id=phone_number_id,
             display_name=display_name,
+            two_step_pin=two_step_pin,
             status=PhoneNumberStatus.AVAILABLE,
         )
         db.add(entry)
@@ -69,4 +70,14 @@ if __name__ == "__main__":
         if len(sys.argv) > 2
         else input("Display name (optional, press Enter to skip): ").strip() or None
     )
-    add_pool_number(phone_number_id, display_name)
+    two_step_pin = (
+        sys.argv[3]
+        if len(sys.argv) > 3
+        else input(
+            "Two-step verification PIN set for this number in Meta Business "
+            "Manager (required to auto-activate display name changes later; "
+            "press Enter to skip): "
+        ).strip()
+        or None
+    )
+    add_pool_number(phone_number_id, display_name, two_step_pin)

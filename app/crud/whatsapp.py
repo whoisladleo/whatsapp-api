@@ -57,6 +57,14 @@ def claim_available_pool_number(db: Session) -> Optional[PhoneNumberPool]:
     return candidate
 
 
+def get_pool_number_for_account(db: Session, account_id: int) -> Optional[PhoneNumberPool]:
+    return (
+        db.query(PhoneNumberPool)
+        .filter(PhoneNumberPool.whatsapp_account_id == account_id)
+        .first()
+    )
+
+
 def release_pool_number_for_account(db: Session, account_id: int) -> None:
     pool_number = (
         db.query(PhoneNumberPool)

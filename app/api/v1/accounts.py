@@ -8,7 +8,7 @@ from app.db.models import User
 from app.schemas.account import AccountCreate, AccountUpdate, AccountResponse
 from app.crud.account import (
     create_account, get_account_by_id, get_accounts_by_user,
-    update_account, delete_account,
+    update_account, delete_account, get_pool_two_step_pin,
     PartialWhatsAppCredentialsError, PhonePoolExhaustedError,
     PoolAccessTokenNotConfiguredError,
 )
@@ -31,6 +31,40 @@ async def validate_whatsapp_credentials(phone_number_id: str, access_token: str)
             return False
         except Exception:
             return False
+
+async def request_display_name_change(phone_number_id: str, access_token: str, display_name: str) -> None:
+    """
+    Submits a display name for Meta review on a pool-assigned number, so
+    customers see the merchant's own business name instead of "Taskflow OS"
+    (the name pool numbers are provisioned with by default in Meta Business
+    Manager). Meta approval is async — this only submits the request, it
+    doesn't wait for approval — so best-effort: a failure here shouldn't
+    block account creation, it just leaves the number needing manual
+    approval in Meta Business Manager instead.
+    """
+    url = f"{settings.WHATSAPP_BASE_URL}/{settings.WHATSAPP_VERSION}/{phone_number_id}"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    async with httpx.AsyncClient() as client:
+        try:
+            await client.post(url, headers=headers, data={"new_display_name": display_name})
+        except Exception:
+            pass
+
+async def register_phone_number(phone_number_id: str, access_token: str, pin: str) -> None:
+    """
+    Re-registers a Cloud API number with its two-step verification PIN.
+    Meta requires this after a display name change for the new name to
+    actually take effect (see request_display_name_change) — without it,
+    the change is accepted but never activated. Best-effort: a failure
+    here shouldn't block account creation.
+    """
+    url = f"{settings.WHATSAPP_BASE_URL}/{settings.WHATSAPP_VERSION}/{phone_number_id}/register"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    async with httpx.AsyncClient() as client:
+        try:
+            await client.post(url, headers=headers, json={"messaging_product": "whatsapp", "pin": pin})
+        except Exception:
+            pass
 
 @router.post("", response_model=AccountResponse, status_code=status.HTTP_201_CREATED)
 async def create_new_account(
@@ -76,6 +110,14 @@ async def create_new_account(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="WhatsApp account with this ID already exists",
         )
+
+    was_auto_assigned = not (account_in.phone_number_id and account_in.access_token)
+    if was_auto_assigned:
+        await request_display_name_change(account.phone_number_id, account.access_token, account.name)
+        pin = get_pool_two_step_pin(db, account.id)
+        if pin:
+            await register_phone_number(account.phone_number_id, account.access_token, pin)
+
     return account
 
 @router.get("", response_model=List[AccountResponse])

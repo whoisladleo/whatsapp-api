@@ -92,6 +92,12 @@ class PhoneNumberPool(Base):
     id = Column(Integer, primary_key=True, index=True)
     phone_number_id = Column(String, unique=True, index=True, nullable=False)
     display_name = Column(String, nullable=True)  # plain reference label, e.g. "Taskflow Store #4"
+    # This number's Cloud API two-step verification PIN, set once during its
+    # one-time manual Meta Business Manager provisioning. Required to call
+    # POST /{phone_number_id}/register again after each display-name change
+    # (see create_whatsapp_account) — without it, a claimed number's display
+    # name can be submitted but never actually activated.
+    two_step_pin = Column(String, nullable=True)
     status = Column(Enum(PhoneNumberStatus), default=PhoneNumberStatus.AVAILABLE, nullable=False)
     whatsapp_account_id = Column(Integer, ForeignKey("whatsapp_accounts.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
