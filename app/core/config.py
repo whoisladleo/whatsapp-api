@@ -41,6 +41,12 @@ class Settings(BaseSettings):
     # every pooled phone_number_id. Businesses that bring their own number
     # (BYON) still supply their own access_token at account-creation time.
     WHATSAPP_POOL_ACCESS_TOKEN: Optional[str] = None
+    # The WhatsApp Business Account (WABA) ID that pool numbers live under —
+    # needed to add/register new pool numbers via the Graph API
+    # (POST /{WABA_ID}/phone_numbers etc.) rather than doing that setup by
+    # hand in Meta Business Manager. Distinct from any individual
+    # phone_number_id: a WABA can hold many numbers.
+    WHATSAPP_POOL_WABA_ID: Optional[str] = None
 
     # LLM
     ANTHROPIC_API_KEY: Optional[str] = None
