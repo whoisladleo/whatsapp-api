@@ -5,7 +5,7 @@ from typing import List
 
 from app.db.session import get_db
 from app.db.models import User
-from app.schemas.account import AccountCreate, AccountUpdate, AccountResponse
+from app.schemas.account import AccountCreate, AccountUpdate, AccountResponse, AccountMetaStatus
 from app.crud.account import (
     create_account, get_account_by_id, get_accounts_by_user,
     update_account, delete_account, get_pool_two_step_pin,
@@ -126,6 +126,34 @@ def read_accounts(
     current_user: User = Depends(get_current_user)
 ):
     return get_accounts_by_user(db=db, user_id=current_user.id)
+
+@router.get("/{account_id}/status", response_model=AccountMetaStatus)
+async def get_account_meta_status(
+    account_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Live phone-number status straight from Meta's Graph API — not our own DB state."""
+    db_account = get_account_by_id(db=db, account_id=account_id, user_id=current_user.id)
+    if not db_account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    url = f"{settings.WHATSAPP_BASE_URL}/{settings.WHATSAPP_VERSION}/{db_account.phone_number_id}"
+    headers = {"Authorization": f"Bearer {db_account.access_token}"}
+    params = {
+        "fields": "verified_name,display_phone_number,quality_rating,code_verification_status,"
+        "status,platform_type,new_display_name,new_name_status"
+    }
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(url, headers=headers, params=params)
+        except Exception:
+            raise HTTPException(status_code=502, detail="Failed to reach Meta")
+
+    if response.status_code != 200:
+        raise HTTPException(status_code=502, detail="Failed to fetch number status from Meta")
+
+    return response.json()
 
 @router.put("/{account_id}", response_model=AccountResponse)
 async def update_existing_account(

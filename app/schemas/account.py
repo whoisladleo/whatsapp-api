@@ -36,3 +36,16 @@ class AccountResponse(AccountBase):
 
     class Config:
         from_attributes = True
+
+
+class AccountMetaStatus(BaseModel):
+    """Live phone-number status as Meta itself reports it, not our own DB state."""
+    verified_name: Optional[str] = None
+    display_phone_number: Optional[str] = None
+    quality_rating: Optional[str] = None
+    code_verification_status: Optional[str] = None
+    status: Optional[str] = None
+    platform_type: Optional[str] = None
+    # Set while a display-name change is pending Meta's review.
+    new_display_name: Optional[str] = None
+    new_name_status: Optional[str] = None

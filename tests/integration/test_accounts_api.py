@@ -223,3 +223,64 @@ def test_delete_account_requires_auth(client):
     resp = client.delete(f"{BASE}/1")
 
     assert resp.status_code in (401, 403)
+
+
+def test_get_account_status_returns_meta_fields(client, auth_user):
+    _, headers = auth_user
+    with respx.mock:
+        respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
+        created = client.post(BASE, json=_account_payload(), headers=headers).json()
+
+    with respx.mock:
+        respx.get(url__regex=r"https://graph\.facebook\.com/.+/PHONE1").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "verified_name": "My Shop",
+                    "display_phone_number": "+1 555-000-0000",
+                    "quality_rating": "GREEN",
+                    "code_verification_status": "VERIFIED",
+                    "status": "CONNECTED",
+                    "platform_type": "CLOUD_API",
+                },
+            )
+        )
+        resp = client.get(f"{BASE}/{created['id']}/status", headers=headers)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["verified_name"] == "My Shop"
+    assert body["quality_rating"] == "GREEN"
+    assert body["status"] == "CONNECTED"
+
+
+def test_get_account_status_404_for_other_user(client, auth_user, other_user_headers):
+    _, headers = auth_user
+    with respx.mock:
+        respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
+        created = client.post(BASE, json=_account_payload(), headers=headers).json()
+
+    resp = client.get(f"{BASE}/{created['id']}/status", headers=other_user_headers)
+
+    assert resp.status_code == 404
+
+
+def test_get_account_status_502_when_meta_errors(client, auth_user):
+    _, headers = auth_user
+    with respx.mock:
+        respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
+        created = client.post(BASE, json=_account_payload(), headers=headers).json()
+
+    with respx.mock:
+        respx.get(url__regex=r"https://graph\.facebook\.com/.+/PHONE1").mock(
+            return_value=httpx.Response(400, json={"error": {}})
+        )
+        resp = client.get(f"{BASE}/{created['id']}/status", headers=headers)
+
+    assert resp.status_code == 502
+
+
+def test_get_account_status_requires_auth(client):
+    resp = client.get(f"{BASE}/1/status")
+
+    assert resp.status_code in (401, 403)
