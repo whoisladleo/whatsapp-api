@@ -1,6 +1,7 @@
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from app.db.models import Customer, Message, ConversationContext, ConversationState
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 
 class ConversationNotFoundError(Exception):
@@ -96,6 +97,60 @@ def resume_conversation_for_account(db: Session, account_id: int, phone: str) ->
     context.state = ConversationState.NEGOTIATING
     context.handoff_at = None
     db.commit()
+
+
+def get_conversations_for_account(
+    db: Session, account_id: int, exclude_phone: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """
+    Every distinct customer this account has exchanged messages with,
+    ordered by most recent activity (either direction). A message row only
+    ever has one of from_phone/to_phone set to the customer's number (the
+    other is None — see create_message), so COALESCE picks it out regardless
+    of direction.
+
+    exclude_phone filters out the merchant's own number, so a merchant
+    testing their account via /manage etc. doesn't show up as a customer
+    conversation with themselves.
+    """
+    customer_phone = func.coalesce(Message.from_phone, Message.to_phone)
+
+    query = (
+        db.query(customer_phone.label("customer_phone"), func.max(Message.timestamp).label("last_activity_at"))
+        .filter(Message.account_id == account_id, customer_phone.isnot(None))
+        .group_by(customer_phone)
+    )
+    if exclude_phone:
+        query = query.filter(customer_phone != exclude_phone)
+
+    rows = query.order_by(func.max(Message.timestamp).desc()).all()
+
+    results = []
+    for row in rows:
+        phone = row.customer_phone
+        last_message = (
+            db.query(Message)
+            .filter(Message.account_id == account_id, customer_phone == phone)
+            .order_by(Message.timestamp.desc())
+            .first()
+        )
+
+        state = None
+        customer = db.query(Customer).filter(Customer.phone_number == phone).first()
+        if customer and customer.conversation:
+            state = customer.conversation.state.value
+
+        results.append(
+            {
+                "customer_phone": phone,
+                "last_activity_at": row.last_activity_at,
+                "last_message_body": last_message.body if last_message else None,
+                "last_message_direction": last_message.direction if last_message else None,
+                "state": state,
+            }
+        )
+
+    return results
 
 
 def get_pending_handoffs_for_account(db: Session, account_id: int) -> List[Dict[str, Any]]:

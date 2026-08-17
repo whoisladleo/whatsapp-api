@@ -15,6 +15,7 @@ from app.crud import message as crud_message
 from app.tasks.webhook_processing import process_inbound_message
 from app.tasks.location_capture import capture_customer_location
 from app.schemas.whatsapp import (
+    ConversationSummary,
     MessageRead,
     MessageSend,
     PendingHandoffRead,
@@ -187,6 +188,15 @@ async def handle_webhook(
                         print(f"Failed to forward webhook to {account_callback_url}: {e}")
 
     return {"status": "ok"}
+
+
+@router.get("/conversations", response_model=list[ConversationSummary])
+def get_conversations(
+    account: WhatsAppAccount = Depends(get_whatsapp_account),
+    db: Session = Depends(get_db),
+):
+    exclude_phone = account.owner.username if account.owner else None
+    return crud_message.get_conversations_for_account(db, account.id, exclude_phone=exclude_phone)
 
 
 @router.get("/handoffs", response_model=list[PendingHandoffRead])
