@@ -70,6 +70,11 @@ class PendingHandoffRead(BaseModel):
     last_message_body: Optional[str] = None
 
 
+class MessageStats(BaseModel):
+    messages_sent: int
+    conversations: int
+
+
 class ConversationSummary(BaseModel):
     customer_phone: str
     last_activity_at: Optional[datetime] = None

@@ -156,6 +156,32 @@ def get_conversations_for_account(
     return results
 
 
+def get_message_stats_for_account(
+    db: Session, account_id: int, exclude_phone: Optional[str] = None
+) -> Dict[str, int]:
+    """Total outbound messages sent vs. distinct customers messaged — same
+    exclude_phone semantics as get_conversations_for_account, so the
+    conversation count here matches what the Conversations page shows."""
+    sent_query = db.query(Message).filter(
+        Message.account_id == account_id, Message.direction == "outbound"
+    )
+    if exclude_phone:
+        sent_query = sent_query.filter(
+            func.coalesce(Message.from_phone, Message.to_phone) != exclude_phone
+        )
+    messages_sent = sent_query.count()
+
+    customer_phone = func.coalesce(Message.from_phone, Message.to_phone)
+    conversations_query = db.query(customer_phone).filter(
+        Message.account_id == account_id, customer_phone.isnot(None)
+    )
+    if exclude_phone:
+        conversations_query = conversations_query.filter(customer_phone != exclude_phone)
+    conversations = conversations_query.distinct().count()
+
+    return {"messages_sent": messages_sent, "conversations": conversations}
+
+
 def get_pending_handoffs_for_account(db: Session, account_id: int) -> List[Dict[str, Any]]:
     """
     Customers currently in ConversationState.HUMAN_HANDOFF whose most recent

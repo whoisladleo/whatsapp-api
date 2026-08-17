@@ -18,6 +18,7 @@ from app.schemas.whatsapp import (
     ConversationSummary,
     MessageRead,
     MessageSend,
+    MessageStats,
     PendingHandoffRead,
 )
 
@@ -197,6 +198,15 @@ def get_conversations(
 ):
     exclude_phone = account.owner.username if account.owner else None
     return crud_message.get_conversations_for_account(db, account.id, exclude_phone=exclude_phone)
+
+
+@router.get("/stats", response_model=MessageStats)
+def get_message_stats(
+    account: WhatsAppAccount = Depends(get_whatsapp_account),
+    db: Session = Depends(get_db),
+):
+    exclude_phone = account.owner.username if account.owner else None
+    return crud_message.get_message_stats_for_account(db, account.id, exclude_phone=exclude_phone)
 
 
 @router.get("/handoffs", response_model=list[PendingHandoffRead])
