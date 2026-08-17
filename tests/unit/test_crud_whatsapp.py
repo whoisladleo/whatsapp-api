@@ -200,13 +200,49 @@ def test_create_whatsapp_account_auto_assigns_from_pool(db_session, monkeypatch)
     assert pool_row.whatsapp_account_id == account.id
 
 
-def test_create_whatsapp_account_pool_exhausted_raises(db_session):
+def test_create_whatsapp_account_pool_exhausted_raises(db_session, monkeypatch):
     user = _user(db_session, "255700000308")
+    monkeypatch.setattr(settings, "WHATSAPP_POOL_ACCESS_TOKEN", "platform-token")
 
     with pytest.raises(crud_whatsapp.PhonePoolExhaustedError):
         crud_whatsapp.create_whatsapp_account(
             db_session, WhatsAppAccountCreate(name="Shop"), user.id
         )
+
+
+def test_create_whatsapp_account_pool_token_not_configured_raises_before_claiming(
+    db_session, monkeypatch
+):
+    monkeypatch.setattr(settings, "WHATSAPP_POOL_ACCESS_TOKEN", None)
+    user = _user(db_session, "255700000308b")
+    pool_entry = _pool_number(db_session, "POOL_NO_TOKEN")
+
+    with pytest.raises(crud_whatsapp.PoolAccessTokenNotConfiguredError):
+        crud_whatsapp.create_whatsapp_account(
+            db_session, WhatsAppAccountCreate(name="Shop"), user.id
+        )
+
+    db_session.refresh(pool_entry)
+    assert pool_entry.status == PhoneNumberStatus.AVAILABLE
+
+
+def test_create_whatsapp_account_releases_pool_claim_on_commit_failure(
+    db_session, monkeypatch
+):
+    monkeypatch.setattr(settings, "WHATSAPP_POOL_ACCESS_TOKEN", "platform-token")
+    user = _user(db_session, "255700000308c")
+    pool_entry = _pool_number(db_session, "POOL_COMMIT_FAILS")
+
+    account_in = WhatsAppAccountCreate(name="Shop")
+    account_in.name = None  # violates WhatsAppAccount.name's NOT NULL constraint
+
+    with pytest.raises(Exception):
+        crud_whatsapp.create_whatsapp_account(db_session, account_in, user.id)
+
+    db_session.rollback()
+    db_session.refresh(pool_entry)
+    assert pool_entry.status == PhoneNumberStatus.AVAILABLE
+    assert pool_entry.whatsapp_account_id is None
 
 
 def test_create_whatsapp_account_partial_credentials_raises(db_session):

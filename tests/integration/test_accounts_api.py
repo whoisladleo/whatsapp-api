@@ -155,8 +155,9 @@ def test_create_account_auto_assigns_from_pool_when_credentials_omitted(
     assert body["phone_number_id"] == "POOL_ACC_1"
 
 
-def test_create_account_pool_exhausted_returns_409(client, auth_user):
+def test_create_account_pool_exhausted_returns_409(client, auth_user, monkeypatch):
     _, headers = auth_user
+    monkeypatch.setattr(settings, "WHATSAPP_POOL_ACCESS_TOKEN", "platform-token")
 
     resp = client.post(BASE, json={"name": "No Pool Shop"}, headers=headers)
 
