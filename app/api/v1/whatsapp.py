@@ -226,10 +226,11 @@ def resume_handoff(
 @router.get("/messages", response_model=list[MessageRead])
 def get_message_history(
     limit: int = 100,
+    phone: Optional[str] = None,
     account: WhatsAppAccount = Depends(get_whatsapp_account),
     db: Session = Depends(get_db),
 ):
-    return crud_message.get_messages_by_account(db, account.id, limit)
+    return crud_message.get_messages_by_account(db, account.id, limit, customer_phone=phone)
 
 
 @router.post("/messages/send")

@@ -97,6 +97,36 @@ def test_get_messages_200_for_owner_by_phone_number_id(client, owner_and_account
     assert resp.status_code == 200
 
 
+def test_get_messages_filters_by_phone(client, db_session, owner_and_account):
+    from app.db.models import Message
+
+    _, account, headers = owner_and_account
+    db_session.add(
+        Message(
+            from_phone="255700001111", type="text", body="from customer A",
+            direction="inbound", status="sent", account_id=account.id,
+        )
+    )
+    db_session.add(
+        Message(
+            from_phone="255700002222", type="text", body="from customer B",
+            direction="inbound", status="sent", account_id=account.id,
+        )
+    )
+    db_session.commit()
+
+    resp = client.get(
+        "/api/v1/whatsapp/messages",
+        params={"phone": "255700001111"},
+        headers={**headers, "X-WhatsApp-Account-ID": str(account.id)},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body) == 1
+    assert body[0]["body"] == "from customer A"
+
+
 def test_get_messages_200_via_legacy_header(client, owner_and_account):
     _, account, headers = owner_and_account
 

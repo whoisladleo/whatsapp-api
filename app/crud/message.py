@@ -40,11 +40,14 @@ def create_message(
 
 
 def get_messages_by_account(
-    db: Session, account_id: int, limit: int = 100
+    db: Session, account_id: int, limit: int = 100, customer_phone: Optional[str] = None
 ) -> List[Message]:
+    query = db.query(Message).filter(Message.account_id == account_id)
+    if customer_phone:
+        customer_phone_expr = func.coalesce(Message.from_phone, Message.to_phone)
+        query = query.filter(customer_phone_expr == customer_phone)
     return (
-        db.query(Message)
-        .filter(Message.account_id == account_id)
+        query
         .order_by(Message.timestamp.desc())
         .limit(limit)
         .all()
