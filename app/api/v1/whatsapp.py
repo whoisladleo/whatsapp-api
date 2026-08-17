@@ -271,5 +271,14 @@ async def send_message(
             },
             account.id,
         )
+        return response
 
-    return response
+    # WhatsAppProvider always returns response.json() regardless of HTTP
+    # status, so a Meta-side rejection lands here as {"error": {...}} —
+    # without this check it would silently return 200, and the dashboard's
+    # reply UI would show "sent" for a message that never left the server.
+    error_detail = (
+        response.get("error", {}).get("message", "Failed to send message")
+        if response else "Failed to send message"
+    )
+    raise HTTPException(status_code=502, detail=error_detail)

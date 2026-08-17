@@ -50,6 +50,29 @@ def test_send_text_message(client, db_session, owner_and_headers, account):
 
 
 @respx.mock
+def test_send_text_message_meta_error_returns_502_and_does_not_log(
+    client, db_session, owner_and_headers, account
+):
+    _, headers = owner_and_headers
+    respx.post(url__regex=MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(
+            400,
+            json={"error": {"message": "(#131037) Needs display name approval", "code": 131037}},
+        )
+    )
+
+    resp = client.post(
+        "/api/v1/whatsapp/messages/send",
+        headers={**headers, "X-WhatsApp-Account-ID": str(account.id)},
+        json={"to": "255711119999", "type": "text", "text_body": "Hello there"},
+    )
+
+    assert resp.status_code == 502
+    assert "display name approval" in resp.json()["detail"]
+    assert db_session.query(Message).filter(Message.direction == "outbound").first() is None
+
+
+@respx.mock
 def test_send_template_message(client, db_session, owner_and_headers, account):
     _, headers = owner_and_headers
     route = respx.post(url__regex=MESSAGES_URL_RE).mock(
