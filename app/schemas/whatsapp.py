@@ -46,6 +46,8 @@ class MessageSend(BaseModel):
     text_body: Optional[str] = None
     media_id: Optional[str] = None
     caption: Optional[str] = None
+    # wamid of an existing message to quote-reply to (text messages only).
+    context_message_id: Optional[str] = None
 
 
 class MessageRead(BaseModel):

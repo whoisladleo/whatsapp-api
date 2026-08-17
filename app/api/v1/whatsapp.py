@@ -245,7 +245,9 @@ async def send_message(
     if msg.type == "template":
         response = await provider.send_template(msg.to, msg.template_name)
     elif msg.type == "text":
-        response = await provider.send_text(msg.to, msg.text_body)
+        response = await provider.send_text(
+            msg.to, msg.text_body, context_message_id=msg.context_message_id
+        )
     elif msg.type in ["image", "document"]:
         response = await provider.send_media(
             msg.to, msg.media_id, msg.type, msg.caption

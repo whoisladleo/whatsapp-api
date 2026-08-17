@@ -1,3 +1,5 @@
+import json
+
 import httpx
 import pytest
 import respx
@@ -47,6 +49,31 @@ def test_send_text_message(client, db_session, owner_and_headers, account):
     assert logged is not None
     assert logged.body == "Hello there"
     assert logged.whatsapp_message_id == "wamid.send1"
+
+
+@respx.mock
+def test_send_text_message_with_context_includes_quoted_reply(
+    client, db_session, owner_and_headers, account
+):
+    _, headers = owner_and_headers
+    route = respx.post(url__regex=MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "wamid.reply1"}]})
+    )
+
+    resp = client.post(
+        "/api/v1/whatsapp/messages/send",
+        headers={**headers, "X-WhatsApp-Account-ID": str(account.id)},
+        json={
+            "to": "255711119999",
+            "type": "text",
+            "text_body": "Sure, that one is 45000",
+            "context_message_id": "wamid.original123",
+        },
+    )
+
+    assert resp.status_code == 200
+    sent_payload = json.loads(route.calls.last.request.content)
+    assert sent_payload["context"] == {"message_id": "wamid.original123"}
 
 
 @respx.mock

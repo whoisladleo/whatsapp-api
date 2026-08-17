@@ -37,6 +37,30 @@ async def test_send_text_payload(provider):
 
 
 @respx.mock
+async def test_send_text_with_context_message_id(provider):
+    route = respx.post(url__regex=MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "wamid.2"}]})
+    )
+
+    await provider.send_text("255711111111", "Sure!", context_message_id="wamid.original")
+
+    sent = json.loads(route.calls.last.request.content)
+    assert sent["context"] == {"message_id": "wamid.original"}
+
+
+@respx.mock
+async def test_send_text_without_context_message_id_omits_context(provider):
+    route = respx.post(url__regex=MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "wamid.3"}]})
+    )
+
+    await provider.send_text("255711111111", "Hello!")
+
+    sent = json.loads(route.calls.last.request.content)
+    assert "context" not in sent
+
+
+@respx.mock
 async def test_send_template_payload_without_components(provider):
     route = respx.post(url__regex=MESSAGES_URL_RE).mock(
         return_value=httpx.Response(200, json={"messages": [{"id": "wamid.2"}]})

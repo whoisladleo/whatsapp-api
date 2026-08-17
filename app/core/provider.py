@@ -38,7 +38,11 @@ class WhatsAppProvider:
             return response.json()
 
     async def send_text(
-        self, to: str, body: str, preview_url: bool = False
+        self,
+        to: str,
+        body: str,
+        preview_url: bool = False,
+        context_message_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         url = f"{self.base_url}/messages"
         payload = {
@@ -48,6 +52,10 @@ class WhatsAppProvider:
             "type": "text",
             "text": {"preview_url": preview_url, "body": body},
         }
+        if context_message_id:
+            # Renders as a quoted reply to that message in the customer's
+            # WhatsApp — Meta requires a real wamid from this same number.
+            payload["context"] = {"message_id": context_message_id}
         async with httpx.AsyncClient() as client:
             response = await client.post(url, json=payload, headers=self.headers)
             return response.json()
