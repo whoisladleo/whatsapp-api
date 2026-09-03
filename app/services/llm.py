@@ -39,6 +39,12 @@ _QUOTE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Rule 3 (README/CLAUDE.md): "after 3 failed price agreement attempts...
+# switch context to HUMAN_HANDOFF". ConversationContext.failed_cycles counts
+# consecutive [QUOTE] rounds on the same product (see _track_quote) — hitting
+# this many force-escalates regardless of what the model itself judges.
+FAILED_CYCLES_HANDOFF_THRESHOLD = 3
+
 
 def _parse_and_strip_quote(text: str):
     """
@@ -173,10 +179,11 @@ class LLMService:
 
         context.last_offer = price
         # No longer just a quote — it's a real order now, so nothing to
-        # nudge the customer about.
+        # nudge the customer about, and the failed-attempts count resets.
         context.pending_quote_price = None
         context.pending_quote_at = None
         context.quote_nudge_count = 0
+        context.failed_cycles = 0
         db.commit()
 
         self._schedule_reminders(order.id)
@@ -253,8 +260,73 @@ class LLMService:
             except Exception as sched_err:
                 logger.error(f"Failed to schedule {task.name}: {sched_err}")
 
-    def _track_quote(
-        self, db: Session, account: WhatsAppAccount, context: ConversationContext, quote: dict
+    async def _trigger_human_handoff(
+        self,
+        db: Session,
+        account: WhatsAppAccount,
+        context: ConversationContext,
+        from_phone: str,
+        last_message: str,
+        is_platform_account: bool,
+    ) -> None:
+        """
+        Marks the conversation HUMAN_HANDOFF and alerts the merchant.
+        Shared by both handoff triggers: the model's own [HUMAN_HANDOFF]
+        marker (tone-based judgment) and the hard failed_cycles counter
+        (Rule 3 — see FAILED_CYCLES_HANDOFF_THRESHOLD). Does not touch this
+        turn's customer-facing response_text; callers decide what to send.
+        """
+        context.state = ConversationState.HUMAN_HANDOFF
+        context.handoff_at = datetime.utcnow()
+        db.commit()
+
+        if is_platform_account or not account.owner:
+            return
+
+        merchant_phone = account.owner.username
+        alert_message = f"🚨 *HUMAN HANDOFF REQUIRED* 🚨\nA customer at {from_phone} needs your help!\n\n*Last AI message:* {last_message}"
+        from app.core.provider import WhatsAppProvider
+        provider = WhatsAppProvider(account.access_token, account.phone_number_id)
+        try:
+            alert_resp = await provider.send_text(merchant_phone, alert_message)
+        except Exception as alert_err:
+            logger.error(f"Failed to send handoff alert to merchant: {alert_err}")
+            alert_resp = None
+
+        from app.crud import message as crud_message
+        crud_message.create_message(
+            db,
+            {
+                "to_phone": merchant_phone,
+                "type": "text",
+                "body": alert_message,
+                "direction": "outbound",
+                "status": "sent" if alert_resp else "failed",
+                "raw": alert_resp or {},
+            },
+            account.id,
+        )
+
+        from app.tasks.handoff_reminders import (
+            send_handoff_reminder,
+            HANDOFF_REMINDER_DELAY_SECONDS,
+        )
+        try:
+            send_handoff_reminder.apply_async(
+                args=[context.id], countdown=HANDOFF_REMINDER_DELAY_SECONDS
+            )
+        except Exception as sched_err:
+            logger.error(f"Failed to schedule handoff reminder: {sched_err}")
+
+    async def _track_quote(
+        self,
+        db: Session,
+        account: WhatsAppAccount,
+        context: ConversationContext,
+        quote: dict,
+        from_phone: str,
+        response_text: str,
+        is_platform_account: bool,
     ) -> None:
         """
         Records an outstanding [QUOTE: ...] and schedules the first
@@ -262,6 +334,13 @@ class LLMService:
         the same way _close_deal does — a quote for a product that doesn't
         actually exist in the catalog isn't tracked (nothing sensible to
         nudge the customer about).
+
+        Also implements Rule 3: failed_cycles counts consecutive quote
+        rounds on the *same* product (i.e. the customer pushed back and got
+        countered again) — a quote for a new/different product means a
+        fresh negotiation and resets the count. Hitting the threshold
+        force-escalates to HUMAN_HANDOFF even if the model itself never
+        judged the customer "unreasonable" enough to emit [HUMAN_HANDOFF].
         """
         from app.tasks.quote_nudges import QUOTE_NUDGE_INTERVALS_SECONDS, send_quote_nudge
 
@@ -274,11 +353,22 @@ class LLMService:
             logger.warning(f"QUOTE for unknown product '{quote['product_name']}'; not tracking a nudge.")
             return
 
+        if context.current_product_intent == product.name:
+            context.failed_cycles = (context.failed_cycles or 0) + 1
+        else:
+            context.failed_cycles = 0
+
         context.current_product_intent = product.name
         context.pending_quote_price = quote["price"]
         context.pending_quote_at = datetime.utcnow()
         context.quote_nudge_count = 0
         db.commit()
+
+        if context.failed_cycles >= FAILED_CYCLES_HANDOFF_THRESHOLD:
+            await self._trigger_human_handoff(
+                db, account, context, from_phone, response_text, is_platform_account
+            )
+            return
 
         try:
             send_quote_nudge.apply_async(
@@ -536,47 +626,10 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
             
             # 2. Human Handoff
             if "[HUMAN_HANDOFF]" in response_text:
-                context.state = ConversationState.HUMAN_HANDOFF
-                context.handoff_at = datetime.utcnow()
-                db.commit()
                 response_text = response_text.replace("[HUMAN_HANDOFF]", "").strip()
-
-                # Alert the merchant
-                if not is_platform_account and account.owner:
-                    merchant_phone = account.owner.username
-                    alert_message = f"🚨 *HUMAN HANDOFF REQUIRED* 🚨\nA customer at {from_phone} needs your help!\n\n*Last AI message:* {response_text}"
-                    from app.core.provider import WhatsAppProvider
-                    provider = WhatsAppProvider(account.access_token, account.phone_number_id)
-                    try:
-                        alert_resp = await provider.send_text(merchant_phone, alert_message)
-                    except Exception as alert_err:
-                        print(f"Failed to send handoff alert to merchant: {alert_err}")
-                        alert_resp = None
-
-                    from app.crud import message as crud_message
-                    crud_message.create_message(
-                        db,
-                        {
-                            "to_phone": merchant_phone,
-                            "type": "text",
-                            "body": alert_message,
-                            "direction": "outbound",
-                            "status": "sent" if alert_resp else "failed",
-                            "raw": alert_resp or {},
-                        },
-                        account.id,
-                    )
-
-                    from app.tasks.handoff_reminders import (
-                        send_handoff_reminder,
-                        HANDOFF_REMINDER_DELAY_SECONDS,
-                    )
-                    try:
-                        send_handoff_reminder.apply_async(
-                            args=[context.id], countdown=HANDOFF_REMINDER_DELAY_SECONDS
-                        )
-                    except Exception as sched_err:
-                        print(f"Failed to schedule handoff reminder: {sched_err}")
+                await self._trigger_human_handoff(
+                    db, account, context, from_phone, response_text, is_platform_account
+                )
 
                 if not response_text:
                     response_text = "I am transferring you to a human agent who can help you further. Please hold."
@@ -613,7 +666,9 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
             # means there's nothing to nudge about.
             response_text, quote = _parse_and_strip_quote(response_text)
             if quote and not agreement and not is_platform_account and context.state != ConversationState.HUMAN_HANDOFF:
-                self._track_quote(db, account, context, quote)
+                await self._track_quote(
+                    db, account, context, quote, from_phone, response_text, is_platform_account
+                )
 
             return response_text
         except Exception as e:

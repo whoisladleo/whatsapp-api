@@ -153,7 +153,14 @@ async def get_account_meta_status(
     if response.status_code != 200:
         raise HTTPException(status_code=502, detail="Failed to fetch number status from Meta")
 
-    return response.json()
+    from app.crud.message import get_recent_send_failures
+
+    data = response.json()
+    failures = get_recent_send_failures(db, db_account.id)
+    data["recent_send_failures"] = failures["count"]
+    data["last_send_failure_reason"] = failures["last_reason"]
+    data["last_send_failure_at"] = failures["last_failed_at"]
+    return data
 
 @router.put("/{account_id}", response_model=AccountResponse)
 async def update_existing_account(

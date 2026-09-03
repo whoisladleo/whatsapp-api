@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 from app.db.models import Customer, Message, ConversationContext, ConversationState
@@ -180,6 +181,43 @@ def get_message_stats_for_account(
     conversations = conversations_query.distinct().count()
 
     return {"messages_sent": messages_sent, "conversations": conversations}
+
+
+def get_recent_send_failures(
+    db: Session, account_id: int, hours: int = 24
+) -> Dict[str, Any]:
+    """
+    Outbound sends that failed at the WhatsApp API level in the last `hours`
+    — e.g. Meta rejecting sends with "display name needs approval" (code
+    131037), a state Meta's own phone-number status endpoint does NOT
+    surface (verified_name/quality_rating/status can all look healthy while
+    every send is actually failing). The real reason lives in raw_data.error
+    (see app/tasks/webhook_processing.py's create_message call), but nothing
+    previously exposed it outside of grepping worker logs.
+    """
+    since = datetime.utcnow() - timedelta(hours=hours)
+    failures = (
+        db.query(Message)
+        .filter(
+            Message.account_id == account_id,
+            Message.direction == "outbound",
+            Message.status == "failed",
+            Message.timestamp >= since,
+        )
+        .order_by(Message.timestamp.desc())
+        .all()
+    )
+
+    last_reason = None
+    if failures:
+        raw = failures[0].raw_data or {}
+        last_reason = (raw.get("error") or {}).get("message")
+
+    return {
+        "count": len(failures),
+        "last_failed_at": failures[0].timestamp if failures else None,
+        "last_reason": last_reason,
+    }
 
 
 def get_pending_handoffs_for_account(db: Session, account_id: int) -> List[Dict[str, Any]]:

@@ -49,3 +49,10 @@ class AccountMetaStatus(BaseModel):
     # Set while a display-name change is pending Meta's review.
     new_display_name: Optional[str] = None
     new_name_status: Optional[str] = None
+    # From our own DB, not Meta — see app/crud/message.py's
+    # get_recent_send_failures. Meta's own status fields above can all look
+    # healthy while every send is actually failing (e.g. code 131037,
+    # "display name needs approval"), so this is the only reliable signal.
+    recent_send_failures: int = 0
+    last_send_failure_reason: Optional[str] = None
+    last_send_failure_at: Optional[datetime] = None
