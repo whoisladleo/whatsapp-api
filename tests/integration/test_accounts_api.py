@@ -160,11 +160,13 @@ def test_update_account_reassign_from_pool_success(client, auth_user, db_session
     assert resp.json()["phone_number_id"] == "POOL_REASSIGN_1"
 
 
-def test_update_account_reassign_from_pool_exhausted_returns_409(client, auth_user):
+def test_update_account_reassign_from_pool_exhausted_returns_409(client, auth_user, monkeypatch):
     _, headers = auth_user
     with respx.mock:
         respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
         created = client.post(BASE, json=_account_payload(), headers=headers).json()
+
+    monkeypatch.setattr(settings, "WHATSAPP_POOL_ACCESS_TOKEN", "platform-token")
 
     resp = client.put(
         f"{BASE}/{created['id']}", json={"reassign_from_pool": True}, headers=headers
