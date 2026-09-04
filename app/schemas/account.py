@@ -46,6 +46,7 @@ class AccountResponse(AccountBase):
 
 class AccountMetaStatus(BaseModel):
     """Live phone-number status as Meta itself reports it, not our own DB state."""
+    id: Optional[str] = None
     verified_name: Optional[str] = None
     display_phone_number: Optional[str] = None
     quality_rating: Optional[str] = None
