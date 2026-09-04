@@ -48,6 +48,26 @@ class Settings(BaseSettings):
     # phone_number_id: a WABA can hold many numbers.
     WHATSAPP_POOL_WABA_ID: Optional[str] = None
 
+    # Twilio — sources the actual phone numbers for automated pool
+    # provisioning (see app/services/pool_provisioning.py). Distinct from
+    # WHATSAPP_POOL_ACCESS_TOKEN/WABA_ID above: Twilio owns the number
+    # itself and its inbound SMS (used to receive Meta's verification code),
+    # Meta owns registering that number onto our WABA for messaging.
+    TWILIO_ACCOUNT_SID: Optional[str] = None
+    TWILIO_AUTH_TOKEN: Optional[str] = None
+    # Country to purchase pool numbers in. Twilio's local-number inventory
+    # and regulatory-bundle requirements vary a lot by country — this
+    # defaults to "US" because it's what we provision test numbers in today;
+    # switching to Tanzania (or wherever pool numbers should ultimately be
+    # local to) needs that regulatory question settled first, not just this
+    # value changed.
+    TWILIO_COUNTRY_CODE: str = "US"
+    # This service's own publicly reachable base URL, needed at Twilio
+    # number-purchase time to configure that number's inbound-SMS webhook
+    # (POST {PUBLIC_BASE_URL}/api/v1/pool/twilio-sms-webhook) — Twilio has to
+    # reach us, not the other way around, so localhost is never valid here.
+    PUBLIC_BASE_URL: Optional[str] = None
+
     # LLM
     ANTHROPIC_API_KEY: Optional[str] = None
 

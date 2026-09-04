@@ -138,6 +138,56 @@ def test_update_account_revalidates_when_token_changes(client, auth_user):
     assert revalidate_route.called
 
 
+@respx.mock
+def test_update_account_reassign_from_pool_success(client, auth_user, db_session, monkeypatch):
+    _, headers = auth_user
+    respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
+    created = client.post(BASE, json=_account_payload(), headers=headers).json()
+
+    monkeypatch.setattr(settings, "WHATSAPP_POOL_ACCESS_TOKEN", "platform-token")
+    db_session.add(PhoneNumberPool(phone_number_id="POOL_REASSIGN_1"))
+    db_session.commit()
+    # request_display_name_change (best-effort, swallows failures) fires
+    # against this new number afterward — no route registered for it is
+    # fine, same pattern test_create_account_auto_assigns_from_pool... relies
+    # on: respx's unmocked-request error gets caught right there and ignored.
+
+    resp = client.put(
+        f"{BASE}/{created['id']}", json={"reassign_from_pool": True}, headers=headers
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["phone_number_id"] == "POOL_REASSIGN_1"
+
+
+def test_update_account_reassign_from_pool_exhausted_returns_409(client, auth_user):
+    _, headers = auth_user
+    with respx.mock:
+        respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
+        created = client.post(BASE, json=_account_payload(), headers=headers).json()
+
+    resp = client.put(
+        f"{BASE}/{created['id']}", json={"reassign_from_pool": True}, headers=headers
+    )
+
+    assert resp.status_code == 409
+
+
+def test_update_account_reassign_from_pool_not_configured_returns_503(client, auth_user, monkeypatch):
+    _, headers = auth_user
+    with respx.mock:
+        respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
+        created = client.post(BASE, json=_account_payload(), headers=headers).json()
+
+    monkeypatch.setattr(settings, "WHATSAPP_POOL_ACCESS_TOKEN", None)
+
+    resp = client.put(
+        f"{BASE}/{created['id']}", json={"reassign_from_pool": True}, headers=headers
+    )
+
+    assert resp.status_code == 503
+
+
 def test_create_account_auto_assigns_from_pool_when_credentials_omitted(
     client, auth_user, db_session, monkeypatch
 ):

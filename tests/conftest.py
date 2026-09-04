@@ -61,6 +61,12 @@ def _no_real_external_credentials(monkeypatch):
     monkeypatch.setattr(settings, "R2_SECRET_ACCESS_KEY", None)
     monkeypatch.setattr(settings, "R2_BUCKET_NAME", None)
     monkeypatch.setattr(settings, "R2_PUBLIC_URL", None)
+    # Same reasoning, now that real Twilio credentials also live in `.env`
+    # (see app/services/twilio_provisioning.py / pool_provisioning.py) —
+    # tests exercising those paths must explicitly monkeypatch a fake
+    # Twilio client back on top rather than ever touching the real API.
+    monkeypatch.setattr(settings, "TWILIO_ACCOUNT_SID", None)
+    monkeypatch.setattr(settings, "TWILIO_AUTH_TOKEN", None)
 
 
 @pytest.fixture(autouse=True)

@@ -15,3 +15,4 @@ anthropic==0.122.0
 celery==5.4.0
 redis==5.2.1
 boto3
+twilio==9.3.7

@@ -36,6 +36,23 @@ class PhoneNumberStatus(enum.Enum):
     ASSIGNED = "ASSIGNED"
     RELEASED = "RELEASED"
 
+
+class ProvisioningStatus(enum.Enum):
+    """
+    Tracks an in-progress automated pool-number provisioning run (see
+    app/services/pool_provisioning.py) — distinct from PhoneNumberStatus,
+    which is the pool's own AVAILABLE/ASSIGNED/RELEASED lifecycle for a
+    number that's already fully set up. A row here only ever becomes a
+    PhoneNumberPool row on reaching COMPLETED.
+    """
+    PURCHASED = "PURCHASED"
+    META_REGISTERED = "META_REGISTERED"
+    CODE_REQUESTED = "CODE_REQUESTED"
+    VERIFIED = "VERIFIED"
+    REGISTERED = "REGISTERED"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
 class User(Base):
     __tablename__ = "users"
 
@@ -105,6 +122,28 @@ class PhoneNumberPool(Base):
     released_at = Column(DateTime, nullable=True)
 
     whatsapp_account = relationship("WhatsAppAccount")
+
+
+class PhoneNumberProvisioningAttempt(Base):
+    __tablename__ = "phone_number_provisioning_attempts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    # Twilio's SID for the purchased number — needed to release/cancel it if
+    # a later step fails, so a failed run doesn't leave an orphaned,
+    # still-billed Twilio number behind.
+    twilio_sid = Column(String, nullable=True)
+    phone_number = Column(String, nullable=True)  # E.164, e.g. +12025551234
+    phone_number_id = Column(String, nullable=True)  # Meta's ID, set once META_REGISTERED
+    two_step_pin = Column(String, nullable=True)
+    # Populated by the Twilio inbound-SMS webhook once Meta's verification
+    # code arrives (app/api/v1/pool.py) — the provisioning script polls this
+    # column rather than receiving the code directly, since the code arrives
+    # out-of-band on a separate request.
+    verification_code = Column(String, nullable=True)
+    status = Column(Enum(ProvisioningStatus), default=ProvisioningStatus.PURCHASED, nullable=False)
+    error_message = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class MediaEntry(Base):
