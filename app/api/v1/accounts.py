@@ -9,6 +9,7 @@ from app.schemas.account import AccountCreate, AccountUpdate, AccountResponse, A
 from app.crud.account import (
     create_account, get_account_by_id, get_accounts_by_user,
     update_account, delete_account, get_pool_two_step_pin,
+    reassign_account_to_pool_number,
     PartialWhatsAppCredentialsError, PhonePoolExhaustedError,
     PoolAccessTokenNotConfiguredError,
 )
@@ -172,7 +173,29 @@ async def update_existing_account(
     db_account = get_account_by_id(db=db, account_id=account_id, user_id=current_user.id)
     if not db_account:
         raise HTTPException(status_code=404, detail="Account not found")
-        
+
+    if account_in.reassign_from_pool:
+        try:
+            db_account = reassign_account_to_pool_number(db, db_account)
+        except PoolAccessTokenNotConfiguredError:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Auto-assign is temporarily unavailable (pool credentials not configured). Provide your own phone_number_id/access_token instead.",
+            )
+        except PhonePoolExhaustedError:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="No WhatsApp numbers are currently available in the pool. Try again shortly, or provide your own phone_number_id/access_token.",
+            )
+        await request_display_name_change(db_account.phone_number_id, db_account.access_token, db_account.name)
+        pin = get_pool_two_step_pin(db, db_account.id)
+        if pin:
+            await register_phone_number(db_account.phone_number_id, db_account.access_token, pin)
+        # Any other fields in this same request (name, ai_enabled, system_prompt,
+        # etc.) still apply normally — just never phone_number_id/access_token,
+        # which the frontend never sends alongside reassign_from_pool anyway.
+        return update_account(db=db, db_account=db_account, account_in=account_in)
+
     # If they are updating credentials, validate them
     phone_id_to_check = account_in.phone_number_id or db_account.phone_number_id
     token_to_check = account_in.access_token or db_account.access_token

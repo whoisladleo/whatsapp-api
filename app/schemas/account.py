@@ -27,6 +27,12 @@ class AccountUpdate(BaseModel):
     product_slug: Optional[str] = None
     ai_enabled: Optional[bool] = None
     system_prompt: Optional[str] = None
+    # True releases the account's current number (if pool-assigned) and
+    # claims a fresh one from the pool, replacing phone_number_id/
+    # access_token — see reassign_account_to_pool_number. Mutually
+    # exclusive with supplying phone_number_id/access_token; the endpoint
+    # handles that combination before touching either.
+    reassign_from_pool: bool = False
 
 class AccountResponse(AccountBase):
     id: int

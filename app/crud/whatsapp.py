@@ -78,6 +78,35 @@ def release_pool_number_for_account(db: Session, account_id: int) -> None:
         db.commit()
 
 
+def reassign_account_to_pool_number(db: Session, db_account: WhatsAppAccount) -> WhatsAppAccount:
+    """
+    Switches an existing account (BYON, a Meta test number, or already
+    pool-assigned) onto a freshly claimed pool number, replacing its current
+    phone_number_id/access_token. Unlike create_whatsapp_account's pool path,
+    this account already exists, so there's no "leaked claim with nothing to
+    attach it to" case to guard — release-then-claim just needs to happen
+    before the swap, in that order, so an account is never left pointing at
+    neither.
+    """
+    if not settings.WHATSAPP_POOL_ACCESS_TOKEN:
+        raise PoolAccessTokenNotConfiguredError()
+
+    release_pool_number_for_account(db, db_account.id)
+
+    pool_number = claim_available_pool_number(db)
+    if not pool_number:
+        raise PhonePoolExhaustedError()
+
+    db_account.phone_number_id = pool_number.phone_number_id
+    db_account.access_token = settings.WHATSAPP_POOL_ACCESS_TOKEN
+    db.commit()
+
+    pool_number.whatsapp_account_id = db_account.id
+    db.commit()
+    db.refresh(db_account)
+    return db_account
+
+
 def create_whatsapp_account(
     db: Session, account_in: WhatsAppAccountCreate, user_id: int
 ) -> Optional[WhatsAppAccount]:

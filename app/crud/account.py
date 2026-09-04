@@ -28,6 +28,7 @@ __all__ = [
     "update_account",
     "delete_account",
     "get_pool_two_step_pin",
+    "reassign_account_to_pool_number",
 ]
 
 
@@ -59,3 +60,7 @@ def delete_account(db: Session, db_account: WhatsAppAccount) -> WhatsAppAccount:
 def get_pool_two_step_pin(db: Session, account_id: int) -> Optional[str]:
     pool_number = crud_whatsapp.get_pool_number_for_account(db, account_id)
     return pool_number.two_step_pin if pool_number else None
+
+
+def reassign_account_to_pool_number(db: Session, db_account: WhatsAppAccount) -> WhatsAppAccount:
+    return crud_whatsapp.reassign_account_to_pool_number(db, db_account)
