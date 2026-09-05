@@ -4,8 +4,11 @@ from sqlalchemy.orm import Session
 from typing import List
 
 from app.db.session import get_db
-from app.db.models import User
-from app.schemas.account import AccountCreate, AccountUpdate, AccountResponse, AccountMetaStatus
+from app.db.models import NumberSubscription, NumberSubscriptionStatus, User
+from app.schemas.account import (
+    AccountCreate, AccountUpdate, AccountResponse, AccountMetaStatus,
+    NumberSubscriptionResponse,
+)
 from app.crud.account import (
     create_account, get_account_by_id, get_accounts_by_user,
     update_account, delete_account, get_pool_two_step_pin,
@@ -15,8 +18,7 @@ from app.crud.account import (
 )
 from app.api.deps import get_current_user
 from app.core.config import settings
-from app.services import pool_provisioning
-from app.services.pool_provisioning import PoolProvisioningError
+from app.services import number_billing
 
 router = APIRouter()
 
@@ -185,33 +187,18 @@ async def update_existing_account(
                 detail="Auto-assign is temporarily unavailable (pool credentials not configured). Provide your own phone_number_id/access_token instead.",
             )
         except PhonePoolExhaustedError:
-            # Nothing pre-provisioned and sitting idle — rather than making
-            # the merchant wait on an ops team to replenish the pool, buy a
-            # real number from Twilio right now and claim that instead. This
-            # is a live purchase: it blocks for up to
-            # pool_provisioning.POLL_TIMEOUT_SECONDS while it waits for
-            # Meta's verification SMS to arrive via the Twilio webhook.
-            try:
-                await pool_provisioning.provision_pool_number(db, verified_name=db_account.name)
-            except ValueError as e:
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail=f"No numbers available and purchasing a new one isn't configured: {e}",
-                )
-            except PoolProvisioningError as e:
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail=f"Failed to purchase a new WhatsApp number: {e}",
-                )
-            try:
-                db_account = reassign_account_to_pool_number(db, db_account)
-            except PhonePoolExhaustedError:
-                # Shouldn't happen right after a successful purchase, but
-                # guards against a race with some other concurrent claim.
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="A number was purchased but claimed by another request — try again.",
-                )
+            # Free pool numbers are for ops-driven replenishment only — a
+            # live Twilio purchase costs real, recurring money, so it's
+            # gated behind POST /{account_id}/purchase-number's paid flow
+            # instead of happening for free here.
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "No WhatsApp numbers are currently available in the free pool. "
+                    "Use \"Purchase a WhatsApp Number\" to buy one directly, or provide your own "
+                    "phone_number_id/access_token instead."
+                ),
+            )
         await request_display_name_change(db_account.phone_number_id, db_account.access_token, db_account.name)
         pin = get_pool_two_step_pin(db, db_account.id)
         if pin:
@@ -246,3 +233,81 @@ def delete_existing_account(
         raise HTTPException(status_code=404, detail="Account not found")
     delete_account(db=db, db_account=db_account)
     return {"status": "deleted"}
+
+
+@router.post("/{account_id}/purchase-number", response_model=NumberSubscriptionResponse, status_code=status.HTTP_201_CREATED)
+async def purchase_number(
+    account_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Starts a paid, on-demand number purchase (10,000 TZS/month) — the
+    explicit, monetized counterpart to the free (but ops-dependent)
+    reassign_from_pool path above. Only pushes the Tunzaa payment request
+    here; the actual Twilio/Meta purchase runs later, once
+    app/api/v1/tunzaa_webhook.py confirms payment (see
+    app/services/number_billing.py).
+    """
+    db_account = get_account_by_id(db=db, account_id=account_id, user_id=current_user.id)
+    if not db_account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    existing = (
+        db.query(NumberSubscription).filter(NumberSubscription.account_id == db_account.id).first()
+    )
+    if existing and existing.status in (
+        NumberSubscriptionStatus.PENDING_PAYMENT,
+        NumberSubscriptionStatus.PROVISIONING,
+        NumberSubscriptionStatus.ACTIVE,
+        NumberSubscriptionStatus.PAST_DUE,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"This account already has a number subscription (status: {existing.status.value}).",
+        )
+
+    try:
+        subscription = await number_billing.start_number_purchase(db, db_account)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Failed to start payment: {e}",
+        )
+
+    return NumberSubscriptionResponse(
+        id=subscription.id,
+        status=subscription.status.value,
+        monthly_amount=subscription.monthly_amount,
+        next_billing_at=subscription.next_billing_at,
+        retry_count=subscription.retry_count,
+        created_at=subscription.created_at,
+    )
+
+
+@router.get("/{account_id}/number-subscription", response_model=NumberSubscriptionResponse)
+def get_number_subscription(
+    account_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Lets the dashboard poll purchase/billing status after purchase_number
+    kicks off the (up to ~2 minute) async provisioning chain."""
+    db_account = get_account_by_id(db=db, account_id=account_id, user_id=current_user.id)
+    if not db_account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    subscription = (
+        db.query(NumberSubscription).filter(NumberSubscription.account_id == db_account.id).first()
+    )
+    if not subscription:
+        raise HTTPException(status_code=404, detail="No number subscription for this account.")
+
+    return NumberSubscriptionResponse(
+        id=subscription.id,
+        status=subscription.status.value,
+        monthly_amount=subscription.monthly_amount,
+        next_billing_at=subscription.next_billing_at,
+        retry_count=subscription.retry_count,
+        created_at=subscription.created_at,
+    )

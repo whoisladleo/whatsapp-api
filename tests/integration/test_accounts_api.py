@@ -4,9 +4,7 @@ import respx
 
 from app.core.config import settings
 from app.core.security import create_access_token
-from app.db.models import PhoneNumberPool, User
-from app.services import pool_provisioning
-from app.services.pool_provisioning import PoolProvisioningError
+from app.db.models import NumberSubscription, NumberSubscriptionStatus, PhoneNumberPool, User
 
 BASE = "/api/v1/accounts"
 VALIDATE_URL_RE = r"https://graph\.facebook\.com/.+/PHONE1$"
@@ -162,75 +160,23 @@ def test_update_account_reassign_from_pool_success(client, auth_user, db_session
     assert resp.json()["phone_number_id"] == "POOL_REASSIGN_1"
 
 
-def test_update_account_reassign_from_pool_exhausted_and_purchase_not_configured_returns_503(
-    client, auth_user, monkeypatch
-):
+def test_update_account_reassign_from_pool_exhausted_returns_409(client, auth_user, monkeypatch):
+    # Free pool numbers are ops-provisioned only — exhaustion no longer
+    # falls back to a live (unpaid) Twilio purchase, since that's now
+    # gated behind the paid purchase_number endpoint instead.
     _, headers = auth_user
     with respx.mock:
         respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
         created = client.post(BASE, json=_account_payload(), headers=headers).json()
 
-    # Pool empty, and TWILIO_ACCOUNT_SID etc. aren't set (conftest's
-    # _no_real_external_credentials fixture already forces this) — so the
-    # live-purchase fallback can't even start.
     monkeypatch.setattr(settings, "WHATSAPP_POOL_ACCESS_TOKEN", "platform-token")
 
     resp = client.put(
         f"{BASE}/{created['id']}", json={"reassign_from_pool": True}, headers=headers
     )
 
-    assert resp.status_code == 503
-    assert "purchasing a new one isn't configured" in resp.json()["detail"]
-
-
-def test_update_account_reassign_from_pool_exhausted_purchases_new_number(
-    client, auth_user, db_session, monkeypatch
-):
-    _, headers = auth_user
-    with respx.mock:
-        respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
-        created = client.post(BASE, json=_account_payload(), headers=headers).json()
-
-    monkeypatch.setattr(settings, "WHATSAPP_POOL_ACCESS_TOKEN", "platform-token")
-
-    async def _fake_provision(db, verified_name=None, country_code=None):
-        db.add(PhoneNumberPool(phone_number_id="FRESH_TWILIO_NUMBER"))
-        db.commit()
-
-    monkeypatch.setattr(pool_provisioning, "provision_pool_number", _fake_provision)
-
-    with respx.mock:
-        # request_display_name_change fires against the newly-purchased
-        # number afterward — unmocked-and-swallowed, same as the plain
-        # reassign-success test above.
-        resp = client.put(
-            f"{BASE}/{created['id']}", json={"reassign_from_pool": True}, headers=headers
-        )
-
-    assert resp.status_code == 200
-    assert resp.json()["phone_number_id"] == "FRESH_TWILIO_NUMBER"
-
-
-def test_update_account_reassign_from_pool_exhausted_purchase_fails_returns_502(
-    client, auth_user, monkeypatch
-):
-    _, headers = auth_user
-    with respx.mock:
-        respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
-        created = client.post(BASE, json=_account_payload(), headers=headers).json()
-
-    monkeypatch.setattr(settings, "WHATSAPP_POOL_ACCESS_TOKEN", "platform-token")
-
-    async def _fake_provision_fails(db, verified_name=None, country_code=None):
-        raise PoolProvisioningError("Twilio has no numbers left", attempt=None)
-
-    monkeypatch.setattr(pool_provisioning, "provision_pool_number", _fake_provision_fails)
-
-    resp = client.put(
-        f"{BASE}/{created['id']}", json={"reassign_from_pool": True}, headers=headers
-    )
-
-    assert resp.status_code == 502
+    assert resp.status_code == 409
+    assert "Purchase a WhatsApp Number" in resp.json()["detail"]
 
 
 def test_update_account_reassign_from_pool_not_configured_returns_503(client, auth_user, monkeypatch):
@@ -394,3 +340,108 @@ def test_get_account_status_requires_auth(client):
     resp = client.get(f"{BASE}/1/status")
 
     assert resp.status_code in (401, 403)
+
+
+# --- purchase-number / number-subscription -----------------------------------
+
+def _mock_initiate_payment(monkeypatch, ok=True):
+    async def fake(self, phone, amount, reference):
+        if not ok:
+            raise RuntimeError("Tunzaa is down")
+        return {"transaction_id": "T-fake", "status": "PENDING"}
+
+    monkeypatch.setattr("app.services.tunzaa.TunzaaService.initiate_payment", fake)
+
+
+def test_purchase_number_success(client, auth_user, monkeypatch):
+    _, headers = auth_user
+    with respx.mock:
+        respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
+        created = client.post(BASE, json=_account_payload(), headers=headers).json()
+
+    _mock_initiate_payment(monkeypatch)
+
+    resp = client.post(f"{BASE}/{created['id']}/purchase-number", headers=headers)
+
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["status"] == "PENDING_PAYMENT"
+    assert body["monthly_amount"] == 10000
+
+
+def test_purchase_number_requires_auth(client):
+    resp = client.post(f"{BASE}/1/purchase-number")
+
+    assert resp.status_code in (401, 403)
+
+
+def test_purchase_number_404_for_other_user(client, auth_user, other_user_headers):
+    _, headers = auth_user
+    with respx.mock:
+        respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
+        created = client.post(BASE, json=_account_payload(), headers=headers).json()
+
+    resp = client.post(f"{BASE}/{created['id']}/purchase-number", headers=other_user_headers)
+
+    assert resp.status_code == 404
+
+
+def test_purchase_number_conflict_when_already_active(client, auth_user, db_session, monkeypatch):
+    _, headers = auth_user
+    with respx.mock:
+        respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
+        created = client.post(BASE, json=_account_payload(), headers=headers).json()
+
+    db_session.add(
+        NumberSubscription(account_id=created["id"], status=NumberSubscriptionStatus.ACTIVE, monthly_amount=10000)
+    )
+    db_session.commit()
+
+    _mock_initiate_payment(monkeypatch)
+
+    resp = client.post(f"{BASE}/{created['id']}/purchase-number", headers=headers)
+
+    assert resp.status_code == 409
+
+
+def test_purchase_number_payment_failure_returns_502(client, auth_user, monkeypatch):
+    _, headers = auth_user
+    with respx.mock:
+        respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
+        created = client.post(BASE, json=_account_payload(), headers=headers).json()
+
+    _mock_initiate_payment(monkeypatch, ok=False)
+
+    resp = client.post(f"{BASE}/{created['id']}/purchase-number", headers=headers)
+
+    assert resp.status_code == 502
+
+
+def test_get_number_subscription_returns_current_status(client, auth_user, db_session):
+    _, headers = auth_user
+    with respx.mock:
+        respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
+        created = client.post(BASE, json=_account_payload(), headers=headers).json()
+
+    db_session.add(
+        NumberSubscription(
+            account_id=created["id"], status=NumberSubscriptionStatus.ACTIVE, monthly_amount=10000
+        )
+    )
+    db_session.commit()
+
+    resp = client.get(f"{BASE}/{created['id']}/number-subscription", headers=headers)
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ACTIVE"
+
+
+def test_get_number_subscription_404_when_none(client, auth_user):
+    _, headers = auth_user
+    with respx.mock:
+        respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
+        created = client.post(BASE, json=_account_payload(), headers=headers).json()
+
+    resp = client.get(f"{BASE}/{created['id']}/number-subscription", headers=headers)
+
+    assert resp.status_code == 404

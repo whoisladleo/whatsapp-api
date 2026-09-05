@@ -9,6 +9,7 @@ from app.db.session import get_db
 from app.db.models import (
     Installment,
     InstallmentStatus,
+    NumberSubscription,
     Order,
     OrderStatus,
     Product,
@@ -67,6 +68,9 @@ async def handle_tunzaa_webhook(
 
     if not order_ref:
         return {"status": "ignored", "reason": "No reference_id provided"}
+
+    if order_ref.startswith("number-purchase-") or order_ref.startswith("number-renewal-"):
+        return await _handle_number_subscription_webhook(db, order_ref, status_value, transaction_id)
 
     order = db.query(Order).filter(Order.id == int(order_ref.split("-")[-1])).first() if "-" in order_ref else None
 
@@ -128,6 +132,42 @@ async def handle_tunzaa_webhook(
         return {"status": "success", "message": "Order marked as FAILED"}
 
     return {"status": "ignored", "reason": "Unhandled status"}
+
+
+async def _handle_number_subscription_webhook(
+    db: Session, order_ref: str, status_value: Optional[str], transaction_id: Optional[str]
+) -> dict:
+    """Routes a "number-purchase-<id>" / "number-renewal-<id>" callback to
+    app/services/number_billing.py rather than the Order-shaped handling
+    below it, which these NumberSubscription rows have nothing to do with."""
+    from app.services import number_billing
+
+    try:
+        subscription_id = int(order_ref.split("-")[-1])
+    except ValueError:
+        return {"status": "ignored", "reason": "Malformed reference_id"}
+
+    subscription = (
+        db.query(NumberSubscription).filter(NumberSubscription.id == subscription_id).first()
+    )
+    if not subscription:
+        return {"status": "ignored", "reason": "Subscription not found"}
+
+    # Idempotency: Tunzaa retries a callback up to 5 times per their docs —
+    # the handlers below are what set tunzaa_transaction_id, so a repeat of
+    # a transaction_id already recorded means this exact event already ran.
+    if transaction_id and subscription.tunzaa_transaction_id == transaction_id:
+        return {"status": "ignored", "reason": "Already processed"}
+
+    if order_ref.startswith("number-purchase-"):
+        await number_billing.handle_purchase_payment_result(db, subscription, status_value, transaction_id)
+    else:
+        await number_billing.handle_renewal_payment_result(db, subscription, status_value, transaction_id)
+
+    return {
+        "status": "success",
+        "message": f"Subscription {subscription.id} status: {subscription.status.value}",
+    }
 
 
 def _mark_single_installment_paid(db: Session, order: Order, installment_id) -> None:

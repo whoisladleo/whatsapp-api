@@ -146,6 +146,47 @@ class PhoneNumberProvisioningAttempt(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class NumberSubscriptionStatus(enum.Enum):
+    PENDING_PAYMENT = "PENDING_PAYMENT"  # Tunzaa push sent, awaiting the merchant's approval
+    PROVISIONING = "PROVISIONING"  # payment confirmed, Twilio/Meta pipeline running
+    ACTIVE = "ACTIVE"  # number live, billing on schedule
+    PAYMENT_FAILED = "PAYMENT_FAILED"  # initial purchase payment failed/cancelled — no number, no retry
+    PAST_DUE = "PAST_DUE"  # a renewal charge failed once — one retry scheduled before DEACTIVATED
+    DEACTIVATED = "DEACTIVATED"  # renewal retry also failed — ai_enabled turned off, number kept
+    PROVISIONING_FAILED = "PROVISIONING_FAILED"  # payment succeeded but Twilio/Meta failed — refunded
+
+
+class NumberSubscription(Base):
+    """
+    The billing side of an on-demand purchased number (10,000 TZS/month) —
+    deliberately separate from PhoneNumberProvisioningAttempt, which only
+    tracks the Twilio/Meta technical steps. One row per WhatsAppAccount that
+    has ever purchased a number this way; BYON and ops-pool-assigned
+    accounts have no row here at all.
+    """
+    __tablename__ = "number_subscriptions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    account_id = Column(Integer, ForeignKey("whatsapp_accounts.id"), unique=True, nullable=False)
+    status = Column(Enum(NumberSubscriptionStatus), default=NumberSubscriptionStatus.PENDING_PAYMENT, nullable=False)
+    monthly_amount = Column(Float, nullable=False, default=10000)
+    tunzaa_transaction_id = Column(String, nullable=True)
+    # When the next renewal charge is due (ACTIVE) — checked/used by
+    # app/tasks/number_billing.py's self-rescheduling renewal task.
+    next_billing_at = Column(DateTime, nullable=True)
+    # 0 = no renewal retry used yet; 1 = the one allowed retry has fired.
+    # A second consecutive failure at retry_count == 1 triggers DEACTIVATED.
+    retry_count = Column(Integer, default=0, nullable=False)
+    provisioning_attempt_id = Column(
+        Integer, ForeignKey("phone_number_provisioning_attempts.id"), nullable=True
+    )
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    account = relationship("WhatsAppAccount")
+    provisioning_attempt = relationship("PhoneNumberProvisioningAttempt")
+
+
 class MediaEntry(Base):
     __tablename__ = "media_entries"
 

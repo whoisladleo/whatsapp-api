@@ -63,3 +63,17 @@ class AccountMetaStatus(BaseModel):
     recent_send_failures: int = 0
     last_send_failure_reason: Optional[str] = None
     last_send_failure_at: Optional[datetime] = None
+
+
+class NumberSubscriptionResponse(BaseModel):
+    """Billing state for an on-demand purchased number — see
+    app/services/number_billing.py and app/db/models.py's NumberSubscription."""
+    id: int
+    status: str
+    monthly_amount: float
+    next_billing_at: Optional[datetime] = None
+    retry_count: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True

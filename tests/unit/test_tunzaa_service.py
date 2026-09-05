@@ -11,6 +11,7 @@ from app.services.tunzaa import TunzaaService
 TOKEN_URL = "https://pay.tunzaa.co.tz/accounts/request/token"
 PAYMENT_URL = "https://pay.tunzaa.co.tz/payments/initiate-payment"
 INSTALLMENT_URL = "https://pay.tunzaa.co.tz/installments/create"
+REFUND_URL = "https://pay.tunzaa.co.tz/payments/refund"
 
 
 def _service():
@@ -149,6 +150,42 @@ async def test_initiate_payment_raises_on_http_error():
 
     with pytest.raises(httpx.HTTPStatusError):
         await service.initiate_payment("255711111111", 1000, "order-2")
+
+
+@respx.mock
+async def test_refund_payment_payload_and_auth_header():
+    service = _service()
+    respx.post(TOKEN_URL).mock(
+        return_value=httpx.Response(200, json={"access_token": "tok-1"})
+    )
+    refund_route = respx.post(REFUND_URL).mock(
+        return_value=httpx.Response(200, json={"status": "REFUNDED"})
+    )
+
+    result = await service.refund_payment("TXN-1", 10000, "Number provisioning failed")
+
+    assert result == {"status": "REFUNDED"}
+    sent = json.loads(refund_route.calls.last.request.content)
+    assert sent == {
+        "transaction_id": "TXN-1",
+        "amount": "10000",
+        "reason": "Number provisioning failed",
+    }
+    assert refund_route.calls.last.request.headers["Authorization"] == "Bearer tok-1"
+
+
+@respx.mock
+async def test_refund_payment_raises_on_http_error():
+    service = _service()
+    respx.post(TOKEN_URL).mock(
+        return_value=httpx.Response(200, json={"access_token": "tok-1"})
+    )
+    respx.post(REFUND_URL).mock(return_value=httpx.Response(500))
+
+    import pytest
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await service.refund_payment("TXN-2", 10000, "test")
 
 
 @respx.mock

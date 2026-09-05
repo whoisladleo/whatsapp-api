@@ -14,6 +14,7 @@ celery_app = Celery(
         "app.tasks.webhook_processing",
         "app.tasks.location_capture",
         "app.tasks.quote_nudges",
+        "app.tasks.number_billing",
     ]
 )
 
