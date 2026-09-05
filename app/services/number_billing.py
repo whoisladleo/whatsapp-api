@@ -16,19 +16,35 @@ RENEWAL_RETRY_DELAY_SECONDS = 24 * 60 * 60
 
 async def start_number_purchase(db: Session, account: WhatsAppAccount) -> NumberSubscription:
     """
-    Creates the billing record and pushes the first (10,000 TZS) Tunzaa
-    payment request. The actual Twilio/Meta purchase only starts once that
-    payment is confirmed via the Tunzaa webhook (handle_purchase_payment_result)
-    — see app/tasks/number_billing.py for the rest of the chain.
+    Creates (or, retrying after PAYMENT_FAILED/PROVISIONING_FAILED/
+    DEACTIVATED, reuses) the billing record and pushes the first (10,000
+    TZS) Tunzaa payment request. account_id is unique on NumberSubscription
+    — a retry has to reset the existing row rather than insert a second
+    one, or it'd hit a DB IntegrityError. The endpoint above already blocks
+    calling this at all while a subscription is PENDING_PAYMENT/
+    PROVISIONING/ACTIVE/PAST_DUE, so reaching here with an existing row
+    always means a legitimate retry from a terminal failure state.
+
+    The actual Twilio/Meta purchase only starts once payment is confirmed
+    via the Tunzaa webhook (handle_purchase_payment_result) — see
+    app/tasks/number_billing.py for the rest of the chain.
     """
     from app.services.tunzaa import tunzaa_service
 
-    subscription = NumberSubscription(
-        account_id=account.id,
-        status=NumberSubscriptionStatus.PENDING_PAYMENT,
-        monthly_amount=MONTHLY_AMOUNT_TZS,
+    subscription = (
+        db.query(NumberSubscription).filter(NumberSubscription.account_id == account.id).first()
     )
-    db.add(subscription)
+    if subscription:
+        subscription.status = NumberSubscriptionStatus.PENDING_PAYMENT
+        subscription.retry_count = 0
+        subscription.monthly_amount = MONTHLY_AMOUNT_TZS
+    else:
+        subscription = NumberSubscription(
+            account_id=account.id,
+            status=NumberSubscriptionStatus.PENDING_PAYMENT,
+            monthly_amount=MONTHLY_AMOUNT_TZS,
+        )
+        db.add(subscription)
     db.commit()
     db.refresh(subscription)
 

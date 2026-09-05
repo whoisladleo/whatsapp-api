@@ -404,6 +404,39 @@ def test_purchase_number_conflict_when_already_active(client, auth_user, db_sess
     assert resp.status_code == 409
 
 
+def test_purchase_number_retries_by_reusing_deactivated_subscription(
+    client, auth_user, db_session, monkeypatch
+):
+    # NumberSubscription.account_id is unique — a retry after a terminal
+    # failure has to reuse the row, not insert a second one (which would
+    # otherwise hit a raw DB IntegrityError instead of a clean 201).
+    _, headers = auth_user
+    with respx.mock:
+        respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
+        created = client.post(BASE, json=_account_payload(), headers=headers).json()
+
+    existing = NumberSubscription(
+        account_id=created["id"],
+        status=NumberSubscriptionStatus.DEACTIVATED,
+        monthly_amount=10000,
+        retry_count=1,
+    )
+    db_session.add(existing)
+    db_session.commit()
+    db_session.refresh(existing)
+
+    _mock_initiate_payment(monkeypatch)
+
+    resp = client.post(f"{BASE}/{created['id']}/purchase-number", headers=headers)
+
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["id"] == existing.id  # same row reused, not a new one
+    assert body["status"] == "PENDING_PAYMENT"
+    assert body["retry_count"] == 0
+    assert db_session.query(NumberSubscription).filter(NumberSubscription.account_id == created["id"]).count() == 1
+
+
 def test_purchase_number_payment_failure_returns_502(client, auth_user, monkeypatch):
     _, headers = auth_user
     with respx.mock:
