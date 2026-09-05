@@ -28,8 +28,11 @@ async def main():
             f"({pool_number.display_name})."
         )
     except PoolProvisioningError as e:
-        print(f"Provisioning failed at status={e.attempt.status.value}: {e}")
-        print(f"See phone_number_provisioning_attempts.id={e.attempt.id} for details.")
+        if e.attempt:
+            print(f"Provisioning failed at status={e.attempt.status.value}: {e}")
+            print(f"See phone_number_provisioning_attempts.id={e.attempt.id} for details.")
+        else:
+            print(f"Provisioning failed before any number was purchased: {e}")
         sys.exit(1)
     finally:
         db.close()

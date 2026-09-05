@@ -26,9 +26,11 @@ class PoolProvisioningError(Exception):
     Raised when a provisioning run fails at any step. The attempt row
     (attached as `.attempt`) records exactly which step it reached and
     `error_message` — check that rather than parsing this exception's text.
+    `.attempt` is None only for a failure before any row could be created
+    (the Twilio purchase itself failing — see provision_pool_number).
     """
 
-    def __init__(self, message: str, attempt: PhoneNumberProvisioningAttempt):
+    def __init__(self, message: str, attempt: Optional[PhoneNumberProvisioningAttempt]):
         super().__init__(message)
         self.attempt = attempt
 
@@ -76,20 +78,34 @@ async def provision_pool_number(
     Buys a real number from Twilio, registers + verifies it against
     Taskflow's pool WABA, and inserts it into PhoneNumberPool as AVAILABLE.
 
-    verified_name is deliberately a generic placeholder, not a merchant's
-    business name — the real name gets requested later, at assignment time,
-    via the existing request_display_name_change in app/api/v1/accounts.py.
+    verified_name defaults to a generic placeholder for ops-driven pool
+    replenishment, where the real merchant isn't known yet (the real name
+    gets requested later, at assignment time, via the existing
+    request_display_name_change in app/api/v1/accounts.py). Callers doing
+    an on-demand purchase for a specific merchant right now (the
+    reassign_from_pool fallback in app/api/v1/accounts.py) should pass that
+    merchant's actual account name instead, so it's correct from the start.
     """
     country_code = country_code or settings.TWILIO_COUNTRY_CODE
     if not settings.PUBLIC_BASE_URL:
         raise ValueError("PUBLIC_BASE_URL is not configured — Twilio would have no way to reach our webhook.")
     if not settings.WHATSAPP_POOL_WABA_ID or not settings.WHATSAPP_POOL_ACCESS_TOKEN:
         raise ValueError("WHATSAPP_POOL_WABA_ID/WHATSAPP_POOL_ACCESS_TOKEN are not configured.")
+    if not settings.TWILIO_ACCOUNT_SID or not settings.TWILIO_AUTH_TOKEN:
+        raise ValueError("TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN are not configured.")
 
     twilio_service = TwilioProvisioningService()
     webhook_url = f"{settings.PUBLIC_BASE_URL}/api/v1/pool/twilio-sms-webhook"
 
-    purchased = twilio_service.purchase_number(country_code, webhook_url)
+    try:
+        purchased = twilio_service.purchase_number(country_code, webhook_url)
+    except Exception as e:
+        # No attempt row exists yet at this point — nothing purchased,
+        # nothing to release, nothing to mark FAILED. Still wrap it so
+        # callers only ever need to handle PoolProvisioningError, not also
+        # every TwilioProvisioningService exception type directly.
+        raise PoolProvisioningError(f"purchase_number failed: {e}", attempt=None)
+
     attempt = PhoneNumberProvisioningAttempt(
         twilio_sid=purchased["sid"],
         phone_number=purchased["phone_number"],

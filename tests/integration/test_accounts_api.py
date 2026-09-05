@@ -5,6 +5,8 @@ import respx
 from app.core.config import settings
 from app.core.security import create_access_token
 from app.db.models import PhoneNumberPool, User
+from app.services import pool_provisioning
+from app.services.pool_provisioning import PoolProvisioningError
 
 BASE = "/api/v1/accounts"
 VALIDATE_URL_RE = r"https://graph\.facebook\.com/.+/PHONE1$"
@@ -160,7 +162,30 @@ def test_update_account_reassign_from_pool_success(client, auth_user, db_session
     assert resp.json()["phone_number_id"] == "POOL_REASSIGN_1"
 
 
-def test_update_account_reassign_from_pool_exhausted_returns_409(client, auth_user, monkeypatch):
+def test_update_account_reassign_from_pool_exhausted_and_purchase_not_configured_returns_503(
+    client, auth_user, monkeypatch
+):
+    _, headers = auth_user
+    with respx.mock:
+        respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
+        created = client.post(BASE, json=_account_payload(), headers=headers).json()
+
+    # Pool empty, and TWILIO_ACCOUNT_SID etc. aren't set (conftest's
+    # _no_real_external_credentials fixture already forces this) — so the
+    # live-purchase fallback can't even start.
+    monkeypatch.setattr(settings, "WHATSAPP_POOL_ACCESS_TOKEN", "platform-token")
+
+    resp = client.put(
+        f"{BASE}/{created['id']}", json={"reassign_from_pool": True}, headers=headers
+    )
+
+    assert resp.status_code == 503
+    assert "purchasing a new one isn't configured" in resp.json()["detail"]
+
+
+def test_update_account_reassign_from_pool_exhausted_purchases_new_number(
+    client, auth_user, db_session, monkeypatch
+):
     _, headers = auth_user
     with respx.mock:
         respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
@@ -168,11 +193,44 @@ def test_update_account_reassign_from_pool_exhausted_returns_409(client, auth_us
 
     monkeypatch.setattr(settings, "WHATSAPP_POOL_ACCESS_TOKEN", "platform-token")
 
+    async def _fake_provision(db, verified_name=None, country_code=None):
+        db.add(PhoneNumberPool(phone_number_id="FRESH_TWILIO_NUMBER"))
+        db.commit()
+
+    monkeypatch.setattr(pool_provisioning, "provision_pool_number", _fake_provision)
+
+    with respx.mock:
+        # request_display_name_change fires against the newly-purchased
+        # number afterward — unmocked-and-swallowed, same as the plain
+        # reassign-success test above.
+        resp = client.put(
+            f"{BASE}/{created['id']}", json={"reassign_from_pool": True}, headers=headers
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["phone_number_id"] == "FRESH_TWILIO_NUMBER"
+
+
+def test_update_account_reassign_from_pool_exhausted_purchase_fails_returns_502(
+    client, auth_user, monkeypatch
+):
+    _, headers = auth_user
+    with respx.mock:
+        respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
+        created = client.post(BASE, json=_account_payload(), headers=headers).json()
+
+    monkeypatch.setattr(settings, "WHATSAPP_POOL_ACCESS_TOKEN", "platform-token")
+
+    async def _fake_provision_fails(db, verified_name=None, country_code=None):
+        raise PoolProvisioningError("Twilio has no numbers left", attempt=None)
+
+    monkeypatch.setattr(pool_provisioning, "provision_pool_number", _fake_provision_fails)
+
     resp = client.put(
         f"{BASE}/{created['id']}", json={"reassign_from_pool": True}, headers=headers
     )
 
-    assert resp.status_code == 409
+    assert resp.status_code == 502
 
 
 def test_update_account_reassign_from_pool_not_configured_returns_503(client, auth_user, monkeypatch):

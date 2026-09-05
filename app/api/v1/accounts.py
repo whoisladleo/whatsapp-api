@@ -15,6 +15,8 @@ from app.crud.account import (
 )
 from app.api.deps import get_current_user
 from app.core.config import settings
+from app.services import pool_provisioning
+from app.services.pool_provisioning import PoolProvisioningError
 
 router = APIRouter()
 
@@ -183,10 +185,33 @@ async def update_existing_account(
                 detail="Auto-assign is temporarily unavailable (pool credentials not configured). Provide your own phone_number_id/access_token instead.",
             )
         except PhonePoolExhaustedError:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="No WhatsApp numbers are currently available in the pool. Try again shortly, or provide your own phone_number_id/access_token.",
-            )
+            # Nothing pre-provisioned and sitting idle — rather than making
+            # the merchant wait on an ops team to replenish the pool, buy a
+            # real number from Twilio right now and claim that instead. This
+            # is a live purchase: it blocks for up to
+            # pool_provisioning.POLL_TIMEOUT_SECONDS while it waits for
+            # Meta's verification SMS to arrive via the Twilio webhook.
+            try:
+                await pool_provisioning.provision_pool_number(db, verified_name=db_account.name)
+            except ValueError as e:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=f"No numbers available and purchasing a new one isn't configured: {e}",
+                )
+            except PoolProvisioningError as e:
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail=f"Failed to purchase a new WhatsApp number: {e}",
+                )
+            try:
+                db_account = reassign_account_to_pool_number(db, db_account)
+            except PhonePoolExhaustedError:
+                # Shouldn't happen right after a successful purchase, but
+                # guards against a race with some other concurrent claim.
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="A number was purchased but claimed by another request — try again.",
+                )
         await request_display_name_change(db_account.phone_number_id, db_account.access_token, db_account.name)
         pin = get_pool_two_step_pin(db, db_account.id)
         if pin:

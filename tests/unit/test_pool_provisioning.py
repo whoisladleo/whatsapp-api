@@ -23,6 +23,11 @@ def _pool_config(monkeypatch):
     monkeypatch.setattr(settings, "PUBLIC_BASE_URL", "https://api.example.com")
     monkeypatch.setattr(settings, "WHATSAPP_POOL_WABA_ID", "WABA123")
     monkeypatch.setattr(settings, "WHATSAPP_POOL_ACCESS_TOKEN", "pool-token")
+    # TwilioProvisioningService itself gets faked out per-test (see
+    # fake_twilio / individual monkeypatches below) — this just needs to
+    # pass provision_pool_number's own upfront "is Twilio configured" check.
+    monkeypatch.setattr(settings, "TWILIO_ACCOUNT_SID", "AC_fake")
+    monkeypatch.setattr(settings, "TWILIO_AUTH_TOKEN", "tok_fake")
 
 
 @pytest.fixture
@@ -66,6 +71,21 @@ async def test_provision_pool_number_happy_path(db_session, fake_twilio, monkeyp
     assert fake_twilio.released_sids == []  # never released on success
 
 
+async def test_provision_pool_number_fails_purchase(db_session, monkeypatch):
+    class _FailingTwilioService:
+        def purchase_number(self, country_code, sms_webhook_url):
+            raise RuntimeError("Twilio account suspended")
+
+    monkeypatch.setattr(pool_provisioning, "TwilioProvisioningService", lambda: _FailingTwilioService())
+
+    with pytest.raises(PoolProvisioningError) as exc_info:
+        await provision_pool_number(db_session, country_code="US")
+
+    assert exc_info.value.attempt is None
+    assert "purchase_number failed" in str(exc_info.value)
+    assert db_session.query(PhoneNumberProvisioningAttempt).count() == 0
+
+
 async def test_provision_pool_number_missing_public_base_url(db_session, monkeypatch):
     monkeypatch.setattr(settings, "PUBLIC_BASE_URL", None)
 
@@ -75,6 +95,13 @@ async def test_provision_pool_number_missing_public_base_url(db_session, monkeyp
 
 async def test_provision_pool_number_missing_waba_config(db_session, monkeypatch):
     monkeypatch.setattr(settings, "WHATSAPP_POOL_WABA_ID", None)
+
+    with pytest.raises(ValueError):
+        await provision_pool_number(db_session)
+
+
+async def test_provision_pool_number_missing_twilio_config(db_session, monkeypatch):
+    monkeypatch.setattr(settings, "TWILIO_ACCOUNT_SID", None)
 
     with pytest.raises(ValueError):
         await provision_pool_number(db_session)
