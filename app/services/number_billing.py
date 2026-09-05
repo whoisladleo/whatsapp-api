@@ -48,11 +48,20 @@ async def start_number_purchase(db: Session, account: WhatsAppAccount) -> Number
     db.commit()
     db.refresh(subscription)
 
-    await tunzaa_service.initiate_payment(
-        phone=account.owner.username,
-        amount=MONTHLY_AMOUNT_TZS,
-        reference=f"number-purchase-{subscription.id}",
-    )
+    try:
+        await tunzaa_service.initiate_payment(
+            phone=account.owner.username,
+            amount=MONTHLY_AMOUNT_TZS,
+            reference=f"number-purchase-{subscription.id}",
+        )
+    except Exception:
+        # Left in PENDING_PAYMENT otherwise — a blocking status the
+        # purchase-number endpoint 409s on, so a push that never even went
+        # out would permanently lock the merchant out of retrying at all.
+        subscription.status = NumberSubscriptionStatus.PAYMENT_FAILED
+        db.commit()
+        raise
+
     return subscription
 
 

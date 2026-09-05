@@ -450,6 +450,34 @@ def test_purchase_number_payment_failure_returns_502(client, auth_user, monkeypa
     assert resp.status_code == 502
 
 
+def test_purchase_number_failed_push_leaves_retryable_state_not_stuck(
+    client, auth_user, db_session, monkeypatch
+):
+    # A push that fails outright (e.g. Tunzaa unreachable) must not leave
+    # the subscription stuck in PENDING_PAYMENT — that's a blocking status
+    # the endpoint itself 409s a retry against, permanently locking the
+    # merchant out. Reproduces the actual failure seen live: Tunzaa's token
+    # endpoint timed out, and the first PENDING_PAYMENT row blocked every
+    # retry with 409 instead of allowing one.
+    _, headers = auth_user
+    with respx.mock:
+        respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
+        created = client.post(BASE, json=_account_payload(), headers=headers).json()
+
+    _mock_initiate_payment(monkeypatch, ok=False)
+    first = client.post(f"{BASE}/{created['id']}/purchase-number", headers=headers)
+    assert first.status_code == 502
+
+    sub = db_session.query(NumberSubscription).filter(NumberSubscription.account_id == created["id"]).first()
+    assert sub.status == NumberSubscriptionStatus.PAYMENT_FAILED
+
+    _mock_initiate_payment(monkeypatch, ok=True)
+    second = client.post(f"{BASE}/{created['id']}/purchase-number", headers=headers)
+
+    assert second.status_code == 201
+    assert second.json()["status"] == "PENDING_PAYMENT"
+
+
 def test_get_number_subscription_returns_current_status(client, auth_user, db_session):
     _, headers = auth_user
     with respx.mock:
