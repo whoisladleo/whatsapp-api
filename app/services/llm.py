@@ -39,6 +39,28 @@ _QUOTE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_COMMENT_REPLY_RE = re.compile(
+    r"PUBLIC:\s*(?P<public>.+?)\s*\n+\s*PRIVATE:\s*(?P<private>.+)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _parse_comment_reply(text: str):
+    """
+    Parses the PUBLIC:/PRIVATE: two-line format generate_comment_reply asks
+    the model for. Returns None on any malformed/empty output rather than
+    guessing — the caller falls back to not sending anything sooner than
+    risk sending a broken or empty message publicly.
+    """
+    match = _COMMENT_REPLY_RE.search(text)
+    if not match:
+        return None
+    public_reply = match.group("public").strip()
+    private_reply = match.group("private").strip()
+    if not public_reply or not private_reply:
+        return None
+    return public_reply, private_reply
+
 # Rule 3 (README/CLAUDE.md): "after 3 failed price agreement attempts...
 # switch context to HUMAN_HANDOFF". ConversationContext.failed_cycles counts
 # consecutive [QUOTE] rounds on the same product (see _track_quote) — hitting
@@ -377,6 +399,77 @@ class LLMService:
             )
         except Exception as sched_err:
             logger.error(f"Failed to schedule quote nudge for context {context.id}: {sched_err}")
+
+    async def generate_comment_reply(
+        self,
+        comment_body: str,
+        merchant_id: int,
+        db: Session,
+        account_name: str = "the shop",
+        knowledge_content: Optional[str] = None,
+    ) -> Optional[dict]:
+        """
+        Generates Amara's response to a public Instagram comment: a short
+        public reply (visible to everyone, never states a price) plus a
+        one-shot private-reply DM with the actual details. Deliberately
+        stateless — unlike generate_response, there's no ConversationContext
+        or negotiation here. A private reply can only be sent once per
+        comment (Meta's own limit), and there's no inbound-DM channel yet to
+        continue a conversation over (see Issue 7 — full Amara-over-DM).
+        Returns None (caller sends nothing) if the model is unavailable or
+        its output doesn't match the expected PUBLIC:/PRIVATE: format.
+        """
+        if not self.client:
+            return None
+
+        products = db.query(Product).filter(Product.merchant_id == merchant_id).all()
+        if not products:
+            catalog_str = "No products currently available."
+        else:
+            catalog_str = "Available Products:\n"
+            for p in products:
+                catalog_str += f"- {p.name}: Price {p.max_price}, Stock: {p.quantity}\n"
+
+        instruction = f"""You are Amara, the AI sales agent for {account_name}. A customer just left a public comment on one of the shop's Instagram posts:
+
+"{comment_body}"
+
+{catalog_str}
+"""
+        if knowledge_content:
+            instruction += f"\nHere is additional knowledge:\n{knowledge_content}"
+
+        instruction += """
+Reply with EXACTLY two lines, nothing else, in this format:
+PUBLIC: <a short, friendly public reply visible to everyone — never state a price or personal details, just acknowledge them and say you've sent more info to their DMs>
+PRIVATE: <a short direct message with the actual details they're asking about, using only the catalog/knowledge above — never invent a product, price, or stock level that isn't there>
+
+Match the customer's language (Swahili or English). Keep both lines to one sentence each.
+"""
+
+        try:
+            response = await self.client.messages.create(
+                model=self.model_id,
+                max_tokens=300,
+                system=instruction,
+                messages=[{"role": "user", "content": "Respond as Amara:"}],
+            )
+            response_text = "".join(
+                block.text for block in response.content if block.type == "text"
+            )
+        except Exception as e:
+            logger.error(f"Comment-reply LLM error: {e}")
+            return None
+
+        parsed = _parse_comment_reply(response_text)
+        if not parsed:
+            logger.warning(
+                f"Comment-reply response didn't match PUBLIC/PRIVATE format: {response_text!r}"
+            )
+            return None
+
+        public_reply, private_reply = parsed
+        return {"public_reply": public_reply, "private_reply": private_reply}
 
     async def generate_response(
         self, 
