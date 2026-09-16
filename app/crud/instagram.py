@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
@@ -13,6 +13,10 @@ def get_account_by_ig_business_id(
         .filter(InstagramAccount.ig_business_id == ig_business_id)
         .first()
     )
+
+
+def get_accounts_by_user(db: Session, user_id: int) -> List[InstagramAccount]:
+    return db.query(InstagramAccount).filter(InstagramAccount.user_id == user_id).all()
 
 
 def comment_already_processed(db: Session, comment_id: str) -> bool:

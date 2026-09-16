@@ -14,6 +14,7 @@ from app.core.security import verify_meta_signature
 from app.crud import instagram as crud_instagram
 from app.db.models import User
 from app.db.session import get_db
+from app.schemas.instagram import InstagramAccountRead
 from app.services import instagram_oauth
 from app.tasks.instagram_comment_processing import process_inbound_comment
 
@@ -78,6 +79,13 @@ async def handle_webhook(
             process_inbound_comment.apply_async(args=[account.id, comment.id])
 
     return {"status": "ok"}
+
+
+@router.get("/accounts", response_model=list[InstagramAccountRead])
+async def list_accounts(
+    db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
+):
+    return crud_instagram.get_accounts_by_user(db, current_user.id)
 
 
 @router.get("/oauth/start")
