@@ -87,6 +87,13 @@ class Settings(BaseSettings):
     # template approved for this account in Meta Business Manager.
     WHATSAPP_REMINDER_TEMPLATE_NAME: str = "hello_world"
 
+    # Authentication-category template for OTP login (Meta requires these
+    # outside the 24h customer-service window, which is always the case for
+    # a first-time login OTP). None disables template sending and falls back
+    # straight to the plain-text OTP message; set this once the template is
+    # approved in Meta Business Manager.
+    WHATSAPP_OTP_TEMPLATE_NAME: Optional[str] = "taskflow_login"
+
     # Cloudflare R2
     R2_ACCOUNT_ID: Optional[str] = None
     R2_ACCESS_KEY_ID: Optional[str] = None

@@ -15,6 +15,31 @@ router = APIRouter()
 
 async def send_otp_message(phone_number: str, otp: str):
     provider = WhatsAppProvider(settings.WHATSAPP_TOKEN, settings.PHONE_NUMBER_ID)
+
+    if settings.WHATSAPP_OTP_TEMPLATE_NAME:
+        try:
+            response = await provider.send_template(
+                to=phone_number,
+                name=settings.WHATSAPP_OTP_TEMPLATE_NAME,
+                components=[
+                    {"type": "body", "parameters": [{"type": "text", "text": otp}]},
+                    {
+                        "type": "button",
+                        "sub_type": "copy_code",
+                        "index": 0,
+                        "parameters": [{"type": "coupon_code", "coupon_code": otp}],
+                    },
+                ],
+            )
+            if response and "messages" in response:
+                return
+            print(f"OTP template send rejected for {phone_number}, falling back to text: {response}")
+        except Exception as e:
+            print(f"OTP template send failed for {phone_number}, falling back to text: {e}")
+
+    # Fallback: a plain-text OTP only reaches the customer if they've
+    # messaged us in the last 24h, but it's better than nothing while the
+    # template is pending Meta's review (or if it ever gets rejected).
     message = f"OTP yako wa kuingia Taskflow OS ni: *{otp}*. Ni siri, usimpe mtu. Unaisha ndani ya dakika 5."
     try:
         await provider.send_text(to=phone_number, body=message)

@@ -1,3 +1,5 @@
+import json
+
 import httpx
 import jwt
 import pytest
@@ -173,3 +175,58 @@ def test_verify_otp_rate_limited_after_five_attempts(client, db_session):
     )
 
     assert resp.status_code == 429
+
+
+@respx.mock
+def test_request_otp_sends_authentication_template_with_code(client, db_session):
+    route = respx.post(url__regex=r"https://graph\.facebook\.com/.+/messages$").mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "wamid.otp"}]})
+    )
+
+    resp = client.post("/api/v1/auth/request-otp", json={"username": PHONE})
+
+    assert resp.status_code == 200
+    assert route.call_count == 1
+    payload = json.loads(route.calls[0].request.content)
+    assert payload["type"] == "template"
+    assert payload["template"]["name"] == settings.WHATSAPP_OTP_TEMPLATE_NAME
+
+    user = db_session.query(User).filter(User.username == PHONE).first()
+    components = payload["template"]["components"]
+    assert components[0]["type"] == "body"
+    assert components[0]["parameters"][0]["text"] == user.otp_code
+    assert components[1]["type"] == "button"
+    assert components[1]["sub_type"] == "copy_code"
+    assert components[1]["parameters"][0]["coupon_code"] == user.otp_code
+
+
+@respx.mock
+def test_request_otp_falls_back_to_text_when_template_rejected(client, db_session):
+    route = respx.post(url__regex=r"https://graph\.facebook\.com/.+/messages$").mock(
+        side_effect=[
+            httpx.Response(400, json={"error": {"message": "template not approved"}}),
+            httpx.Response(200, json={"messages": [{"id": "wamid.otp"}]}),
+        ]
+    )
+
+    resp = client.post("/api/v1/auth/request-otp", json={"username": PHONE})
+
+    assert resp.status_code == 200
+    assert route.call_count == 2
+    first_payload = json.loads(route.calls[0].request.content)
+    second_payload = json.loads(route.calls[1].request.content)
+    assert first_payload["type"] == "template"
+    assert second_payload["type"] == "text"
+
+
+@respx.mock
+def test_request_otp_skips_template_when_not_configured(client, db_session, monkeypatch):
+    monkeypatch.setattr(settings, "WHATSAPP_OTP_TEMPLATE_NAME", None)
+    route = _mock_send_text()
+
+    resp = client.post("/api/v1/auth/request-otp", json={"username": PHONE})
+
+    assert resp.status_code == 200
+    assert route.call_count == 1
+    payload = json.loads(route.calls[0].request.content)
+    assert payload["type"] == "text"
