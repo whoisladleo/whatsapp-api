@@ -34,7 +34,7 @@ Production image build/run uses `Dockerfile.prod` (multi-stage, non-root `webapp
 
 ## Architecture
 
-**Request flow**: `main.py` wires up FastAPI, CORS, and mounts five routers under `/api/v1` (`app/api/v1/*.py`): `auth`, `whatsapp`, `knowledge`, `tunzaa_webhook`, `accounts`, `products`. Static product images are served from `/static` (backed by `static/uploads/products`, or Cloudflare R2 when `R2_*` env vars are set).
+**Request flow**: `main.py` wires up FastAPI, CORS, and mounts routers under `/api/v1` (`app/api/v1/*.py`): `auth`, `whatsapp`, `instagram`, `knowledge`, `tunzaa_webhook`, `accounts`, `products`, `orders`, `pool`. Static product images are served from `/static` (backed by `static/uploads/products`, or Cloudflare R2 when `R2_*` env vars are set).
 
 **Multi-tenant model**: A `User` (merchant) owns one or more `WhatsAppAccount` rows (each tied to a Meta `phone_number_id` + access token). Most WhatsApp-account-scoped endpoints (`/whatsapp/messages`, `/whatsapp/messages/send`) resolve the account via the `get_whatsapp_account` dependency in `app/api/v1/whatsapp.py`, which accepts the account either as the `X-WhatsApp-Account-ID` / `X-Account-ID` header or query param — not from the JWT. Account-management endpoints (`/whatsapp/accounts*`) and everything under `/products`, `/knowledge` are scoped by the authenticated user (`get_current_user` in `app/api/deps.py`, JWT bearer via `PyJWT`).
 

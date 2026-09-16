@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api.v1 import auth, whatsapp, knowledge, tunzaa_webhook, accounts, products, orders, pool
+from app.api.v1 import auth, whatsapp, instagram, knowledge, tunzaa_webhook, accounts, products, orders, pool
 from app.core.config import settings
 
 from fastapi.staticfiles import StaticFiles
@@ -34,6 +34,9 @@ app.add_middleware(
 app.include_router(auth.router, prefix=f"{settings.API_V1_STR}/auth", tags=["auth"])
 app.include_router(
     whatsapp.router, prefix=f"{settings.API_V1_STR}/whatsapp", tags=["whatsapp"]
+)
+app.include_router(
+    instagram.router, prefix=f"{settings.API_V1_STR}/instagram", tags=["instagram"]
 )
 app.include_router(
     knowledge.router, prefix=f"{settings.API_V1_STR}/knowledge", tags=["knowledge"]
