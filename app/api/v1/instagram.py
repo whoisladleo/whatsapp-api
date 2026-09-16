@@ -1,17 +1,29 @@
+from datetime import timedelta
 from typing import Optional
 
+import jwt
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
+from app.api.deps import get_current_user
+from app.core import security
 from app.core.config import settings
 from app.core.instagram_webhook_parser import InstagramWebhookParser
 from app.core.security import verify_meta_signature
 from app.crud import instagram as crud_instagram
+from app.db.models import User
 from app.db.session import get_db
+from app.services import instagram_oauth
 from app.tasks.instagram_comment_processing import process_inbound_comment
 
 router = APIRouter()
+
+# How long a merchant has to complete the Meta consent screen before the
+# `state` token (which carries their identity through the redirect, since
+# the callback is a plain browser navigation with no Authorization header)
+# expires.
+OAUTH_STATE_EXPIRE_MINUTES = 10
 
 
 @router.get("/webhook")
@@ -66,3 +78,50 @@ async def handle_webhook(
             process_inbound_comment.apply_async(args=[account.id, comment.id])
 
     return {"status": "ok"}
+
+
+@router.get("/oauth/start")
+async def start_oauth(current_user: User = Depends(get_current_user)):
+    """Called by the dashboard's "Connect Instagram" button; the browser
+    is then redirected to the returned URL for Meta's consent screen."""
+    state = security.create_access_token(
+        current_user.id, expires_delta=timedelta(minutes=OAUTH_STATE_EXPIRE_MINUTES)
+    )
+    return {"authorize_url": instagram_oauth.build_authorize_url(state)}
+
+
+@router.get("/oauth/callback")
+async def oauth_callback(
+    db: Session = Depends(get_db),
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
+):
+    """
+    Meta redirects the merchant's browser here after the consent screen —
+    a plain top-level navigation, so identity travels via the signed
+    `state` token from /oauth/start rather than an Authorization header.
+    Always redirects back to the dashboard; success/failure is conveyed
+    via query params for the frontend to show a toast.
+    """
+    settings_url = f"{settings.DASHBOARD_URL}/dashboard/settings"
+
+    if error or not code or not state:
+        return RedirectResponse(f"{settings_url}?instagram=error")
+
+    try:
+        payload = jwt.decode(state, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        user_id = int(payload["sub"])
+    except (jwt.InvalidTokenError, KeyError, TypeError, ValueError):
+        return RedirectResponse(f"{settings_url}?instagram=error")
+
+    try:
+        short_lived_token = await instagram_oauth.exchange_code_for_short_lived_token(code)
+        long_lived_token = await instagram_oauth.exchange_for_long_lived_token(short_lived_token)
+        ig_user_id, username = await instagram_oauth.fetch_account_identity(long_lived_token)
+    except instagram_oauth.InstagramOAuthError:
+        return RedirectResponse(f"{settings_url}?instagram=error")
+
+    crud_instagram.upsert_account(db, user_id, ig_user_id, long_lived_token, username)
+
+    return RedirectResponse(f"{settings_url}?instagram=connected")
