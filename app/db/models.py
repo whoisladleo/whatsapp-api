@@ -64,6 +64,7 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     accounts = relationship("WhatsAppAccount", back_populates="owner")
+    instagram_accounts = relationship("InstagramAccount", back_populates="owner")
     knowledge_bases = relationship("KnowledgeBase", back_populates="owner")
     products = relationship("Product", back_populates="merchant")
 
@@ -216,6 +217,54 @@ class Message(Base):
     timestamp = Column(DateTime, default=datetime.utcnow)
 
     account = relationship("WhatsAppAccount", back_populates="messages")
+
+
+class InstagramAccount(Base):
+    """
+    A merchant's connected Instagram professional account — always
+    bring-your-own (unlike WhatsAppAccount, there's no pool: Instagram
+    accounts can't be provisioned the way phone numbers can), linked via
+    Facebook Login for Business OAuth.
+    """
+    __tablename__ = "instagram_accounts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    ig_business_id = Column(String, unique=True, index=True, nullable=False)
+    page_id = Column(String, nullable=False)
+    page_access_token = Column(String, nullable=False)
+    username = Column(String, nullable=True)
+    ai_enabled = Column(Boolean, default=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    owner = relationship("User", back_populates="instagram_accounts")
+    comments = relationship("InstagramComment", back_populates="account")
+
+
+class InstagramComment(Base):
+    """
+    A comment received on a connected account's media, and Amara's reply
+    state for it — deliberately its own table rather than reusing Message,
+    which is shaped around WhatsApp's phone-number identifiers.
+    """
+    __tablename__ = "instagram_comments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    comment_id = Column(String, unique=True, index=True, nullable=False)
+    media_id = Column(String, nullable=True)
+    from_username = Column(String, nullable=True)
+    # Instagram-scoped user id for the commenter — needed as the `recipient`
+    # for a private-reply DM, distinct from their (not always present) username.
+    from_ig_scoped_id = Column(String, nullable=True)
+    body = Column(String, nullable=True)
+    public_reply_sent = Column(Boolean, default=False, nullable=False)
+    # Private replies are one-shot per comment (Meta allows exactly one),
+    # so this also guards against re-sending on a duplicate webhook delivery.
+    private_reply_sent = Column(Boolean, default=False, nullable=False)
+    account_id = Column(Integer, ForeignKey("instagram_accounts.id"))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    account = relationship("InstagramAccount", back_populates="comments")
 
 
 class Product(Base):
