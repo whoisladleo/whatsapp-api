@@ -224,14 +224,15 @@ class InstagramAccount(Base):
     A merchant's connected Instagram professional account — always
     bring-your-own (unlike WhatsAppAccount, there's no pool: Instagram
     accounts can't be provisioned the way phone numbers can), linked via
-    Facebook Login for Business OAuth.
+    Business Login for Instagram (Instagram API with Instagram Login) OAuth.
+    No Facebook Page is involved in this flow — the access token is scoped
+    directly to the Instagram professional account itself.
     """
     __tablename__ = "instagram_accounts"
 
     id = Column(Integer, primary_key=True, index=True)
     ig_business_id = Column(String, unique=True, index=True, nullable=False)
-    page_id = Column(String, nullable=False)
-    page_access_token = Column(String, nullable=False)
+    access_token = Column(String, nullable=False)
     username = Column(String, nullable=True)
     ai_enabled = Column(Boolean, default=True)
     user_id = Column(Integer, ForeignKey("users.id"))

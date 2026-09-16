@@ -44,7 +44,7 @@ def merchant_owner(db_session):
 # --- GET /webhook verify-token handshake ------------------------------------
 
 def test_verify_webhook_correct_token(client, monkeypatch):
-    monkeypatch.setattr(settings, "WEBHOOK_VERIFY_TOKEN", "expected-verify-token")
+    monkeypatch.setattr(settings, "INSTAGRAM_WEBHOOK_VERIFY_TOKEN", "expected-verify-token")
     resp = client.get(
         WEBHOOK_URL,
         params={
@@ -59,7 +59,7 @@ def test_verify_webhook_correct_token(client, monkeypatch):
 
 
 def test_verify_webhook_wrong_token(client, monkeypatch):
-    monkeypatch.setattr(settings, "WEBHOOK_VERIFY_TOKEN", "expected-verify-token")
+    monkeypatch.setattr(settings, "INSTAGRAM_WEBHOOK_VERIFY_TOKEN", "expected-verify-token")
     resp = client.get(
         WEBHOOK_URL,
         params={
@@ -75,14 +75,14 @@ def test_verify_webhook_wrong_token(client, monkeypatch):
 # --- POST /webhook signature verification ------------------------------------
 
 def test_webhook_accepted_without_app_secret_configured(client):
-    assert settings.WHATSAPP_APP_SECRET is None
+    assert settings.INSTAGRAM_APP_SECRET is None
     resp = client.post(WEBHOOK_URL, json={"entry": []})
 
     assert resp.status_code == 200
 
 
 def test_webhook_rejects_bad_signature_when_secret_configured(client, monkeypatch):
-    monkeypatch.setattr(settings, "WHATSAPP_APP_SECRET", "topsecret")
+    monkeypatch.setattr(settings, "INSTAGRAM_APP_SECRET", "topsecret")
     body = json.dumps({"entry": []}).encode()
 
     resp = client.post(
@@ -98,11 +98,11 @@ def test_webhook_rejects_bad_signature_when_secret_configured(client, monkeypatc
 
 
 def test_webhook_accepts_correct_signature_when_secret_configured(client, monkeypatch):
-    monkeypatch.setattr(settings, "WHATSAPP_APP_SECRET", "topsecret")
+    monkeypatch.setattr(settings, "INSTAGRAM_APP_SECRET", "topsecret")
     body = json.dumps({"entry": []}).encode()
 
     sig = "sha256=" + hmac.new(b"topsecret", body, hashlib.sha256).hexdigest()
-    assert verify_meta_signature(body, sig)
+    assert verify_meta_signature(body, sig, app_secret="topsecret")
 
     resp = client.post(
         WEBHOOK_URL,
@@ -128,8 +128,7 @@ def test_known_account_ai_enabled_stores_comment_and_dispatches_task(
 ):
     account = InstagramAccount(
         ig_business_id="ig_business_1",
-        page_id="page_1",
-        page_access_token="page-tok",
+        access_token="ig-tok",
         ai_enabled=True,
         user_id=merchant_owner.id,
     )
@@ -169,8 +168,7 @@ def test_known_account_ai_disabled_stores_comment_without_dispatch(
 ):
     account = InstagramAccount(
         ig_business_id="ig_business_2",
-        page_id="page_2",
-        page_access_token="page-tok",
+        access_token="ig-tok",
         ai_enabled=False,
         user_id=merchant_owner.id,
     )
@@ -202,8 +200,7 @@ def test_duplicate_delivery_of_same_comment_id_is_not_reprocessed(
 ):
     account = InstagramAccount(
         ig_business_id="ig_business_3",
-        page_id="page_3",
-        page_access_token="page-tok",
+        access_token="ig-tok",
         ai_enabled=True,
         user_id=merchant_owner.id,
     )

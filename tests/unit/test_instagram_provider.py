@@ -6,13 +6,13 @@ import respx
 
 from app.core.instagram_provider import InstagramProvider
 
-REPLIES_URL_RE = r"https://graph\.facebook\.com/.+/replies$"
-MESSAGES_URL_RE = r"https://graph\.facebook\.com/.+/messages$"
+REPLIES_URL_RE = r"https://graph\.instagram\.com/.+/replies$"
+MESSAGES_URL_RE = r"https://graph\.instagram\.com/.+/messages$"
 
 
 @pytest.fixture
 def provider():
-    return InstagramProvider(page_access_token="page-tok")
+    return InstagramProvider(access_token="ig-tok")
 
 
 @respx.mock
@@ -27,7 +27,7 @@ async def test_reply_to_comment_payload(provider):
     sent = json.loads(route.calls.last.request.content)
     assert sent == {"message": "Thanks for asking!"}
     assert result["id"] == "reply_123"
-    assert route.calls.last.request.headers["Authorization"] == "Bearer page-tok"
+    assert route.calls.last.request.headers["Authorization"] == "Bearer ig-tok"
 
 
 @respx.mock

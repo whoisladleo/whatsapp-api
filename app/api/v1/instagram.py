@@ -20,7 +20,7 @@ async def verify_webhook(
     hub_challenge: str = Query(None, alias="hub.challenge"),
     hub_verify_token: str = Query(None, alias="hub.verify_token"),
 ):
-    if hub_mode == "subscribe" and hub_verify_token == settings.WEBHOOK_VERIFY_TOKEN:
+    if hub_mode == "subscribe" and hub_verify_token == settings.INSTAGRAM_WEBHOOK_VERIFY_TOKEN:
         return PlainTextResponse(content=hub_challenge)
 
     raise HTTPException(status_code=403, detail="Verification failed")
@@ -34,14 +34,16 @@ async def handle_webhook(
 ):
     raw_body = await request.body()
 
-    # WHATSAPP_APP_SECRET is this Meta app's secret, not WhatsApp-specific —
-    # it signs every webhook subscription on the app, Instagram included.
-    if settings.WHATSAPP_APP_SECRET:
-        if not verify_meta_signature(raw_body, x_hub_signature_256):
+    # "Taskflow - IG" is a separate Meta App from the WhatsApp one, with its
+    # own app secret — not WHATSAPP_APP_SECRET.
+    if settings.INSTAGRAM_APP_SECRET:
+        if not verify_meta_signature(
+            raw_body, x_hub_signature_256, app_secret=settings.INSTAGRAM_APP_SECRET
+        ):
             raise HTTPException(status_code=403, detail="Invalid webhook signature")
     else:
         print(
-            "WARNING: WHATSAPP_APP_SECRET is not configured; skipping webhook "
+            "WARNING: INSTAGRAM_APP_SECRET is not configured; skipping webhook "
             "signature verification. Set it to prevent spoofed webhook payloads."
         )
 

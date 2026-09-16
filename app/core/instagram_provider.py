@@ -5,17 +5,18 @@ from app.core.config import settings
 
 class InstagramProvider:
     """
-    Wraps the Instagram Graph API (Facebook Login variant, graph.facebook.com)
-    for comment replies and comment-triggered private-reply DMs. Instantiated
-    per-account with that account's own Page access token, same pattern as
-    WhatsAppProvider.
+    Wraps the Instagram API (Instagram Login variant, graph.instagram.com —
+    not graph.facebook.com; there's no Facebook Page in this flow) for
+    comment replies and comment-triggered private-reply DMs. Instantiated
+    per-account with that account's own Instagram-scoped access token, same
+    pattern as WhatsAppProvider.
     """
 
-    def __init__(self, page_access_token: str):
-        self.access_token = page_access_token
-        self.base_url = f"{settings.WHATSAPP_BASE_URL}/{settings.WHATSAPP_VERSION}"
+    def __init__(self, access_token: str):
+        self.access_token = access_token
+        self.base_url = f"{settings.INSTAGRAM_GRAPH_BASE_URL}/{settings.WHATSAPP_VERSION}"
         self.headers = {
-            "Authorization": f"Bearer {page_access_token}",
+            "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
         }
 

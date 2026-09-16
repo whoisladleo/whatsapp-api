@@ -35,6 +35,18 @@ class Settings(BaseSettings):
     # incoming webhook POSTs. If unset, signature verification is skipped
     # (with a warning) rather than rejecting all webhook traffic.
     WHATSAPP_APP_SECRET: Optional[str] = None
+
+    # Instagram (Instagram API with Instagram Login / "Business Login for
+    # Instagram") — a separate Meta App from the WhatsApp one above, so it
+    # gets its own app id/secret/verify token/API host rather than reusing
+    # the WHATSAPP_* settings. No Facebook Page is involved in this flow.
+    INSTAGRAM_APP_ID: Optional[str] = None
+    INSTAGRAM_APP_SECRET: Optional[str] = None
+    INSTAGRAM_WEBHOOK_VERIFY_TOKEN: Optional[str] = None
+    INSTAGRAM_GRAPH_BASE_URL: str = "https://graph.instagram.com"
+    INSTAGRAM_OAUTH_AUTHORIZE_URL: str = "https://www.instagram.com/oauth/authorize"
+    INSTAGRAM_OAUTH_TOKEN_URL: str = "https://api.instagram.com/oauth/access_token"
+    INSTAGRAM_REDIRECT_URI: Optional[str] = None
     # Shared platform-level access token used for numbers auto-assigned from
     # the phone number pool (see PhoneNumberPool) — these all sit under
     # Taskflow's own Meta Business Manager, so one System User token covers

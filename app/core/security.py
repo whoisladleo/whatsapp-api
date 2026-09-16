@@ -33,13 +33,18 @@ def generate_otp(length: int = 6) -> str:
     return ''.join(str(secrets.randbelow(10)) for _ in range(length))
 
 
-def verify_meta_signature(raw_body: bytes, signature_header: Optional[str]) -> bool:
-    """Verifies Meta's X-Hub-Signature-256 header against the raw webhook body."""
+def verify_meta_signature(
+    raw_body: bytes, signature_header: Optional[str], app_secret: Optional[str] = None
+) -> bool:
+    """
+    Verifies Meta's X-Hub-Signature-256 header against the raw webhook body.
+    Defaults to the WhatsApp app's secret; pass app_secret explicitly for a
+    webhook belonging to a different Meta App (e.g. Instagram's).
+    """
     if not signature_header or not signature_header.startswith("sha256="):
         return False
-    expected = hmac.new(
-        settings.WHATSAPP_APP_SECRET.encode(), raw_body, hashlib.sha256
-    ).hexdigest()
+    secret = app_secret if app_secret is not None else settings.WHATSAPP_APP_SECRET
+    expected = hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
     provided = signature_header.removeprefix("sha256=")
     return hmac.compare_digest(expected, provided)
 
