@@ -15,7 +15,13 @@ def build_authorize_url(state: str) -> str:
         "client_id": settings.FACEBOOK_APP_ID,
         "redirect_uri": settings.FACEBOOK_LOGIN_REDIRECT_URI,
         "response_type": "code",
-        "scope": "email,public_profile",
+        # public_profile only — email isn't actually needed (the account is
+        # keyed on facebook_id, not email) and requesting it 400s with
+        # "Invalid Scopes: email" until it's added under the app's Use
+        # Cases/Permissions page in the Meta dashboard. fetch_profile still
+        # requests the email field and stores it opportunistically if a
+        # future token happens to carry it.
+        "scope": "public_profile",
         "state": state,
     }
     return f"{settings.FACEBOOK_OAUTH_AUTHORIZE_URL}?{urlencode(params)}"

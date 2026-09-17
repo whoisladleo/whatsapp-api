@@ -23,7 +23,6 @@ def test_build_authorize_url_includes_client_id_redirect_and_scopes():
     assert url.startswith(settings.FACEBOOK_OAUTH_AUTHORIZE_URL)
     assert "client_id=APPID123" in url
     assert "state=state123" in url
-    assert "email" in url
     assert "public_profile" in url
 
 
