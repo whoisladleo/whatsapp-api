@@ -22,6 +22,15 @@ class InstagramWebhookParser:
                 from_ = value.get("from", {})
                 media = value.get("media", {})
 
+                # Meta sends a webhook event for every comment on the
+                # media, including replies posted BY the connected account
+                # itself (from.id == the receiving account's own id) — our
+                # own public reply to a customer's comment is exactly such
+                # an event. Without this, Amara would treat her own reply
+                # as a new inbound comment and reply to it again, forever.
+                if from_.get("id") == ig_business_id:
+                    continue
+
                 parsed_comments.append(
                     {
                         "ig_business_id": ig_business_id,

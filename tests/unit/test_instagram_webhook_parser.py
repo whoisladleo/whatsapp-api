@@ -49,6 +49,44 @@ def test_ignores_non_comments_fields():
     assert InstagramWebhookParser.parse_inbound(data) == []
 
 
+def test_excludes_comments_authored_by_the_connected_account_itself():
+    """
+    The account's own public reply to a customer comment triggers another
+    webhook event for that reply — without filtering this out, Amara would
+    reply to her own reply, forever.
+    """
+    value = {
+        "from": {"id": "ig_business_1", "username": "taskflow_os"},
+        "media": {"id": "media_1"},
+        "id": "reply_comment_1",
+        "parent_id": "comment_1",
+        "text": "Thanks for reaching out! I've sent you more info in your DMs",
+    }
+    data = _envelope("ig_business_1", value)
+
+    assert InstagramWebhookParser.parse_inbound(data) == []
+
+
+def test_still_parses_a_real_customer_comment_alongside_a_self_comment():
+    self_value = {
+        "from": {"id": "ig_business_1", "username": "taskflow_os"},
+        "media": {"id": "media_1"},
+        "id": "reply_comment_1",
+        "text": "Thanks!",
+    }
+    customer_value = {
+        "from": {"id": "igsid_2", "username": "commenter2"},
+        "media": {"id": "media_1"},
+        "id": "comment_2",
+        "text": "how much?",
+    }
+    data = _envelope("ig_business_1", self_value, customer_value)
+
+    parsed = InstagramWebhookParser.parse_inbound(data)
+
+    assert [p["comment_id"] for p in parsed] == ["comment_2"]
+
+
 def test_parses_multiple_comments_across_entries():
     value1 = {"from": {"id": "a", "username": "u1"}, "media": {"id": "m1"}, "id": "c1", "text": "hi"}
     value2 = {"from": {"id": "b", "username": "u2"}, "media": {"id": "m2"}, "id": "c2", "text": "yo"}
