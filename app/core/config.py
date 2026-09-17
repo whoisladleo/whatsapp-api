@@ -49,7 +49,7 @@ class Settings(BaseSettings):
     INSTAGRAM_REDIRECT_URI: Optional[str] = None
     # Where to send the merchant's browser back to once the OAuth callback
     # finishes (success or failure) — the dashboard's settings page.
-    DASHBOARD_URL: str = "https://whatsapp.whoisladleo.dev"
+    DASHBOARD_URL: str = "https://business.taskflowos.dev"
 
     # Facebook Login — an independent alternative to WhatsApp OTP login
     # (not account-linking), added because OTP delivery has been unreliable.
@@ -142,6 +142,7 @@ class Settings(BaseSettings):
     BACKEND_CORS_ORIGINS: list[str] = [
         "http://localhost:3000",
         "http://127.0.0.1:3000",
+        "https://business.taskflowos.dev",
         "https://whatsapp.whoisladleo.dev",
     ]
 
