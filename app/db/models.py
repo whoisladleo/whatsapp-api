@@ -57,10 +57,20 @@ class User(Base):
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True, index=True)
-    username = Column(String, unique=True, index=True, nullable=False)
+    # Nullable: a Facebook-login-only account (see facebook_id below) has no
+    # phone number and therefore no username — WhatsApp OTP login and
+    # merchant-command routing (matching a WhatsApp sender against
+    # account.owner.username) simply never apply to that user.
+    username = Column(String, unique=True, index=True, nullable=True)
     otp_code = Column(String, nullable=True)
     otp_expires_at = Column(DateTime, nullable=True)
     business_name = Column(String, nullable=True)
+    # Facebook Login — an independent login method from WhatsApp OTP, not
+    # linked to a phone-based account. Set only for users who signed up/in
+    # via Facebook.
+    facebook_id = Column(String, unique=True, index=True, nullable=True)
+    email = Column(String, nullable=True)
+    name = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     accounts = relationship("WhatsAppAccount", back_populates="owner")

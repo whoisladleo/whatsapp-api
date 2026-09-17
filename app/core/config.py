@@ -50,6 +50,18 @@ class Settings(BaseSettings):
     # Where to send the merchant's browser back to once the OAuth callback
     # finishes (success or failure) — the dashboard's settings page.
     DASHBOARD_URL: str = "https://whatsapp.whoisladleo.dev"
+
+    # Facebook Login — an independent alternative to WhatsApp OTP login
+    # (not account-linking), added because OTP delivery has been unreliable.
+    # Runs under the same Meta App as Instagram ("Taskflow - IG"), so it
+    # deliberately reuses INSTAGRAM_APP_ID/INSTAGRAM_APP_SECRET above rather
+    # than having its own — only the redirect URI and OAuth host differ
+    # (Facebook Login uses www.facebook.com / graph.facebook.com, not
+    # Instagram's graph.instagram.com).
+    FACEBOOK_LOGIN_REDIRECT_URI: Optional[str] = None
+    FACEBOOK_OAUTH_AUTHORIZE_URL: str = "https://www.facebook.com/v25.0/dialog/oauth"
+    FACEBOOK_OAUTH_TOKEN_URL: str = "https://graph.facebook.com/v25.0/oauth/access_token"
+    FACEBOOK_GRAPH_BASE_URL: str = "https://graph.facebook.com/v25.0"
     # Shared platform-level access token used for numbers auto-assigned from
     # the phone number pool (see PhoneNumberPool) — these all sit under
     # Taskflow's own Meta Business Manager, so one System User token covers

@@ -22,3 +22,6 @@ class Token(BaseModel):
 
 class TokenPayload(BaseModel):
     sub: Optional[int] = None
+
+class FacebookExchangeRequest(BaseModel):
+    code: str

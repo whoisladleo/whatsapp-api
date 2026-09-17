@@ -1,4 +1,9 @@
+import secrets
+from typing import Optional
+
+import jwt
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
+from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 from datetime import timedelta, datetime
 
@@ -7,11 +12,18 @@ from app.core import security
 from app.core.config import settings
 from app.core.rate_limit import check_and_increment
 from app.core.security import normalize_phone
-from app.schemas.auth import Token, OTPRequest, OTPVerify
+from app.schemas.auth import Token, OTPRequest, OTPVerify, FacebookExchangeRequest
 from app.crud import user as crud_user
 from app.core.provider import WhatsAppProvider
+from app.services import facebook_oauth
 
 router = APIRouter()
+
+# The /callback redirect only carries a short-lived login code (exchanged
+# for the real session token by /exchange) rather than the token itself, so
+# a long-lived credential never ends up in a URL — browser history, server
+# access logs, etc.
+FACEBOOK_LOGIN_CODE_EXPIRE_MINUTES = 2
 
 async def send_otp_message(phone_number: str, otp: str):
     provider = WhatsAppProvider(settings.WHATSAPP_TOKEN, settings.PHONE_NUMBER_ID)
@@ -115,6 +127,69 @@ def verify_otp(
     # Clear OTP after successful verification
     crud_user.clear_user_otp(db, user)
     
+    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    return {
+        "access_token": security.create_access_token(
+            user.id, expires_delta=access_token_expires
+        ),
+        "token_type": "bearer",
+    }
+
+
+@router.get("/facebook/start")
+async def start_facebook_login():
+    """
+    An independent alternative to WhatsApp OTP login (not account linking —
+    see app/db/models.py's User.facebook_id), added because OTP delivery
+    has been unreliable. No current_user dependency: unlike Instagram's
+    oauth/start, this endpoint IS the login mechanism, so there's no
+    existing session to require yet.
+    """
+    state = secrets.token_urlsafe(16)
+    return {"authorize_url": facebook_oauth.build_authorize_url(state)}
+
+
+@router.get("/facebook/callback")
+async def facebook_login_callback(
+    db: Session = Depends(get_db),
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
+):
+    login_url = f"{settings.DASHBOARD_URL}/login"
+
+    if error or not code:
+        return RedirectResponse(f"{login_url}?fb_error=1")
+
+    try:
+        access_token = await facebook_oauth.exchange_code_for_token(code)
+        facebook_id, name, email = await facebook_oauth.fetch_profile(access_token)
+    except facebook_oauth.FacebookOAuthError:
+        return RedirectResponse(f"{login_url}?fb_error=1")
+
+    user = crud_user.get_user_by_facebook_id(db, facebook_id)
+    if not user:
+        user = crud_user.create_facebook_user(db, facebook_id, name, email)
+
+    login_code = security.create_access_token(
+        user.id, expires_delta=timedelta(minutes=FACEBOOK_LOGIN_CODE_EXPIRE_MINUTES)
+    )
+    return RedirectResponse(f"{login_url}?fb_code={login_code}")
+
+
+@router.post("/facebook/exchange", response_model=Token)
+def exchange_facebook_login_code(payload: FacebookExchangeRequest, db: Session = Depends(get_db)):
+    """Trades the short-lived code from /facebook/callback for a real session token."""
+    try:
+        decoded = jwt.decode(payload.code, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        user_id = int(decoded["sub"])
+    except (jwt.InvalidTokenError, KeyError, TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="Invalid or expired login code")
+
+    user = crud_user.get_user(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
     access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     return {
         "access_token": security.create_access_token(
