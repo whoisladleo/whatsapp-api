@@ -103,7 +103,7 @@ async def test_subscribe_to_webhooks_success():
 
     await instagram_oauth.subscribe_to_webhooks("long-tok")
 
-    assert route.calls.last.request.url.params["subscribed_fields"] == "comments"
+    assert route.calls.last.request.url.params["subscribed_fields"] == "comments,messages"
     assert route.calls.last.request.url.params["access_token"] == "long-tok"
 
 

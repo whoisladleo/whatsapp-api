@@ -2,7 +2,13 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
-from app.db.models import InstagramAccount, InstagramComment
+from app.db.models import (
+    InstagramAccount,
+    InstagramComment,
+    InstagramConversationContext,
+    InstagramCustomer,
+    InstagramDirectMessage,
+)
 
 
 def get_account_by_ig_business_id(
@@ -93,3 +99,89 @@ def create_comment(
     db.commit()
     db.refresh(comment)
     return comment
+
+
+def dm_already_processed(db: Session, ig_message_id: Optional[str]) -> bool:
+    if not ig_message_id:
+        return False
+    return (
+        db.query(InstagramDirectMessage)
+        .filter(InstagramDirectMessage.ig_message_id == ig_message_id)
+        .first()
+        is not None
+    )
+
+
+def get_or_create_customer(
+    db: Session, account_id: int, ig_scoped_id: str, username: Optional[str] = None
+) -> InstagramCustomer:
+    customer = (
+        db.query(InstagramCustomer)
+        .filter(InstagramCustomer.ig_scoped_id == ig_scoped_id)
+        .first()
+    )
+    if customer:
+        if username and customer.username != username:
+            customer.username = username
+            db.commit()
+            db.refresh(customer)
+        return customer
+
+    customer = InstagramCustomer(
+        account_id=account_id, ig_scoped_id=ig_scoped_id, username=username
+    )
+    db.add(customer)
+    db.commit()
+    db.refresh(customer)
+    return customer
+
+
+def get_or_create_conversation(
+    db: Session, customer_id: int
+) -> InstagramConversationContext:
+    context = (
+        db.query(InstagramConversationContext)
+        .filter(InstagramConversationContext.customer_id == customer_id)
+        .first()
+    )
+    if context:
+        return context
+
+    context = InstagramConversationContext(customer_id=customer_id)
+    db.add(context)
+    db.commit()
+    db.refresh(context)
+    return context
+
+
+def get_dm_history(
+    db: Session, customer_id: int, limit: int = 20
+) -> List[InstagramDirectMessage]:
+    return (
+        db.query(InstagramDirectMessage)
+        .filter(InstagramDirectMessage.customer_id == customer_id)
+        .order_by(InstagramDirectMessage.id.desc())
+        .limit(limit)
+        .all()
+    )[::-1]
+
+
+def create_direct_message(
+    db: Session,
+    account_id: int,
+    customer_id: int,
+    direction: str,
+    body: Optional[str],
+    ig_message_id: Optional[str] = None,
+) -> InstagramDirectMessage:
+    message = InstagramDirectMessage(
+        account_id=account_id,
+        customer_id=customer_id,
+        direction=direction,
+        body=body,
+        ig_message_id=ig_message_id,
+    )
+    db.add(message)
+    db.commit()
+    db.refresh(message)
+    return message

@@ -51,3 +51,26 @@ async def test_send_private_reply_payload(provider):
     assert result["message_id"] == "msg_1"
     request_url = str(route.calls.last.request.url)
     assert request_url.endswith("/ig_business_1/messages")
+
+
+@respx.mock
+async def test_send_direct_message_payload(provider):
+    route = respx.post(url__regex=MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(
+            200, json={"recipient_id": "ig-scoped-1", "message_id": "msg_2"}
+        )
+    )
+
+    result = await provider.send_direct_message(
+        "ig_business_1", "igsid_1", "It's 45000 TZS."
+    )
+
+    assert route.called
+    sent = json.loads(route.calls.last.request.content)
+    assert sent == {
+        "recipient": {"id": "igsid_1"},
+        "message": {"text": "It's 45000 TZS."},
+    }
+    assert result["message_id"] == "msg_2"
+    request_url = str(route.calls.last.request.url)
+    assert request_url.endswith("/ig_business_1/messages")

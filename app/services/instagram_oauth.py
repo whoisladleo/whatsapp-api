@@ -94,7 +94,7 @@ async def subscribe_to_webhooks(access_token: str) -> None:
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"{settings.INSTAGRAM_GRAPH_BASE_URL}/me/subscribed_apps",
-            params={"subscribed_fields": "comments", "access_token": access_token},
+            params={"subscribed_fields": "comments,messages", "access_token": access_token},
         )
     data = response.json()
     if not data.get("success"):

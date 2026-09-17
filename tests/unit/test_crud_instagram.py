@@ -1,7 +1,14 @@
 import pytest
 
 from app.crud import instagram as crud_instagram
-from app.db.models import InstagramAccount, User
+from app.db.models import (
+    ConversationState,
+    InstagramAccount,
+    InstagramConversationContext,
+    InstagramCustomer,
+    InstagramDirectMessage,
+    User,
+)
 
 
 @pytest.fixture
@@ -98,3 +105,80 @@ def test_upsert_reassigns_account_already_connected_by_a_different_user(
     assert db_session.query(InstagramAccount).filter(
         InstagramAccount.user_id == other_user.id
     ).count() == 0
+
+
+@pytest.fixture
+def account(db_session, user):
+    return crud_instagram.upsert_account(db_session, user.id, "ig_1", "tok_1", "shop_one")
+
+
+def test_get_or_create_customer_creates_new(db_session, account):
+    customer = crud_instagram.get_or_create_customer(db_session, account.id, "igsid_1", "commenter1")
+
+    assert customer.ig_scoped_id == "igsid_1"
+    assert customer.username == "commenter1"
+    assert customer.account_id == account.id
+    assert db_session.query(InstagramCustomer).count() == 1
+
+
+def test_get_or_create_customer_returns_existing_and_updates_username(db_session, account):
+    first = crud_instagram.get_or_create_customer(db_session, account.id, "igsid_1", "old_name")
+    second = crud_instagram.get_or_create_customer(db_session, account.id, "igsid_1", "new_name")
+
+    assert second.id == first.id
+    assert second.username == "new_name"
+    assert db_session.query(InstagramCustomer).count() == 1
+
+
+def test_get_or_create_conversation_creates_with_default_state(db_session, account):
+    customer = crud_instagram.get_or_create_customer(db_session, account.id, "igsid_1")
+
+    context = crud_instagram.get_or_create_conversation(db_session, customer.id)
+
+    assert context.customer_id == customer.id
+    assert context.state == ConversationState.NEGOTIATING
+    assert db_session.query(InstagramConversationContext).count() == 1
+
+
+def test_get_or_create_conversation_returns_existing(db_session, account):
+    customer = crud_instagram.get_or_create_customer(db_session, account.id, "igsid_1")
+    first = crud_instagram.get_or_create_conversation(db_session, customer.id)
+    first.state = ConversationState.HUMAN_HANDOFF
+    db_session.commit()
+
+    second = crud_instagram.get_or_create_conversation(db_session, customer.id)
+
+    assert second.id == first.id
+    assert second.state == ConversationState.HUMAN_HANDOFF
+    assert db_session.query(InstagramConversationContext).count() == 1
+
+
+def test_dm_already_processed(db_session, account):
+    customer = crud_instagram.get_or_create_customer(db_session, account.id, "igsid_1")
+    assert crud_instagram.dm_already_processed(db_session, "mid_1") is False
+
+    crud_instagram.create_direct_message(
+        db_session, account.id, customer.id, "inbound", "hi", ig_message_id="mid_1"
+    )
+
+    assert crud_instagram.dm_already_processed(db_session, "mid_1") is True
+    assert crud_instagram.dm_already_processed(db_session, None) is False
+
+
+def test_create_direct_message_and_get_dm_history_orders_oldest_first(db_session, account):
+    customer = crud_instagram.get_or_create_customer(db_session, account.id, "igsid_1")
+
+    crud_instagram.create_direct_message(
+        db_session, account.id, customer.id, "inbound", "first", ig_message_id="mid_1"
+    )
+    crud_instagram.create_direct_message(
+        db_session, account.id, customer.id, "outbound", "second", ig_message_id=None
+    )
+    crud_instagram.create_direct_message(
+        db_session, account.id, customer.id, "inbound", "third", ig_message_id="mid_3"
+    )
+
+    history = crud_instagram.get_dm_history(db_session, customer.id)
+
+    assert [m.body for m in history] == ["first", "second", "third"]
+    assert db_session.query(InstagramDirectMessage).count() == 3

@@ -44,3 +44,38 @@ class InstagramWebhookParser:
                 )
 
         return parsed_comments
+
+    @staticmethod
+    def parse_inbound_messages(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Parses Meta's Instagram webhook JSON for DM events — a different
+        shape from comments: `entry[].messaging`, not `entry[].changes`.
+        Skips echoes of our own sent messages (`message.is_echo`) and
+        non-message events (read receipts etc., which have no `message`
+        key) — both would otherwise loop the same way unfiltered comment
+        self-replies did.
+        """
+        parsed_messages = []
+
+        for entry in data.get("entry", []):
+            ig_business_id = entry.get("id")
+
+            for event in entry.get("messaging", []):
+                message = event.get("message")
+                if not message or message.get("is_echo"):
+                    continue
+
+                sender_id = event.get("sender", {}).get("id")
+                if not sender_id or sender_id == ig_business_id:
+                    continue
+
+                parsed_messages.append(
+                    {
+                        "ig_business_id": ig_business_id,
+                        "sender_id": sender_id,
+                        "ig_message_id": message.get("mid"),
+                        "body": message.get("text", ""),
+                    }
+                )
+
+        return parsed_messages

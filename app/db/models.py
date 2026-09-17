@@ -278,6 +278,58 @@ class InstagramComment(Base):
     account = relationship("InstagramAccount", back_populates="comments")
 
 
+class InstagramCustomer(Base):
+    """
+    A customer Amara is talking to over Instagram DM — separate from the
+    WhatsApp Customer model, which is keyed on phone_number; here the
+    identifier is the Instagram-scoped sender id, and there's usually no
+    phone number at all (which is also why DM conversations can negotiate
+    but not close/pay for an order the way WhatsApp ones do — Tunzaa's
+    mobile-money push needs a phone number we don't have here).
+    """
+    __tablename__ = "instagram_customers"
+
+    id = Column(Integer, primary_key=True, index=True)
+    ig_scoped_id = Column(String, unique=True, index=True, nullable=False)
+    username = Column(String, nullable=True)
+    account_id = Column(Integer, ForeignKey("instagram_accounts.id"), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    account = relationship("InstagramAccount")
+    conversation = relationship(
+        "InstagramConversationContext", back_populates="customer", uselist=False
+    )
+
+
+class InstagramConversationContext(Base):
+    __tablename__ = "instagram_conversation_contexts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    customer_id = Column(Integer, ForeignKey("instagram_customers.id"), unique=True)
+    # Reuses WhatsApp's ConversationState enum (NEGOTIATING/HUMAN_HANDOFF/
+    # MANAGEMENT) — same three states apply here.
+    state = Column(Enum(ConversationState), default=ConversationState.NEGOTIATING)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    customer = relationship("InstagramCustomer", back_populates="conversation")
+
+
+class InstagramDirectMessage(Base):
+    __tablename__ = "instagram_direct_messages"
+
+    id = Column(Integer, primary_key=True, index=True)
+    ig_message_id = Column(String, unique=True, index=True, nullable=True)
+    account_id = Column(Integer, ForeignKey("instagram_accounts.id"), nullable=False)
+    customer_id = Column(Integer, ForeignKey("instagram_customers.id"), nullable=False)
+    direction = Column(String, nullable=False)  # inbound, outbound
+    body = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    account = relationship("InstagramAccount")
+    customer = relationship("InstagramCustomer")
+
+
 class Product(Base):
     __tablename__ = "products"
 

@@ -17,6 +17,7 @@ from app.db.session import get_db
 from app.schemas.instagram import InstagramAccountRead
 from app.services import instagram_oauth
 from app.tasks.instagram_comment_processing import process_inbound_comment
+from app.tasks.instagram_dm_processing import process_inbound_dm
 
 router = APIRouter()
 
@@ -83,6 +84,38 @@ async def handle_webhook(
 
         if account.ai_enabled:
             process_inbound_comment.apply_async(args=[account.id, comment.id])
+
+    parsed_messages = InstagramWebhookParser.parse_inbound_messages(data)
+    print(f"Parsed {len(parsed_messages)} DM(s) from payload")
+
+    for item in parsed_messages:
+        account = crud_instagram.get_account_by_ig_business_id(
+            db, item["ig_business_id"]
+        )
+        if not account:
+            print(
+                f"No InstagramAccount found for ig_business_id={item['ig_business_id']!r} "
+                f"(ig_message_id={item.get('ig_message_id')!r})"
+            )
+            continue
+
+        if crud_instagram.dm_already_processed(db, item["ig_message_id"]):
+            continue
+
+        customer = crud_instagram.get_or_create_customer(
+            db, account.id, item["sender_id"]
+        )
+        dm = crud_instagram.create_direct_message(
+            db,
+            account_id=account.id,
+            customer_id=customer.id,
+            direction="inbound",
+            body=item["body"],
+            ig_message_id=item["ig_message_id"],
+        )
+
+        if account.ai_enabled:
+            process_inbound_dm.apply_async(args=[account.id, customer.id, dm.id])
 
     return {"status": "ok"}
 

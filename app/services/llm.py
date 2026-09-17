@@ -471,9 +471,87 @@ Match the customer's language (Swahili or English). Keep both lines to one sente
         public_reply, private_reply = parsed
         return {"public_reply": public_reply, "private_reply": private_reply}
 
+    async def generate_dm_response(
+        self,
+        message_body: str,
+        merchant_id: int,
+        db: Session,
+        conversation_history: List[dict],
+        account_name: str = "the shop",
+        knowledge_content: Optional[str] = None,
+    ) -> Optional[dict]:
+        """
+        Generates Amara's reply to an ongoing Instagram DM conversation.
+        Scoped to Q&A + price negotiation + handoff only — unlike
+        generate_response's WhatsApp flow, there's no AGREEMENT_REACHED/order
+        closing here, since Tunzaa's mobile-money payment flow needs a phone
+        number Instagram customers don't have. Once a deal is ready to close,
+        the model is instructed to hand off to a human instead. Returns None
+        if the model is unavailable (caller sends nothing that turn).
+        """
+        if not self.client:
+            return None
+
+        products = db.query(Product).filter(Product.merchant_id == merchant_id).all()
+        if not products:
+            catalog_str = "No products currently available."
+        else:
+            catalog_str = "Available Products:\n"
+            for p in products:
+                catalog_str += f"- {p.name}: Max Price {p.max_price}, Min Price (SECRET FLOOR) {p.min_price}, Stock: {p.quantity}\n"
+
+        history_str = ""
+        for m in conversation_history:
+            sender = "Customer" if m["direction"] == "inbound" else "Amara"
+            history_str += f"{sender}: {m['body']}\n"
+
+        instruction = f"""You are Amara, the AI sales agent for {account_name}, replying to a customer over Instagram Direct Message.
+
+{catalog_str}
+"""
+        if knowledge_content:
+            instruction += f"\nHere is additional knowledge:\n{knowledge_content}"
+
+        instruction += """
+RULES:
+1. Be helpful and friendly. Answer questions about products, pricing, and availability using only the catalog/knowledge above — never invent a product, price, or stock level that isn't there.
+2. Negotiation: use the catalog's max and min prices to negotiate. Never state or agree to a price below the minimum.
+3. You CANNOT take payment or finalize an order over Instagram — there's no way to collect the customer's phone number here for mobile-money payment. Once the customer has clearly agreed on a product and price, tell them a member of the team will follow up shortly to complete the order and arrange payment, and end your response with the exact marker [HUMAN_HANDOFF].
+4. Also include [HUMAN_HANDOFF] if the customer is unreasonable, asks something you can't answer from the catalog/knowledge above, or explicitly asks for a human.
+5. Keep replies SHORT and natural, like a real Instagram DM — usually 1-3 sentences. Match the customer's language (Swahili or English).
+
+Reply with ONLY the message text (plus the [HUMAN_HANDOFF] marker if applicable) — no other formatting.
+"""
+
+        try:
+            response = await self.client.messages.create(
+                model=self.model_id,
+                max_tokens=500,
+                system=instruction,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": f'Recent conversation:\n{history_str}\nCustomer just sent: "{message_body}"\n\nRespond as Amara:',
+                    }
+                ],
+            )
+            response_text = "".join(
+                block.text for block in response.content if block.type == "text"
+            )
+        except Exception as e:
+            logger.error(f"DM-response LLM error: {e}")
+            return None
+
+        handoff = "[HUMAN_HANDOFF]" in response_text
+        response_text = response_text.replace("[HUMAN_HANDOFF]", "").strip()
+        if not response_text:
+            response_text = "I am transferring you to a member of our team who can help you further. Please hold."
+
+        return {"reply": response_text, "handoff": handoff}
+
     async def generate_response(
-        self, 
-        message_body: str, 
+        self,
+        message_body: str,
         product_slug: Optional[str] = None, 
         knowledge_content: Optional[str] = None,
         system_prompt: Optional[str] = None,

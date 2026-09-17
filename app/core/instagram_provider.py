@@ -40,3 +40,17 @@ class InstagramProvider:
         async with httpx.AsyncClient() as client:
             response = await client.post(url, json=payload, headers=self.headers)
             return response.json()
+
+    async def send_direct_message(
+        self, ig_business_id: str, recipient_id: str, message: str
+    ) -> Dict[str, Any]:
+        # Ongoing DM sends (not tied to a specific comment) address the
+        # recipient by their IGSID instead of a comment_id.
+        url = f"{self.base_url}/{ig_business_id}/messages"
+        payload = {
+            "recipient": {"id": recipient_id},
+            "message": {"text": message},
+        }
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, json=payload, headers=self.headers)
+            return response.json()

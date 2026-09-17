@@ -101,3 +101,90 @@ def test_parses_multiple_comments_across_entries():
 
     assert [p["comment_id"] for p in parsed] == ["c1", "c2"]
     assert [p["ig_business_id"] for p in parsed] == ["ig_business_1", "ig_business_2"]
+
+
+def _dm_envelope(ig_business_id: str, *events: dict) -> dict:
+    return {"entry": [{"id": ig_business_id, "messaging": list(events)}]}
+
+
+def test_parses_dm_event():
+    data = _dm_envelope(
+        "ig_business_1",
+        {
+            "sender": {"id": "igsid_1"},
+            "recipient": {"id": "ig_business_1"},
+            "message": {"mid": "mid_1", "text": "is it still available?"},
+        },
+    )
+
+    parsed = InstagramWebhookParser.parse_inbound_messages(data)
+
+    assert parsed == [
+        {
+            "ig_business_id": "ig_business_1",
+            "sender_id": "igsid_1",
+            "ig_message_id": "mid_1",
+            "body": "is it still available?",
+        }
+    ]
+
+
+def test_dm_ignores_echoes_of_our_own_sent_messages():
+    """
+    Meta echoes back the connected account's own DM sends through the same
+    webhook subscription (message.is_echo) — without filtering this out,
+    Amara would treat her own reply as a new inbound message and reply to
+    it again, forever.
+    """
+    data = _dm_envelope(
+        "ig_business_1",
+        {
+            "sender": {"id": "ig_business_1"},
+            "recipient": {"id": "igsid_1"},
+            "message": {"mid": "mid_2", "text": "It's 45000 TZS.", "is_echo": True},
+        },
+    )
+
+    assert InstagramWebhookParser.parse_inbound_messages(data) == []
+
+
+def test_dm_ignores_non_message_events():
+    data = _dm_envelope(
+        "ig_business_1",
+        {"sender": {"id": "igsid_1"}, "recipient": {"id": "ig_business_1"}, "read": {"mid": "mid_1"}},
+    )
+
+    assert InstagramWebhookParser.parse_inbound_messages(data) == []
+
+
+def test_dm_ignores_events_sent_by_the_connected_account_itself():
+    data = _dm_envelope(
+        "ig_business_1",
+        {
+            "sender": {"id": "ig_business_1"},
+            "recipient": {"id": "igsid_1"},
+            "message": {"mid": "mid_3", "text": "Thanks!"},
+        },
+    )
+
+    assert InstagramWebhookParser.parse_inbound_messages(data) == []
+
+
+def test_parses_multiple_dms_across_entries():
+    data = {
+        "entry": [
+            _dm_envelope(
+                "ig_business_1",
+                {"sender": {"id": "a"}, "message": {"mid": "m1", "text": "hi"}},
+            )["entry"][0],
+            _dm_envelope(
+                "ig_business_2",
+                {"sender": {"id": "b"}, "message": {"mid": "m2", "text": "yo"}},
+            )["entry"][0],
+        ]
+    }
+
+    parsed = InstagramWebhookParser.parse_inbound_messages(data)
+
+    assert [p["ig_message_id"] for p in parsed] == ["m1", "m2"]
+    assert [p["ig_business_id"] for p in parsed] == ["ig_business_1", "ig_business_2"]

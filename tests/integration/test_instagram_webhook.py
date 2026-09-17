@@ -6,7 +6,13 @@ import pytest
 
 from app.core.config import settings
 from app.core.security import verify_meta_signature
-from app.db.models import InstagramAccount, InstagramComment, User
+from app.db.models import (
+    InstagramAccount,
+    InstagramComment,
+    InstagramCustomer,
+    InstagramDirectMessage,
+    User,
+)
 
 WEBHOOK_URL = "/api/v1/instagram/webhook"
 
@@ -25,6 +31,23 @@ def _comment_payload(ig_business_id: str, comment_id: str, text: str = "how much
                             "text": text,
                         },
                         "field": "comments",
+                    }
+                ],
+            }
+        ]
+    }
+
+
+def _dm_payload(ig_business_id: str, ig_message_id: str, text: str = "is it still available?"):
+    return {
+        "entry": [
+            {
+                "id": ig_business_id,
+                "messaging": [
+                    {
+                        "sender": {"id": "igsid_dm_1"},
+                        "recipient": {"id": ig_business_id},
+                        "message": {"mid": ig_message_id, "text": text},
                     }
                 ],
             }
@@ -223,5 +246,121 @@ def test_duplicate_delivery_of_same_comment_id_is_not_reprocessed(
     assert second_resp.status_code == 200
     assert db_session.query(InstagramComment).filter(
         InstagramComment.comment_id == "comment_dupe"
+    ).count() == 1
+    assert len(calls) == 1
+
+
+# --- DM account resolution + dispatch -----------------------------------------
+
+def test_unknown_ig_business_id_ignored_for_dm(client, db_session):
+    payload = _dm_payload("ig_does_not_exist", "mid_1")
+    resp = client.post(WEBHOOK_URL, json=payload)
+
+    assert resp.status_code == 200
+    assert db_session.query(InstagramDirectMessage).count() == 0
+
+
+def test_known_account_ai_enabled_stores_dm_and_dispatches_task(
+    client, db_session, merchant_owner
+):
+    account = InstagramAccount(
+        ig_business_id="ig_business_dm_1",
+        access_token="ig-tok",
+        ai_enabled=True,
+        user_id=merchant_owner.id,
+    )
+    db_session.add(account)
+    db_session.commit()
+    db_session.refresh(account)
+
+    import app.tasks.instagram_dm_processing as task_module
+
+    calls = []
+    original = task_module.process_inbound_dm.apply_async
+    task_module.process_inbound_dm.apply_async = lambda args=None, **kw: calls.append(args)
+    try:
+        payload = _dm_payload("ig_business_dm_1", "mid_1")
+        resp = client.post(WEBHOOK_URL, json=payload)
+    finally:
+        task_module.process_inbound_dm.apply_async = original
+
+    assert resp.status_code == 200
+
+    dm = db_session.query(InstagramDirectMessage).filter(
+        InstagramDirectMessage.ig_message_id == "mid_1"
+    ).first()
+    assert dm is not None
+    assert dm.account_id == account.id
+    assert dm.direction == "inbound"
+    assert dm.body == "is it still available?"
+
+    customer = db_session.query(InstagramCustomer).filter(
+        InstagramCustomer.ig_scoped_id == "igsid_dm_1"
+    ).first()
+    assert customer is not None
+    assert dm.customer_id == customer.id
+
+    assert len(calls) == 1
+    assert calls[0] == [account.id, customer.id, dm.id]
+
+
+def test_known_account_ai_disabled_stores_dm_without_dispatch(
+    client, db_session, merchant_owner
+):
+    account = InstagramAccount(
+        ig_business_id="ig_business_dm_2",
+        access_token="ig-tok",
+        ai_enabled=False,
+        user_id=merchant_owner.id,
+    )
+    db_session.add(account)
+    db_session.commit()
+
+    import app.tasks.instagram_dm_processing as task_module
+
+    calls = []
+    original = task_module.process_inbound_dm.apply_async
+    task_module.process_inbound_dm.apply_async = lambda args=None, **kw: calls.append(args)
+    try:
+        payload = _dm_payload("ig_business_dm_2", "mid_2")
+        resp = client.post(WEBHOOK_URL, json=payload)
+    finally:
+        task_module.process_inbound_dm.apply_async = original
+
+    assert resp.status_code == 200
+    assert db_session.query(InstagramDirectMessage).filter(
+        InstagramDirectMessage.ig_message_id == "mid_2"
+    ).count() == 1
+    assert len(calls) == 0
+
+
+def test_duplicate_delivery_of_same_dm_id_is_not_reprocessed(
+    client, db_session, merchant_owner
+):
+    account = InstagramAccount(
+        ig_business_id="ig_business_dm_3",
+        access_token="ig-tok",
+        ai_enabled=True,
+        user_id=merchant_owner.id,
+    )
+    db_session.add(account)
+    db_session.commit()
+
+    import app.tasks.instagram_dm_processing as task_module
+
+    calls = []
+    original = task_module.process_inbound_dm.apply_async
+    task_module.process_inbound_dm.apply_async = lambda args=None, **kw: calls.append(args)
+    try:
+        payload = _dm_payload("ig_business_dm_3", "mid_dupe")
+        first_resp = client.post(WEBHOOK_URL, json=payload)
+        second_resp = client.post(WEBHOOK_URL, json=payload)
+    finally:
+        task_module.process_inbound_dm.apply_async = original
+
+    assert first_resp.status_code == 200
+    assert second_resp.status_code == 200
+    assert db_session.query(InstagramDirectMessage).filter(
+        InstagramDirectMessage.ig_message_id == "mid_dupe"
     ).count() == 1
     assert len(calls) == 1
