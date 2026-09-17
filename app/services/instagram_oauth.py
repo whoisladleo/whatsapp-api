@@ -63,14 +63,20 @@ async def exchange_for_long_lived_token(short_lived_token: str) -> str:
 
 
 async def fetch_account_identity(access_token: str) -> Tuple[str, str]:
-    """Returns (ig_user_id, username) for the connected Instagram account."""
+    """
+    Returns (ig_user_id, username) for the connected Instagram account.
+    Confirmed live against Meta: /me's `id` field is an app-scoped id (only
+    meaningful to this app), NOT the id that shows up in webhook payloads'
+    entry[].id — that's the separate `user_id` field. Requesting the wrong
+    one here silently breaks account lookup for every future webhook.
+    """
     async with httpx.AsyncClient() as client:
         response = await client.get(
             f"{settings.INSTAGRAM_GRAPH_BASE_URL}/me",
-            params={"fields": "id,username", "access_token": access_token},
+            params={"fields": "user_id,username", "access_token": access_token},
         )
     data = response.json()
-    ig_user_id = data.get("id")
+    ig_user_id = data.get("user_id")
     if not ig_user_id:
         raise InstagramOAuthError(f"Failed to fetch Instagram account identity: {data}")
     return ig_user_id, data.get("username")

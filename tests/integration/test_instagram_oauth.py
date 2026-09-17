@@ -28,7 +28,9 @@ def _mock_successful_exchange(ig_user_id="ig_user_1", username="shopowner"):
         return_value=httpx.Response(200, json={"access_token": "long-tok"})
     )
     respx.get(url__regex=ME_URL_RE).mock(
-        return_value=httpx.Response(200, json={"id": ig_user_id, "username": username})
+        return_value=httpx.Response(
+            200, json={"id": "app_scoped_id", "user_id": ig_user_id, "username": username}
+        )
     )
     return respx.post(url__regex=SUBSCRIBE_URL_RE).mock(
         return_value=httpx.Response(200, json={"success": True})
@@ -120,7 +122,9 @@ def test_callback_still_connects_account_even_if_webhook_subscription_fails(
         return_value=httpx.Response(200, json={"access_token": "long-tok"})
     )
     respx.get(url__regex=ME_URL_RE).mock(
-        return_value=httpx.Response(200, json={"id": "ig_user_1", "username": "shopowner"})
+        return_value=httpx.Response(
+            200, json={"id": "app_scoped_id", "user_id": "ig_user_1", "username": "shopowner"}
+        )
     )
     respx.post(url__regex=SUBSCRIBE_URL_RE).mock(
         return_value=httpx.Response(400, json={"error": {"message": "nope"}})

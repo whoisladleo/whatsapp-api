@@ -76,7 +76,9 @@ async def test_exchange_for_long_lived_token_failure():
 @respx.mock
 async def test_fetch_account_identity_success():
     respx.get(url__regex=ME_URL_RE).mock(
-        return_value=httpx.Response(200, json={"id": "ig_user_1", "username": "shopowner"})
+        return_value=httpx.Response(
+            200, json={"id": "app_scoped_1", "user_id": "ig_user_1", "username": "shopowner"}
+        )
     )
 
     ig_user_id, username = await instagram_oauth.fetch_account_identity("long-tok")
