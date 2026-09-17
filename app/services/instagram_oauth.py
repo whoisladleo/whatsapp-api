@@ -73,3 +73,22 @@ async def fetch_account_identity(access_token: str) -> Tuple[str, str]:
     if not ig_user_id:
         raise InstagramOAuthError(f"Failed to fetch Instagram account identity: {data}")
     return ig_user_id, data.get("username")
+
+
+async def subscribe_to_webhooks(access_token: str) -> None:
+    """
+    The app-level webhook callback URL/verify token (configured once in the
+    Meta dashboard) isn't enough on its own — each connected account has to
+    separately opt itself in via this call, using its own access token, or
+    Meta never sends comment events for it. Best-effort: logged by the
+    caller rather than raised, since a failure here shouldn't block the
+    OAuth flow itself completing.
+    """
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{settings.INSTAGRAM_GRAPH_BASE_URL}/me/subscribed_apps",
+            params={"subscribed_fields": "comments", "access_token": access_token},
+        )
+    data = response.json()
+    if not data.get("success"):
+        raise InstagramOAuthError(f"Webhook subscription failed: {data}")

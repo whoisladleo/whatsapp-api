@@ -8,7 +8,8 @@ from app.services.instagram_oauth import InstagramOAuthError
 
 SHORT_TOKEN_URL_RE = r"https://api\.instagram\.com/oauth/access_token$"
 LONG_TOKEN_URL_RE = r"https://graph\.instagram\.com/access_token"
-ME_URL_RE = r"https://graph\.instagram\.com/me"
+ME_URL_RE = r"https://graph\.instagram\.com/me\?"
+SUBSCRIBE_URL_RE = r"https://graph\.instagram\.com/me/subscribed_apps"
 
 
 @pytest.fixture(autouse=True)
@@ -90,3 +91,25 @@ async def test_fetch_account_identity_failure():
 
     with pytest.raises(InstagramOAuthError):
         await instagram_oauth.fetch_account_identity("bad-tok")
+
+
+@respx.mock
+async def test_subscribe_to_webhooks_success():
+    route = respx.post(url__regex=SUBSCRIBE_URL_RE).mock(
+        return_value=httpx.Response(200, json={"success": True})
+    )
+
+    await instagram_oauth.subscribe_to_webhooks("long-tok")
+
+    assert route.calls.last.request.url.params["subscribed_fields"] == "comments"
+    assert route.calls.last.request.url.params["access_token"] == "long-tok"
+
+
+@respx.mock
+async def test_subscribe_to_webhooks_failure():
+    respx.post(url__regex=SUBSCRIBE_URL_RE).mock(
+        return_value=httpx.Response(400, json={"error": {"message": "nope"}})
+    )
+
+    with pytest.raises(InstagramOAuthError):
+        await instagram_oauth.subscribe_to_webhooks("bad-tok")

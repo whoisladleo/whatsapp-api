@@ -1,3 +1,4 @@
+import logging
 from datetime import timedelta
 from typing import Optional
 
@@ -19,6 +20,8 @@ from app.services import instagram_oauth
 from app.tasks.instagram_comment_processing import process_inbound_comment
 
 router = APIRouter()
+
+logger = logging.getLogger(__name__)
 
 # How long a merchant has to complete the Meta consent screen before the
 # `state` token (which carries their identity through the redirect, since
@@ -131,5 +134,13 @@ async def oauth_callback(
         return RedirectResponse(f"{settings_url}?instagram=error")
 
     crud_instagram.upsert_account(db, user_id, ig_user_id, long_lived_token, username)
+
+    try:
+        await instagram_oauth.subscribe_to_webhooks(long_lived_token)
+    except instagram_oauth.InstagramOAuthError as e:
+        # Don't fail the connection over this — the account is connected
+        # either way, it just won't receive comment webhooks until this
+        # succeeds (e.g. on a later reconnect).
+        logger.error(f"Failed to subscribe {ig_user_id} to Instagram webhooks: {e}")
 
     return RedirectResponse(f"{settings_url}?instagram=connected")

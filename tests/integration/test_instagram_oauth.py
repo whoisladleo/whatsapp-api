@@ -8,7 +8,8 @@ from app.db.models import InstagramAccount
 
 SHORT_TOKEN_URL_RE = r"https://api\.instagram\.com/oauth/access_token$"
 LONG_TOKEN_URL_RE = r"https://graph\.instagram\.com/access_token"
-ME_URL_RE = r"https://graph\.instagram\.com/me"
+ME_URL_RE = r"https://graph\.instagram\.com/me\?"
+SUBSCRIBE_URL_RE = r"https://graph\.instagram\.com/me/subscribed_apps"
 
 
 @pytest.fixture(autouse=True)
@@ -28,6 +29,9 @@ def _mock_successful_exchange(ig_user_id="ig_user_1", username="shopowner"):
     )
     respx.get(url__regex=ME_URL_RE).mock(
         return_value=httpx.Response(200, json={"id": ig_user_id, "username": username})
+    )
+    return respx.post(url__regex=SUBSCRIBE_URL_RE).mock(
+        return_value=httpx.Response(200, json={"success": True})
     )
 
 
@@ -81,7 +85,7 @@ def _valid_state_for(user_id: int) -> str:
 @respx.mock
 def test_callback_success_creates_instagram_account(client, db_session, auth_user):
     user, _ = auth_user
-    _mock_successful_exchange(ig_user_id="ig_user_1", username="shopowner")
+    subscribe_route = _mock_successful_exchange(ig_user_id="ig_user_1", username="shopowner")
 
     resp = client.get(
         "/api/v1/instagram/oauth/callback",
@@ -99,6 +103,41 @@ def test_callback_success_creates_instagram_account(client, db_session, auth_use
     assert account.access_token == "long-tok"
     assert account.username == "shopowner"
     assert account.user_id == user.id
+
+    assert subscribe_route.called
+    assert subscribe_route.calls.last.request.url.params["access_token"] == "long-tok"
+
+
+@respx.mock
+def test_callback_still_connects_account_even_if_webhook_subscription_fails(
+    client, db_session, auth_user
+):
+    user, _ = auth_user
+    respx.post(url__regex=SHORT_TOKEN_URL_RE).mock(
+        return_value=httpx.Response(200, json={"access_token": "short-tok"})
+    )
+    respx.get(url__regex=LONG_TOKEN_URL_RE).mock(
+        return_value=httpx.Response(200, json={"access_token": "long-tok"})
+    )
+    respx.get(url__regex=ME_URL_RE).mock(
+        return_value=httpx.Response(200, json={"id": "ig_user_1", "username": "shopowner"})
+    )
+    respx.post(url__regex=SUBSCRIBE_URL_RE).mock(
+        return_value=httpx.Response(400, json={"error": {"message": "nope"}})
+    )
+
+    resp = client.get(
+        "/api/v1/instagram/oauth/callback",
+        params={"code": "auth-code", "state": _valid_state_for(user.id)},
+        follow_redirects=False,
+    )
+
+    assert resp.status_code in (302, 307)
+    assert resp.headers["location"] == "https://dash.example.com/dashboard/settings?instagram=connected"
+    account = db_session.query(InstagramAccount).filter(
+        InstagramAccount.ig_business_id == "ig_user_1"
+    ).first()
+    assert account is not None
 
 
 @respx.mock
