@@ -64,13 +64,19 @@ async def handle_webhook(
         )
 
     data = await request.json()
+    logger.info(f"Instagram webhook payload: {data}")
     parsed_comments = InstagramWebhookParser.parse_inbound(data)
+    logger.info(f"Parsed {len(parsed_comments)} comment(s) from payload")
 
     for item in parsed_comments:
         account = crud_instagram.get_account_by_ig_business_id(
             db, item["ig_business_id"]
         )
         if not account:
+            logger.warning(
+                f"No InstagramAccount found for ig_business_id={item['ig_business_id']!r} "
+                f"(comment_id={item.get('comment_id')!r})"
+            )
             continue
 
         if crud_instagram.comment_already_processed(db, item["comment_id"]):
