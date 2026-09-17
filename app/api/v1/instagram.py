@@ -134,12 +134,26 @@ async def oauth_callback(
 
     try:
         short_lived_token = await instagram_oauth.exchange_code_for_short_lived_token(code)
+        logger.info(f"Short-lived token obtained, tail={short_lived_token[-12:]!r}")
         long_lived_token = await instagram_oauth.exchange_for_long_lived_token(short_lived_token)
+        logger.info(f"Long-lived token obtained, tail={long_lived_token[-12:]!r}")
         ig_user_id, username = await instagram_oauth.fetch_account_identity(long_lived_token)
-    except instagram_oauth.InstagramOAuthError:
+        logger.info(f"fetch_account_identity succeeded: ig_user_id={ig_user_id} username={username!r}")
+    except instagram_oauth.InstagramOAuthError as e:
+        logger.error(f"Instagram OAuth exchange failed: {e}")
         return RedirectResponse(f"{settings_url}?instagram=error")
 
     crud_instagram.upsert_account(db, user_id, ig_user_id, long_lived_token, username)
+    logger.info(f"Stored InstagramAccount for ig_user_id={ig_user_id}, tail={long_lived_token[-12:]!r}")
+
+    # Immediate re-check, milliseconds later, using the exact same token —
+    # to see whether it's already dead by the time this request finishes,
+    # versus dying sometime after.
+    try:
+        recheck_id, recheck_username = await instagram_oauth.fetch_account_identity(long_lived_token)
+        logger.info(f"Immediate re-check OK: {recheck_id} {recheck_username!r}")
+    except instagram_oauth.InstagramOAuthError as e:
+        logger.error(f"Immediate re-check FAILED (token already dead within the same request): {e}")
 
     try:
         await instagram_oauth.subscribe_to_webhooks(long_lived_token)

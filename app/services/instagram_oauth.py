@@ -1,9 +1,12 @@
+import logging
 from typing import Tuple
 from urllib.parse import urlencode
 
 import httpx
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class InstagramOAuthError(Exception):
@@ -55,6 +58,7 @@ async def exchange_for_long_lived_token(short_lived_token: str) -> str:
             },
         )
     data = response.json()
+    logger.info(f"Long-lived token exchange response: {data}")
     token = data.get("access_token")
     if not token:
         raise InstagramOAuthError(f"Long-lived token exchange failed: {data}")
