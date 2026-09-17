@@ -61,6 +61,7 @@ def test_reconnecting_after_disconnect_revives_the_same_row(db_session, user):
 
     assert reconnected.id == account_id
     assert reconnected.access_token == "tok_new"
+    assert reconnected.ai_enabled is True
     assert db_session.query(InstagramAccount).filter(InstagramAccount.user_id == user.id).count() == 1
 
 

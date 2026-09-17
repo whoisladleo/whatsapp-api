@@ -100,6 +100,11 @@ def upsert_account(
         account.access_token = access_token
         account.username = username
         account.user_id = user_id
+        # A previously-disconnected account (see disconnect_account) has
+        # ai_enabled=False — connecting is the merchant's clear intent to
+        # turn Amara back on for this account, and there's no UI to flip it
+        # separately, so it has to happen here.
+        account.ai_enabled = True
     else:
         account = InstagramAccount(
             ig_business_id=ig_business_id,
