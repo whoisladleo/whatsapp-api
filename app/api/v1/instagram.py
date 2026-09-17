@@ -9,17 +9,41 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user
 from app.core import security
 from app.core.config import settings
+from app.core.instagram_provider import InstagramProvider
 from app.core.instagram_webhook_parser import InstagramWebhookParser
 from app.core.security import verify_meta_signature
 from app.crud import instagram as crud_instagram
-from app.db.models import User
+from app.db.models import InstagramAccount, User
 from app.db.session import get_db
-from app.schemas.instagram import InstagramAccountRead
+from app.schemas.instagram import (
+    InstagramAccountRead,
+    InstagramConversationSummary,
+    InstagramMessageRead,
+    InstagramMessageSend,
+    InstagramPendingHandoffRead,
+)
 from app.services import instagram_oauth
 from app.tasks.instagram_comment_processing import process_inbound_comment
 from app.tasks.instagram_dm_processing import process_inbound_dm
 
 router = APIRouter()
+
+
+async def get_instagram_account(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> InstagramAccount:
+    """
+    Unlike WhatsApp's get_whatsapp_account, there's no header/account-id to
+    resolve — a Taskflow user has at most one connected InstagramAccount
+    (see upsert_account), so it's looked up directly off the JWT.
+    """
+    account = (
+        db.query(InstagramAccount).filter(InstagramAccount.user_id == current_user.id).first()
+    )
+    if not account:
+        raise HTTPException(status_code=404, detail="No Instagram account connected")
+    return account
 
 # How long a merchant has to complete the Meta consent screen before the
 # `state` token (which carries their identity through the redirect, since
@@ -194,3 +218,85 @@ async def oauth_callback(
         print(f"Failed to subscribe {ig_user_id} to Instagram webhooks: {e}")
 
     return RedirectResponse(f"{settings_url}?instagram=connected")
+
+
+@router.get("/conversations", response_model=list[InstagramConversationSummary])
+def get_conversations(
+    account: InstagramAccount = Depends(get_instagram_account),
+    db: Session = Depends(get_db),
+):
+    return crud_instagram.get_conversations_for_account(db, account.id)
+
+
+@router.get("/handoffs", response_model=list[InstagramPendingHandoffRead])
+def get_pending_handoffs(
+    account: InstagramAccount = Depends(get_instagram_account),
+    db: Session = Depends(get_db),
+):
+    return crud_instagram.get_pending_handoffs_for_account(db, account.id)
+
+
+@router.post("/handoffs/{customer_id}/resume")
+def resume_handoff(
+    customer_id: int,
+    account: InstagramAccount = Depends(get_instagram_account),
+    db: Session = Depends(get_db),
+):
+    try:
+        crud_instagram.get_customer_for_account(db, account.id, customer_id)
+        crud_instagram.resume_conversation(db, customer_id)
+    except crud_instagram.CustomerNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except crud_instagram.ConversationNotInHandoffError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"status": "resumed", "customer_id": customer_id}
+
+
+@router.get("/messages", response_model=list[InstagramMessageRead])
+def get_message_history(
+    customer_id: int,
+    limit: int = 100,
+    account: InstagramAccount = Depends(get_instagram_account),
+    db: Session = Depends(get_db),
+):
+    try:
+        crud_instagram.get_customer_for_account(db, account.id, customer_id)
+    except crud_instagram.CustomerNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return crud_instagram.get_dm_history(db, customer_id, limit=limit)
+
+
+@router.post("/messages/send")
+async def send_message(
+    payload: InstagramMessageSend,
+    account: InstagramAccount = Depends(get_instagram_account),
+    db: Session = Depends(get_db),
+):
+    """
+    A merchant manually replying from the dashboard — most useful once a
+    conversation is in HUMAN_HANDOFF, but not restricted to that state
+    (a merchant may want to jump in at any point). Amara stays silent on
+    this thread going forward only if the conversation is actually in
+    handoff; sending a message here doesn't itself change conversation state.
+    """
+    try:
+        customer = crud_instagram.get_customer_for_account(db, account.id, payload.customer_id)
+    except crud_instagram.CustomerNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    provider = InstagramProvider(account.access_token)
+    response = await provider.send_direct_message(
+        account.ig_business_id, customer.ig_scoped_id, payload.message
+    )
+    if "error" in response:
+        raise HTTPException(status_code=502, detail="Failed to send Instagram message")
+
+    message = crud_instagram.create_direct_message(
+        db,
+        account_id=account.id,
+        customer_id=customer.id,
+        direction="outbound",
+        body=payload.message,
+        ig_message_id=response.get("message_id"),
+    )
+    return {"status": "sent", "message_id": message.id}

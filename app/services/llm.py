@@ -14,6 +14,9 @@ from app.db.models import (
     ConversationState,
     Installment,
     InstallmentStatus,
+    InstagramAccount,
+    InstagramConversationContext,
+    InstagramCustomer,
     Order,
     OrderStatus,
     PaymentType,
@@ -30,7 +33,8 @@ logger = logging.getLogger(__name__)
 RESERVATION_WINDOW = timedelta(hours=48)
 
 _AGREEMENT_RE = re.compile(
-    r"\[AGREEMENT_REACHED:\s*product=(?P<product>.+?)\s+price=(?P<price>[\d.]+)\s+payment=(?P<payment>full|installment)\s*\]",
+    r"\[AGREEMENT_REACHED:\s*product=(?P<product>.+?)\s+price=(?P<price>[\d.]+)\s+payment=(?P<payment>full|installment)"
+    r"(?:\s+phone=(?P<phone>\S+))?\s*\]",
     re.IGNORECASE,
 )
 
@@ -103,6 +107,12 @@ def _parse_and_strip_agreement(text: str):
     [HUMAN_HANDOFF] is parsed. Always strips the marker from what the
     customer sees, whether or not it parses; a malformed marker just means
     no order gets created.
+
+    The optional `phone=` group only ever appears in Instagram DM output
+    (see generate_dm_response's prompt) — the WhatsApp flow already knows
+    the customer's phone number from the conversation itself, so its prompt
+    never asks the model to include one, and `match.group("phone")` is
+    simply None there.
     """
     match = _AGREEMENT_RE.search(text)
     if not match:
@@ -123,6 +133,7 @@ def _parse_and_strip_agreement(text: str):
         "product_name": product_name,
         "price": price,
         "payment_type": match.group("payment").lower(),
+        "phone": match.group("phone"),
     }
 
 class LLMService:
@@ -471,28 +482,104 @@ Match the customer's language (Swahili or English). Keep both lines to one sente
         public_reply, private_reply = parsed
         return {"public_reply": public_reply, "private_reply": private_reply}
 
+    async def _close_instagram_deal(
+        self, db: Session, account: InstagramAccount, agreement: dict
+    ) -> Optional[str]:
+        """
+        Instagram counterpart to _close_deal: validates the parsed
+        AGREEMENT_REACHED marker the same way (server-side catalog/price/
+        stock enforcement), then reserves stock and creates the Order —
+        except there's no pre-existing WhatsApp Customer/ConversationContext
+        to work from here, since Instagram never gave us a phone number up
+        front. The model is instructed to ask for one before emitting this
+        marker (see generate_dm_response's prompt); `agreement["phone"]` is
+        that number. Once normalized, it resolves/creates the same
+        phone-keyed Customer the WhatsApp flow uses, so payment dispatch,
+        reminders, and the dashboard Orders page all work identically
+        regardless of which channel the deal originated on — the only
+        difference is Order.instagram_account_id instead of .account_id.
+        """
+        product = (
+            db.query(Product)
+            .filter(Product.merchant_id == account.user_id, Product.name.ilike(agreement["product_name"]))
+            .first()
+        )
+        price = agreement["price"]
+        if not product:
+            logger.warning(f"Instagram AGREEMENT_REACHED for unknown product '{agreement['product_name']}'; ignoring.")
+            return None
+        if not (product.min_price <= price <= product.max_price):
+            logger.warning(
+                f"Instagram AGREEMENT_REACHED price {price} outside [{product.min_price}, {product.max_price}] "
+                f"for '{product.name}'; ignoring (possible prompt injection)."
+            )
+            return None
+        if product.quantity < 1:
+            logger.warning(f"Instagram AGREEMENT_REACHED for '{product.name}' but it's out of stock; ignoring.")
+            return None
+
+        phone = agreement.get("phone")
+        if not phone:
+            logger.warning("Instagram AGREEMENT_REACHED with no phone number; ignoring.")
+            return None
+        normalized_phone = normalize_phone(phone)
+
+        customer = db.query(Customer).filter(Customer.phone_number == normalized_phone).first()
+        if not customer:
+            customer = Customer(phone_number=normalized_phone)
+            db.add(customer)
+            db.commit()
+            db.refresh(customer)
+
+        payment_type = (
+            PaymentType.INSTALLMENT if agreement["payment_type"] == "installment" else PaymentType.FULL
+        )
+
+        product.quantity -= 1
+        order = Order(
+            customer_id=customer.id,
+            product_id=product.id,
+            instagram_account_id=account.id,
+            quantity=1,
+            agreed_price=price,
+            payment_type=payment_type,
+            status=OrderStatus.PENDING,
+            reserved_until=datetime.utcnow() + RESERVATION_WINDOW,
+        )
+        db.add(order)
+        db.commit()
+        db.refresh(order)
+
+        self._schedule_reminders(order.id)
+
+        return await self._dispatch_payment(db, order, product, normalized_phone, payment_type)
+
     async def generate_dm_response(
         self,
         message_body: str,
-        merchant_id: int,
         db: Session,
+        account: InstagramAccount,
+        context: InstagramConversationContext,
         conversation_history: List[dict],
         account_name: str = "the shop",
         knowledge_content: Optional[str] = None,
-    ) -> Optional[dict]:
+    ) -> Optional[str]:
         """
-        Generates Amara's reply to an ongoing Instagram DM conversation.
-        Scoped to Q&A + price negotiation + handoff only — unlike
-        generate_response's WhatsApp flow, there's no AGREEMENT_REACHED/order
-        closing here, since Tunzaa's mobile-money payment flow needs a phone
-        number Instagram customers don't have. Once a deal is ready to close,
-        the model is instructed to hand off to a human instead. Returns None
-        if the model is unavailable (caller sends nothing that turn).
+        Generates Amara's reply to an ongoing Instagram DM conversation:
+        Q&A, price negotiation, and — once the customer is ready to buy —
+        closing the deal for real (see _close_instagram_deal), the same way
+        generate_response's WhatsApp flow does. The one real difference is
+        that Instagram gives no phone number up front, so the prompt below
+        has the model ask for one before it's allowed to emit
+        [AGREEMENT_REACHED]. Falls back to [HUMAN_HANDOFF] for anything the
+        model shouldn't handle itself (unreasonable customers, questions
+        outside the catalog/knowledge, or an explicit request for a human).
+        Returns None if the model is unavailable (caller sends nothing).
         """
         if not self.client:
             return None
 
-        products = db.query(Product).filter(Product.merchant_id == merchant_id).all()
+        products = db.query(Product).filter(Product.merchant_id == account.user_id).all()
         if not products:
             catalog_str = "No products currently available."
         else:
@@ -516,11 +603,12 @@ Match the customer's language (Swahili or English). Keep both lines to one sente
 RULES:
 1. Be helpful and friendly. Answer questions about products, pricing, and availability using only the catalog/knowledge above — never invent a product, price, or stock level that isn't there.
 2. Negotiation: use the catalog's max and min prices to negotiate. Never state or agree to a price below the minimum.
-3. You CANNOT take payment or finalize an order over Instagram — there's no way to collect the customer's phone number here for mobile-money payment. Once the customer has clearly agreed on a product and price, tell them a member of the team will follow up shortly to complete the order and arrange payment, and end your response with the exact marker [HUMAN_HANDOFF].
-4. Also include [HUMAN_HANDOFF] if the customer is unreasonable, asks something you can't answer from the catalog/knowledge above, or explicitly asks for a human.
-5. Keep replies SHORT and natural, like a real Instagram DM — usually 1-3 sentences. Match the customer's language (Swahili or English).
+3. Closing: once the customer has clearly agreed on a specific product and price, ask whether they'd like to pay in full or in installments. Instagram doesn't give us their phone number automatically, so if you don't already have it from earlier in this conversation, ask for it too — explain it's needed to send the mobile-money payment request. Once you have a specific agreed price, a payment method choice, AND a phone number, confirm the deal and end your response with the exact marker [AGREEMENT_REACHED: product=<product name> price=<agreed price> payment=<full|installment> phone=<phone number>] (e.g. [AGREEMENT_REACHED: product=Shoes price=45000 payment=full phone=255700000000]). Only include this marker once all four are explicit — never guess or assume any of them.
+4. Payment: describe it accurately — a payment request gets sent directly to the given phone number for them to approve, not a menu of payment apps to choose from. Don't name specific mobile money providers.
+5. Human Handoff: if the customer is unreasonable, has complex questions you can't answer from the catalog/knowledge above, or explicitly asks for a human, include the exact marker [HUMAN_HANDOFF]. Don't include this for a normal close — that's handled by AGREEMENT_REACHED instead.
+6. Keep replies SHORT and natural, like a real Instagram DM — usually 1-3 sentences. Match the customer's language (Swahili or English).
 
-Reply with ONLY the message text (plus the [HUMAN_HANDOFF] marker if applicable) — no other formatting.
+Reply with ONLY the message text (plus whichever marker applies, if any) — no other formatting.
 """
 
         try:
@@ -542,12 +630,26 @@ Reply with ONLY the message text (plus the [HUMAN_HANDOFF] marker if applicable)
             logger.error(f"DM-response LLM error: {e}")
             return None
 
-        handoff = "[HUMAN_HANDOFF]" in response_text
-        response_text = response_text.replace("[HUMAN_HANDOFF]", "").strip()
-        if not response_text:
-            response_text = "I am transferring you to a member of our team who can help you further. Please hold."
+        if "[HUMAN_HANDOFF]" in response_text:
+            response_text = response_text.replace("[HUMAN_HANDOFF]", "").strip()
+            context.state = ConversationState.HUMAN_HANDOFF
+            context.handoff_at = datetime.utcnow()
+            db.commit()
+            if not response_text:
+                response_text = "I am transferring you to a member of our team who can help you further. Please hold."
+            return response_text
 
-        return {"reply": response_text, "handoff": handoff}
+        response_text, agreement = _parse_and_strip_agreement(response_text)
+        if agreement:
+            try:
+                note = await self._close_instagram_deal(db, account, agreement)
+            except Exception as deal_err:
+                logger.error(f"Instagram order/payment completion failed: {deal_err}")
+                note = None
+            if note:
+                response_text = f"{response_text}\n\n{note}".strip()
+
+        return response_text
 
     async def generate_response(
         self,

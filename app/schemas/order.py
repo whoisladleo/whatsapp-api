@@ -21,6 +21,8 @@ class OrderRead(BaseModel):
     quantity: int
     agreed_price: Optional[float] = None
     account_id: Optional[int] = None
+    instagram_account_id: Optional[int] = None
+    channel: str = "whatsapp"
     product_name: Optional[str] = None
     customer_phone: Optional[str] = None
     reserved_until: Optional[datetime] = None

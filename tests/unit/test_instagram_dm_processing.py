@@ -81,8 +81,18 @@ class _FakeProvider:
 @pytest.fixture
 def fake_llm_reply(monkeypatch):
     async def fake_generate_dm_response(**kwargs):
-        fake_generate_dm_response.called_with = kwargs
-        return {"reply": "It's 45000 TZS.", "handoff": False}
+        # Captured as plain values rather than the ORM objects themselves —
+        # the task's `finally: db.close()` detaches them before this
+        # fixture's caller gets to make assertions.
+        fake_generate_dm_response.called_with = {
+            "message_body": kwargs["message_body"],
+            "account_id": kwargs["account"].id,
+            "account_user_id": kwargs["account"].user_id,
+            "context_customer_id": kwargs["context"].customer_id,
+            "account_name": kwargs["account_name"],
+            "conversation_history": kwargs["conversation_history"],
+        }
+        return "It's 45000 TZS."
 
     fake_generate_dm_response.called_with = None
 
@@ -133,7 +143,9 @@ def test_sends_dm_reply_on_success(
     assert outbound.ig_message_id == "mid_out_1"
 
     assert fake_llm_reply.called_with["message_body"] == "how much is it?"
-    assert fake_llm_reply.called_with["merchant_id"] == merchant_id
+    assert fake_llm_reply.called_with["account_id"] == account_id
+    assert fake_llm_reply.called_with["account_user_id"] == merchant_id
+    assert fake_llm_reply.called_with["context_customer_id"] == customer_id
     assert fake_llm_reply.called_with["account_name"] == "shopowner"
     assert fake_llm_reply.called_with["conversation_history"] == []
 
@@ -174,11 +186,19 @@ def test_existing_handoff_conversation_is_not_replied_to(
     assert fake_provider.calls == []
 
 
-def test_handoff_marker_from_llm_updates_conversation_state(
+def test_reply_reflects_whatever_state_generate_dm_response_left_the_context_in(
     db_session, account, customer, inbound_dm, monkeypatch
 ):
+    """
+    generate_dm_response owns handoff-state mutation directly on the
+    InstagramConversationContext it's given (see tests/unit/test_llm_dm_response.py
+    for that behavior) — the task just needs to pass the same context object
+    through and not clobber whatever state it ends up in.
+    """
     async def fake_generate_dm_response(**kwargs):
-        return {"reply": "Someone from the team will follow up shortly.", "handoff": True}
+        kwargs["context"].state = ConversationState.HUMAN_HANDOFF
+        db_session.commit()
+        return "Someone from the team will follow up shortly."
 
     class FakeLLMService:
         generate_dm_response = staticmethod(fake_generate_dm_response)

@@ -52,20 +52,21 @@ async def _process(db, account_id: int, customer_id: int, dm_row_id: int) -> str
     latest = next((m for m in history_rows if m.id == dm_row_id), None)
     message_body = latest.body if latest else ""
 
-    result = await llm_service.generate_dm_response(
+    reply_text = await llm_service.generate_dm_response(
         message_body=message_body or "",
-        merchant_id=account.user_id,
         db=db,
+        account=account,
+        context=context,
         conversation_history=history,
         account_name=account.username or "the shop",
     )
-    if not result:
+    if not reply_text:
         logger.warning("No usable DM reply generated for customer %s.", customer.id)
         return "No reply generated."
 
     provider = InstagramProvider(account.access_token)
     response = await provider.send_direct_message(
-        account.ig_business_id, customer.ig_scoped_id, result["reply"]
+        account.ig_business_id, customer.ig_scoped_id, reply_text
     )
     if "error" in response:
         logger.error("DM send to customer %s failed: %s", customer.id, response)
@@ -76,12 +77,8 @@ async def _process(db, account_id: int, customer_id: int, dm_row_id: int) -> str
         account_id=account.id,
         customer_id=customer.id,
         direction="outbound",
-        body=result["reply"],
+        body=reply_text,
         ig_message_id=response.get("message_id"),
     )
-
-    if result.get("handoff"):
-        context.state = ConversationState.HUMAN_HANDOFF
-        db.commit()
 
     return "Processed."

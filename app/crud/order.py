@@ -1,8 +1,9 @@
 from typing import List, Optional
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from app.db.models import Order, OrderStatus, Product, WhatsAppAccount
+from app.db.models import InstagramAccount, Order, OrderStatus, Product, WhatsAppAccount
 from app.schemas.order import OrderDetail, OrderRead
 
 
@@ -22,6 +23,8 @@ def _to_order_read(order: Order) -> OrderRead:
         quantity=order.quantity,
         agreed_price=order.agreed_price,
         account_id=order.account_id,
+        instagram_account_id=order.instagram_account_id,
+        channel="instagram" if order.instagram_account_id else "whatsapp",
         product_name=order.product.name if order.product else None,
         customer_phone=order.customer.phone_number if order.customer else None,
         reserved_until=order.reserved_until,
@@ -54,10 +57,20 @@ def get_orders_by_merchant(
     skip: int = 0,
     limit: int = 100,
 ) -> List[OrderRead]:
+    # A merchant's order can belong to either a WhatsAppAccount or an
+    # InstagramAccount (never both — see Order.instagram_account_id), so
+    # this outer-joins both and matches whichever one is actually set,
+    # rather than requiring every merchant to have a WhatsApp account.
     query = (
         db.query(Order)
-        .join(WhatsAppAccount, Order.account_id == WhatsAppAccount.id)
-        .filter(WhatsAppAccount.user_id == user_id)
+        .outerjoin(WhatsAppAccount, Order.account_id == WhatsAppAccount.id)
+        .outerjoin(InstagramAccount, Order.instagram_account_id == InstagramAccount.id)
+        .filter(
+            or_(
+                WhatsAppAccount.user_id == user_id,
+                InstagramAccount.user_id == user_id,
+            )
+        )
     )
     if status:
         query = query.filter(Order.status == status)
@@ -72,8 +85,15 @@ def get_order_for_merchant(db: Session, order_id: int, user_id: int) -> Optional
     """Returns the raw ORM Order (not yet serialized) scoped to the merchant, or None."""
     return (
         db.query(Order)
-        .join(WhatsAppAccount, Order.account_id == WhatsAppAccount.id)
-        .filter(Order.id == order_id, WhatsAppAccount.user_id == user_id)
+        .outerjoin(WhatsAppAccount, Order.account_id == WhatsAppAccount.id)
+        .outerjoin(InstagramAccount, Order.instagram_account_id == InstagramAccount.id)
+        .filter(
+            Order.id == order_id,
+            or_(
+                WhatsAppAccount.user_id == user_id,
+                InstagramAccount.user_id == user_id,
+            ),
+        )
         .first()
     )
 

@@ -282,10 +282,12 @@ class InstagramCustomer(Base):
     """
     A customer Amara is talking to over Instagram DM — separate from the
     WhatsApp Customer model, which is keyed on phone_number; here the
-    identifier is the Instagram-scoped sender id, and there's usually no
-    phone number at all (which is also why DM conversations can negotiate
-    but not close/pay for an order the way WhatsApp ones do — Tunzaa's
-    mobile-money push needs a phone number we don't have here).
+    identifier is the Instagram-scoped sender id. Instagram gives no phone
+    number up front, so closing a deal means Amara has to ask for one during
+    negotiation — once she has it, a real (phone-keyed) Customer/Order is
+    created the same way as the WhatsApp flow (see
+    LLMService._close_instagram_deal), just via Order.instagram_account_id
+    instead of Order.account_id.
     """
     __tablename__ = "instagram_customers"
 
@@ -309,6 +311,7 @@ class InstagramConversationContext(Base):
     # Reuses WhatsApp's ConversationState enum (NEGOTIATING/HUMAN_HANDOFF/
     # MANAGEMENT) — same three states apply here.
     state = Column(Enum(ConversationState), default=ConversationState.NEGOTIATING)
+    handoff_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -374,6 +377,12 @@ class Order(Base):
     customer_id = Column(Integer, ForeignKey("customers.id"))
     product_id = Column(Integer, ForeignKey("products.id"), nullable=True)
     account_id = Column(Integer, ForeignKey("whatsapp_accounts.id"), nullable=True)
+    # An order originates from exactly one channel — this is set instead of
+    # account_id for a deal Amara closed over Instagram DM (see
+    # LLMService._close_instagram_deal), which needs a real Customer/Order
+    # too but has no WhatsAppAccount to hang off (a merchant can be
+    # Instagram-only). Never both set on the same order.
+    instagram_account_id = Column(Integer, ForeignKey("instagram_accounts.id"), nullable=True)
     quantity = Column(Integer, default=1)
     payment_type = Column(Enum(PaymentType), nullable=True)
     tunzaa_transaction_id = Column(String, nullable=True)
@@ -394,6 +403,7 @@ class Order(Base):
     installments = relationship("Installment", back_populates="order")
     product = relationship("Product")
     account = relationship("WhatsAppAccount")
+    instagram_account = relationship("InstagramAccount")
 
 
 class Installment(Base):

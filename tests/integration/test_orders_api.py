@@ -5,6 +5,7 @@ import respx
 from app.core.security import create_access_token
 from app.db.models import (
     Customer,
+    InstagramAccount,
     Message,
     Order,
     OrderStatus,
@@ -156,6 +157,60 @@ def test_list_orders_filters_by_account_id(client, merchant_headers, order, acco
     resp = client.get(f"{BASE}?account_id=999999", headers=merchant_headers)
     assert resp.status_code == 200
     assert resp.json() == []
+
+
+def test_list_orders_includes_instagram_originated_order_for_instagram_only_merchant(
+    client, db_session, product, customer
+):
+    """
+    A merchant with no WhatsAppAccount at all (Instagram-only) must still
+    see orders Amara closed over Instagram DM — this is exactly the gap
+    Order.instagram_account_id + the outer-joined merchant scoping in
+    get_orders_by_merchant fixes.
+    """
+    ig_merchant = User(username="255700000750")
+    db_session.add(ig_merchant)
+    db_session.commit()
+    db_session.refresh(ig_merchant)
+    ig_headers = {"Authorization": f"Bearer {create_access_token(ig_merchant.id)}"}
+
+    ig_account = InstagramAccount(
+        ig_business_id="ig_ord_1", access_token="ig-tok", user_id=ig_merchant.id,
+    )
+    db_session.add(ig_account)
+    db_session.commit()
+    db_session.refresh(ig_account)
+
+    ig_product = Product(
+        slug="ig-order-shoes", name="IG Shoes", max_price=50000, min_price=40000,
+        quantity=5, merchant_id=ig_merchant.id,
+    )
+    db_session.add(ig_product)
+    db_session.commit()
+    db_session.refresh(ig_product)
+
+    ig_order = Order(
+        customer_id=customer.id,
+        product_id=ig_product.id,
+        instagram_account_id=ig_account.id,
+        quantity=1,
+        agreed_price=45000,
+        payment_type=PaymentType.FULL,
+        status=OrderStatus.PENDING,
+    )
+    db_session.add(ig_order)
+    db_session.commit()
+    db_session.refresh(ig_order)
+
+    resp = client.get(BASE, headers=ig_headers)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body) == 1
+    assert body[0]["id"] == ig_order.id
+    assert body[0]["channel"] == "instagram"
+    assert body[0]["account_id"] is None
+    assert body[0]["instagram_account_id"] == ig_account.id
 
 
 def test_get_order_detail_includes_payment_progress(client, merchant_headers, db_session, order):

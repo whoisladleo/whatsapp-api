@@ -587,7 +587,12 @@ def test_parse_agreement_extracts_multi_word_product_and_strips_marker():
     )
 
     assert text == "Great, let's do it!"
-    assert agreement == {"product_name": "Running Shoes", "price": 45000.0, "payment_type": "full"}
+    assert agreement == {
+        "product_name": "Running Shoes",
+        "price": 45000.0,
+        "payment_type": "full",
+        "phone": None,
+    }
 
 
 def test_parse_agreement_case_insensitive():
@@ -597,6 +602,15 @@ def test_parse_agreement_case_insensitive():
 
     assert agreement["payment_type"] == "installment"
     assert agreement["product_name"] == "Shoes"
+
+
+def test_parse_agreement_extracts_optional_phone_for_instagram_dm_flow():
+    text, agreement = _parse_and_strip_agreement(
+        "Deal! [AGREEMENT_REACHED: product=Shoes price=45000 payment=full phone=255711130000]"
+    )
+
+    assert text == "Deal!"
+    assert agreement["phone"] == "255711130000"
 
 
 def test_parse_agreement_no_marker_present():

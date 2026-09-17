@@ -182,3 +182,123 @@ def test_create_direct_message_and_get_dm_history_orders_oldest_first(db_session
 
     assert [m.body for m in history] == ["first", "second", "third"]
     assert db_session.query(InstagramDirectMessage).count() == 3
+
+
+# --- get_customer_for_account -------------------------------------------------
+
+
+def test_get_customer_for_account_returns_matching_customer(db_session, account):
+    customer = crud_instagram.get_or_create_customer(db_session, account.id, "igsid_1")
+
+    found = crud_instagram.get_customer_for_account(db_session, account.id, customer.id)
+
+    assert found.id == customer.id
+
+
+def test_get_customer_for_account_raises_for_wrong_account(db_session, account, other_user):
+    other_account = crud_instagram.upsert_account(
+        db_session, other_user.id, "ig_other", "tok_other", "other_shop"
+    )
+    customer = crud_instagram.get_or_create_customer(db_session, other_account.id, "igsid_1")
+
+    with pytest.raises(crud_instagram.CustomerNotFoundError):
+        crud_instagram.get_customer_for_account(db_session, account.id, customer.id)
+
+
+def test_get_customer_for_account_raises_for_missing_customer(db_session, account):
+    with pytest.raises(crud_instagram.CustomerNotFoundError):
+        crud_instagram.get_customer_for_account(db_session, account.id, 999999)
+
+
+# --- get_conversations_for_account --------------------------------------------
+
+
+def test_get_conversations_for_account_excludes_customers_with_no_messages(db_session, account):
+    crud_instagram.get_or_create_customer(db_session, account.id, "igsid_silent")
+
+    assert crud_instagram.get_conversations_for_account(db_session, account.id) == []
+
+
+def test_get_conversations_for_account_returns_last_message_and_state(db_session, account):
+    customer = crud_instagram.get_or_create_customer(db_session, account.id, "igsid_1", "commenter1")
+    crud_instagram.get_or_create_conversation(db_session, customer.id)
+    crud_instagram.create_direct_message(db_session, account.id, customer.id, "inbound", "hi")
+    crud_instagram.create_direct_message(db_session, account.id, customer.id, "outbound", "hello!")
+
+    conversations = crud_instagram.get_conversations_for_account(db_session, account.id)
+
+    assert len(conversations) == 1
+    convo = conversations[0]
+    assert convo["customer_id"] == customer.id
+    assert convo["username"] == "commenter1"
+    assert convo["last_message_body"] == "hello!"
+    assert convo["last_message_direction"] == "outbound"
+    assert convo["state"] == "NEGOTIATING"
+
+
+def test_get_conversations_for_account_orders_most_recent_first(db_session, account):
+    older = crud_instagram.get_or_create_customer(db_session, account.id, "igsid_older")
+    newer = crud_instagram.get_or_create_customer(db_session, account.id, "igsid_newer")
+    crud_instagram.create_direct_message(db_session, account.id, older.id, "inbound", "first ever")
+    crud_instagram.create_direct_message(db_session, account.id, newer.id, "inbound", "just now")
+
+    conversations = crud_instagram.get_conversations_for_account(db_session, account.id)
+
+    assert [c["customer_id"] for c in conversations] == [newer.id, older.id]
+
+
+def test_get_conversations_for_account_scoped_to_account(db_session, account, other_user):
+    other_account = crud_instagram.upsert_account(
+        db_session, other_user.id, "ig_other2", "tok_other2", "other_shop2"
+    )
+    mine = crud_instagram.get_or_create_customer(db_session, account.id, "igsid_mine")
+    theirs = crud_instagram.get_or_create_customer(db_session, other_account.id, "igsid_theirs")
+    crud_instagram.create_direct_message(db_session, account.id, mine.id, "inbound", "hi")
+    crud_instagram.create_direct_message(db_session, other_account.id, theirs.id, "inbound", "hi")
+
+    conversations = crud_instagram.get_conversations_for_account(db_session, account.id)
+
+    assert [c["customer_id"] for c in conversations] == [mine.id]
+
+
+# --- get_pending_handoffs_for_account / resume_conversation -------------------
+
+
+def test_get_pending_handoffs_for_account_only_returns_handoff_state(db_session, account):
+    negotiating = crud_instagram.get_or_create_customer(db_session, account.id, "igsid_neg")
+    crud_instagram.get_or_create_conversation(db_session, negotiating.id)
+
+    handed_off = crud_instagram.get_or_create_customer(db_session, account.id, "igsid_ho", "needs_help")
+    context = crud_instagram.get_or_create_conversation(db_session, handed_off.id)
+    context.state = ConversationState.HUMAN_HANDOFF
+    db_session.commit()
+    crud_instagram.create_direct_message(db_session, account.id, handed_off.id, "inbound", "I need a human")
+
+    handoffs = crud_instagram.get_pending_handoffs_for_account(db_session, account.id)
+
+    assert len(handoffs) == 1
+    assert handoffs[0]["customer_id"] == handed_off.id
+    assert handoffs[0]["username"] == "needs_help"
+    assert handoffs[0]["last_message_body"] == "I need a human"
+
+
+def test_resume_conversation_flips_state_back_to_negotiating(db_session, account):
+    customer = crud_instagram.get_or_create_customer(db_session, account.id, "igsid_1")
+    context = crud_instagram.get_or_create_conversation(db_session, customer.id)
+    context.state = ConversationState.HUMAN_HANDOFF
+    context.handoff_at = None
+    db_session.commit()
+
+    crud_instagram.resume_conversation(db_session, customer.id)
+
+    db_session.refresh(context)
+    assert context.state == ConversationState.NEGOTIATING
+    assert context.handoff_at is None
+
+
+def test_resume_conversation_raises_if_not_in_handoff(db_session, account):
+    customer = crud_instagram.get_or_create_customer(db_session, account.id, "igsid_1")
+    crud_instagram.get_or_create_conversation(db_session, customer.id)
+
+    with pytest.raises(crud_instagram.ConversationNotInHandoffError):
+        crud_instagram.resume_conversation(db_session, customer.id)

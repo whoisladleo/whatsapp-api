@@ -3,12 +3,21 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy.orm import Session
 
 from app.db.models import (
+    ConversationState,
     InstagramAccount,
     InstagramComment,
     InstagramConversationContext,
     InstagramCustomer,
     InstagramDirectMessage,
 )
+
+
+class CustomerNotFoundError(Exception):
+    """No InstagramCustomer with this id exists for this account."""
+
+
+class ConversationNotInHandoffError(Exception):
+    """The conversation exists but isn't currently in HUMAN_HANDOFF state."""
 
 
 def get_account_by_ig_business_id(
@@ -185,3 +194,113 @@ def create_direct_message(
     db.commit()
     db.refresh(message)
     return message
+
+
+def get_customer_for_account(
+    db: Session, account_id: int, customer_id: int
+) -> InstagramCustomer:
+    """Ownership-checked lookup used by every dashboard endpoint below —
+    raises rather than returning None so callers can 404 without an extra
+    `if not customer` branch at each call site."""
+    customer = (
+        db.query(InstagramCustomer)
+        .filter(InstagramCustomer.id == customer_id, InstagramCustomer.account_id == account_id)
+        .first()
+    )
+    if not customer:
+        raise CustomerNotFoundError(f"No conversation found for customer {customer_id}.")
+    return customer
+
+
+def get_conversations_for_account(db: Session, account_id: int) -> List[Dict[str, Any]]:
+    """
+    Every Instagram customer this account has exchanged DMs with, most
+    recent activity first. Unlike WhatsApp's equivalent (crud/message.py),
+    InstagramCustomer has a direct account_id FK, so no inference from
+    message history is needed to scope this to the right account.
+    """
+    customers = (
+        db.query(InstagramCustomer).filter(InstagramCustomer.account_id == account_id).all()
+    )
+
+    results = []
+    for customer in customers:
+        last_message = (
+            db.query(InstagramDirectMessage)
+            .filter(InstagramDirectMessage.customer_id == customer.id)
+            .order_by(InstagramDirectMessage.id.desc())
+            .first()
+        )
+        if not last_message:
+            continue
+
+        context = (
+            db.query(InstagramConversationContext)
+            .filter(InstagramConversationContext.customer_id == customer.id)
+            .first()
+        )
+
+        results.append(
+            {
+                "customer_id": customer.id,
+                "username": customer.username,
+                "last_activity_at": last_message.created_at,
+                "last_message_body": last_message.body,
+                "last_message_direction": last_message.direction,
+                "state": context.state.value if context else None,
+            }
+        )
+
+    results.sort(key=lambda r: r["last_activity_at"], reverse=True)
+    return results
+
+
+def get_pending_handoffs_for_account(db: Session, account_id: int) -> List[Dict[str, Any]]:
+    rows = (
+        db.query(InstagramConversationContext, InstagramCustomer)
+        .join(InstagramCustomer, InstagramConversationContext.customer_id == InstagramCustomer.id)
+        .filter(
+            InstagramConversationContext.state == ConversationState.HUMAN_HANDOFF,
+            InstagramCustomer.account_id == account_id,
+        )
+        .all()
+    )
+
+    results = []
+    for context, customer in rows:
+        last_message = (
+            db.query(InstagramDirectMessage)
+            .filter(InstagramDirectMessage.customer_id == customer.id)
+            .order_by(InstagramDirectMessage.id.desc())
+            .first()
+        )
+        results.append(
+            {
+                "customer_id": customer.id,
+                "username": customer.username,
+                "handoff_at": context.handoff_at,
+                "last_message_body": last_message.body if last_message else None,
+            }
+        )
+    return results
+
+
+def resume_conversation(db: Session, customer_id: int) -> None:
+    """Flips a HUMAN_HANDOFF conversation back to NEGOTIATING — WhatsApp
+    counterpart is crud/message.py's resume_conversation_for_account. No
+    account-ownership check here since the caller (POST
+    /instagram/handoffs/{customer_id}/resume) already resolved customer_id
+    via get_customer_for_account first."""
+    context = (
+        db.query(InstagramConversationContext)
+        .filter(InstagramConversationContext.customer_id == customer_id)
+        .first()
+    )
+    if not context or context.state != ConversationState.HUMAN_HANDOFF:
+        raise ConversationNotInHandoffError(
+            f"Customer {customer_id} is not currently in a human handoff state."
+        )
+
+    context.state = ConversationState.NEGOTIATING
+    context.handoff_at = None
+    db.commit()
