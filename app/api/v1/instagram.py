@@ -1,4 +1,3 @@
-import logging
 from datetime import timedelta
 from typing import Optional
 
@@ -20,8 +19,6 @@ from app.services import instagram_oauth
 from app.tasks.instagram_comment_processing import process_inbound_comment
 
 router = APIRouter()
-
-logger = logging.getLogger(__name__)
 
 # How long a merchant has to complete the Meta consent screen before the
 # `state` token (which carries their identity through the redirect, since
@@ -64,16 +61,16 @@ async def handle_webhook(
         )
 
     data = await request.json()
-    logger.info(f"Instagram webhook payload: {data}")
+    print(f"Instagram webhook payload: {data}")
     parsed_comments = InstagramWebhookParser.parse_inbound(data)
-    logger.info(f"Parsed {len(parsed_comments)} comment(s) from payload")
+    print(f"Parsed {len(parsed_comments)} comment(s) from payload")
 
     for item in parsed_comments:
         account = crud_instagram.get_account_by_ig_business_id(
             db, item["ig_business_id"]
         )
         if not account:
-            logger.warning(
+            print(
                 f"No InstagramAccount found for ig_business_id={item['ig_business_id']!r} "
                 f"(comment_id={item.get('comment_id')!r})"
             )
@@ -134,26 +131,26 @@ async def oauth_callback(
 
     try:
         short_lived_token = await instagram_oauth.exchange_code_for_short_lived_token(code)
-        logger.info(f"Short-lived token obtained, tail={short_lived_token[-12:]!r}")
+        print(f"Short-lived token obtained, tail={short_lived_token[-12:]!r}")
         long_lived_token = await instagram_oauth.exchange_for_long_lived_token(short_lived_token)
-        logger.info(f"Long-lived token obtained, tail={long_lived_token[-12:]!r}")
+        print(f"Long-lived token obtained, tail={long_lived_token[-12:]!r}")
         ig_user_id, username = await instagram_oauth.fetch_account_identity(long_lived_token)
-        logger.info(f"fetch_account_identity succeeded: ig_user_id={ig_user_id} username={username!r}")
+        print(f"fetch_account_identity succeeded: ig_user_id={ig_user_id} username={username!r}")
     except instagram_oauth.InstagramOAuthError as e:
-        logger.error(f"Instagram OAuth exchange failed: {e}")
+        print(f"Instagram OAuth exchange failed: {e}")
         return RedirectResponse(f"{settings_url}?instagram=error")
 
     crud_instagram.upsert_account(db, user_id, ig_user_id, long_lived_token, username)
-    logger.info(f"Stored InstagramAccount for ig_user_id={ig_user_id}, tail={long_lived_token[-12:]!r}")
+    print(f"Stored InstagramAccount for ig_user_id={ig_user_id}, tail={long_lived_token[-12:]!r}")
 
     # Immediate re-check, milliseconds later, using the exact same token —
     # to see whether it's already dead by the time this request finishes,
     # versus dying sometime after.
     try:
         recheck_id, recheck_username = await instagram_oauth.fetch_account_identity(long_lived_token)
-        logger.info(f"Immediate re-check OK: {recheck_id} {recheck_username!r}")
+        print(f"Immediate re-check OK: {recheck_id} {recheck_username!r}")
     except instagram_oauth.InstagramOAuthError as e:
-        logger.error(f"Immediate re-check FAILED (token already dead within the same request): {e}")
+        print(f"Immediate re-check FAILED (token already dead within the same request): {e}")
 
     try:
         await instagram_oauth.subscribe_to_webhooks(long_lived_token)
@@ -161,6 +158,6 @@ async def oauth_callback(
         # Don't fail the connection over this — the account is connected
         # either way, it just won't receive comment webhooks until this
         # succeeds (e.g. on a later reconnect).
-        logger.error(f"Failed to subscribe {ig_user_id} to Instagram webhooks: {e}")
+        print(f"Failed to subscribe {ig_user_id} to Instagram webhooks: {e}")
 
     return RedirectResponse(f"{settings_url}?instagram=connected")
