@@ -13,8 +13,8 @@ ME_URL_RE = r"https://graph\.facebook\.com/v25\.0/me"
 
 @pytest.fixture(autouse=True)
 def _fb_config(monkeypatch):
-    monkeypatch.setattr(settings, "INSTAGRAM_APP_ID", "APPID123")
-    monkeypatch.setattr(settings, "INSTAGRAM_APP_SECRET", "APPSECRET123")
+    monkeypatch.setattr(settings, "FACEBOOK_APP_ID", "APPID123")
+    monkeypatch.setattr(settings, "FACEBOOK_APP_SECRET", "APPSECRET123")
     monkeypatch.setattr(settings, "FACEBOOK_LOGIN_REDIRECT_URI", "https://api.example.com/fb-cb")
     monkeypatch.setattr(settings, "DASHBOARD_URL", "https://dash.example.com")
 

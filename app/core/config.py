@@ -53,11 +53,15 @@ class Settings(BaseSettings):
 
     # Facebook Login — an independent alternative to WhatsApp OTP login
     # (not account-linking), added because OTP delivery has been unreliable.
-    # Runs under the same Meta App as Instagram ("Taskflow - IG"), so it
-    # deliberately reuses INSTAGRAM_APP_ID/INSTAGRAM_APP_SECRET above rather
-    # than having its own — only the redirect URI and OAuth host differ
-    # (Facebook Login uses www.facebook.com / graph.facebook.com, not
-    # Instagram's graph.instagram.com).
+    # Lives under the same Meta App as Instagram ("Taskflow - IG"), but
+    # NEEDS ITS OWN client_id/secret rather than reusing INSTAGRAM_APP_ID/
+    # SECRET above: Instagram API with Instagram Login gets its own
+    # "Instagram App ID", a distinct identifier from the app's actual Meta
+    # App ID (shown at the top of the App Dashboard / Settings > Basic),
+    # which is what classic Facebook Login's client_id has to be — confirmed
+    # the hard way via a live "Invalid App ID" error using the Instagram one.
+    FACEBOOK_APP_ID: Optional[str] = None
+    FACEBOOK_APP_SECRET: Optional[str] = None
     FACEBOOK_LOGIN_REDIRECT_URI: Optional[str] = None
     FACEBOOK_OAUTH_AUTHORIZE_URL: str = "https://www.facebook.com/v25.0/dialog/oauth"
     FACEBOOK_OAUTH_TOKEN_URL: str = "https://graph.facebook.com/v25.0/oauth/access_token"

@@ -12,7 +12,7 @@ class FacebookOAuthError(Exception):
 
 def build_authorize_url(state: str) -> str:
     params = {
-        "client_id": settings.INSTAGRAM_APP_ID,
+        "client_id": settings.FACEBOOK_APP_ID,
         "redirect_uri": settings.FACEBOOK_LOGIN_REDIRECT_URI,
         "response_type": "code",
         "scope": "email,public_profile",
@@ -26,8 +26,8 @@ async def exchange_code_for_token(code: str) -> str:
         response = await client.get(
             settings.FACEBOOK_OAUTH_TOKEN_URL,
             params={
-                "client_id": settings.INSTAGRAM_APP_ID,
-                "client_secret": settings.INSTAGRAM_APP_SECRET,
+                "client_id": settings.FACEBOOK_APP_ID,
+                "client_secret": settings.FACEBOOK_APP_SECRET,
                 "redirect_uri": settings.FACEBOOK_LOGIN_REDIRECT_URI,
                 "code": code,
             },
