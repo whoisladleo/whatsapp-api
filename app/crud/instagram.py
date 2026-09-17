@@ -32,12 +32,35 @@ def upsert_account(
     db: Session, user_id: int, ig_business_id: str, access_token: str, username: Optional[str]
 ) -> InstagramAccount:
     """
-    Re-running the OAuth flow for an already-connected account (token
-    refresh, re-granting permissions) updates that row in place rather than
-    violating the unique constraint on ig_business_id.
+    One Instagram connection per Taskflow user, enforced here rather than at
+    the DB level — reconnecting always replaces whichever account this user
+    had connected before, even if it's a *different* physical Instagram
+    account than last time (Instagram's OAuth screen authorizes whatever
+    account is currently active in the browser, which a user can easily
+    switch between reconnects). Any other rows already on file for this
+    user are dropped as leftover duplicates.
     """
-    account = get_account_by_ig_business_id(db, ig_business_id)
+    existing_for_user = (
+        db.query(InstagramAccount).filter(InstagramAccount.user_id == user_id).all()
+    )
+
+    account = next(
+        (a for a in existing_for_user if a.ig_business_id == ig_business_id), None
+    )
+    if not account and existing_for_user:
+        account = existing_for_user[0]
+    for other in existing_for_user:
+        if account is None or other.id != account.id:
+            db.delete(other)
+
+    if not account:
+        # This exact Instagram account may already be connected under a
+        # different Taskflow user — the most recent OAuth consent is proof
+        # of current control, so it takes over the row rather than erroring.
+        account = get_account_by_ig_business_id(db, ig_business_id)
+
     if account:
+        account.ig_business_id = ig_business_id
         account.access_token = access_token
         account.username = username
         account.user_id = user_id
@@ -49,6 +72,7 @@ def upsert_account(
             user_id=user_id,
         )
         db.add(account)
+
     db.commit()
     db.refresh(account)
     return account
