@@ -29,6 +29,41 @@ def other_user(db_session):
     return u
 
 
+def test_get_accounts_by_user_excludes_disconnected_accounts(db_session, user):
+    account = crud_instagram.upsert_account(db_session, user.id, "ig_1", "tok_1", "shop_one")
+
+    assert crud_instagram.get_accounts_by_user(db_session, user.id) == [account]
+
+    crud_instagram.disconnect_account(db_session, account)
+
+    assert crud_instagram.get_accounts_by_user(db_session, user.id) == []
+
+
+def test_disconnect_account_clears_token_and_pauses_ai_without_deleting_the_row(db_session, user):
+    account = crud_instagram.upsert_account(db_session, user.id, "ig_1", "tok_1", "shop_one")
+    account_id = account.id
+
+    crud_instagram.disconnect_account(db_session, account)
+
+    reloaded = db_session.query(InstagramAccount).filter(InstagramAccount.id == account_id).first()
+    assert reloaded is not None
+    assert reloaded.access_token == ""
+    assert reloaded.ai_enabled is False
+    assert reloaded.ig_business_id == "ig_1"
+
+
+def test_reconnecting_after_disconnect_revives_the_same_row(db_session, user):
+    account = crud_instagram.upsert_account(db_session, user.id, "ig_1", "tok_1", "shop_one")
+    account_id = account.id
+    crud_instagram.disconnect_account(db_session, account)
+
+    reconnected = crud_instagram.upsert_account(db_session, user.id, "ig_1", "tok_new", "shop_one")
+
+    assert reconnected.id == account_id
+    assert reconnected.access_token == "tok_new"
+    assert db_session.query(InstagramAccount).filter(InstagramAccount.user_id == user.id).count() == 1
+
+
 def test_upsert_creates_new_account(db_session, user):
     account = crud_instagram.upsert_account(
         db_session, user.id, "ig_1", "tok_1", "shop_one"

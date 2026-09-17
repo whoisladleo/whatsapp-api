@@ -31,7 +31,28 @@ def get_account_by_ig_business_id(
 
 
 def get_accounts_by_user(db: Session, user_id: int) -> List[InstagramAccount]:
-    return db.query(InstagramAccount).filter(InstagramAccount.user_id == user_id).all()
+    # access_token == "" marks a disconnected account (see disconnect_account)
+    # — the row and its comment/DM/order history stick around, but it's no
+    # longer "connected" from the merchant's point of view.
+    return (
+        db.query(InstagramAccount)
+        .filter(InstagramAccount.user_id == user_id, InstagramAccount.access_token != "")
+        .all()
+    )
+
+
+def disconnect_account(db: Session, account: InstagramAccount) -> None:
+    """
+    Clears local Meta access and pauses Amara without deleting the account
+    row — InstagramCustomer/InstagramComment/InstagramDirectMessage/
+    Order.instagram_account_id all reference it via required (non-nullable,
+    no ON DELETE CASCADE) foreign keys, so a hard delete would fail for any
+    account with real history. Reconnecting later (upsert_account) finds and
+    revives this same row rather than creating a duplicate.
+    """
+    account.access_token = ""
+    account.ai_enabled = False
+    db.commit()
 
 
 def comment_already_processed(db: Session, comment_id: str) -> bool:

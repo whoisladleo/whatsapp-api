@@ -39,7 +39,9 @@ async def get_instagram_account(
     (see upsert_account), so it's looked up directly off the JWT.
     """
     account = (
-        db.query(InstagramAccount).filter(InstagramAccount.user_id == current_user.id).first()
+        db.query(InstagramAccount)
+        .filter(InstagramAccount.user_id == current_user.id, InstagramAccount.access_token != "")
+        .first()
     )
     if not account:
         raise HTTPException(status_code=404, detail="No Instagram account connected")
@@ -149,6 +151,35 @@ async def list_accounts(
     db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
 ):
     return crud_instagram.get_accounts_by_user(db, current_user.id)
+
+
+@router.delete("/accounts/{account_id}")
+async def disconnect_account(
+    account_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Revokes Meta's webhook subscription and clears the local access token —
+    doesn't delete the InstagramAccount row itself (see
+    crud.instagram.disconnect_account for why: comments/DMs/orders already
+    reference it). Reconnecting later revives the same row.
+    """
+    account = (
+        db.query(InstagramAccount)
+        .filter(InstagramAccount.id == account_id, InstagramAccount.user_id == current_user.id)
+        .first()
+    )
+    if not account:
+        raise HTTPException(status_code=404, detail="Instagram account not found")
+
+    try:
+        await instagram_oauth.unsubscribe_from_webhooks(account.access_token)
+    except instagram_oauth.InstagramOAuthError as e:
+        print(f"Failed to unsubscribe {account.id} from Instagram webhooks: {e}")
+
+    crud_instagram.disconnect_account(db, account)
+    return {"status": "disconnected"}
 
 
 @router.get("/oauth/start")

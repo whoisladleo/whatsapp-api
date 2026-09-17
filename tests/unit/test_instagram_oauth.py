@@ -115,3 +115,24 @@ async def test_subscribe_to_webhooks_failure():
 
     with pytest.raises(InstagramOAuthError):
         await instagram_oauth.subscribe_to_webhooks("bad-tok")
+
+
+@respx.mock
+async def test_unsubscribe_from_webhooks_success():
+    route = respx.delete(url__regex=SUBSCRIBE_URL_RE).mock(
+        return_value=httpx.Response(200, json={"success": True})
+    )
+
+    await instagram_oauth.unsubscribe_from_webhooks("long-tok")
+
+    assert route.calls.last.request.url.params["access_token"] == "long-tok"
+
+
+@respx.mock
+async def test_unsubscribe_from_webhooks_failure():
+    respx.delete(url__regex=SUBSCRIBE_URL_RE).mock(
+        return_value=httpx.Response(400, json={"error": {"message": "nope"}})
+    )
+
+    with pytest.raises(InstagramOAuthError):
+        await instagram_oauth.unsubscribe_from_webhooks("bad-tok")

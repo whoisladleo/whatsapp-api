@@ -99,3 +99,22 @@ async def subscribe_to_webhooks(access_token: str) -> None:
     data = response.json()
     if not data.get("success"):
         raise InstagramOAuthError(f"Webhook subscription failed: {data}")
+
+
+async def unsubscribe_from_webhooks(access_token: str) -> None:
+    """
+    Counterpart to subscribe_to_webhooks, called when a merchant disconnects
+    — tells Meta to stop sending events for this account before the local
+    access token is cleared. Best-effort, same as subscribing: logged by the
+    caller rather than raised, since a merchant disconnecting shouldn't be
+    blocked by a Meta-side hiccup (the local token gets cleared regardless,
+    so Amara stops acting on this account's behalf either way).
+    """
+    async with httpx.AsyncClient() as client:
+        response = await client.delete(
+            f"{settings.INSTAGRAM_GRAPH_BASE_URL}/me/subscribed_apps",
+            params={"access_token": access_token},
+        )
+    data = response.json()
+    if not data.get("success"):
+        raise InstagramOAuthError(f"Webhook unsubscribe failed: {data}")
