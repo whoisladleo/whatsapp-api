@@ -53,3 +53,14 @@ def clear_user_otp(db: Session, user: User) -> User:
     db.commit()
     db.refresh(user)
     return user
+
+
+def get_user_by_phone_number(db: Session, phone_number: str) -> Optional[User]:
+    return db.query(User).filter(User.phone_number == phone_number).first()
+
+
+def set_user_phone_number(db: Session, user: User, phone_number: Optional[str]) -> User:
+    user.phone_number = phone_number
+    db.commit()
+    db.refresh(user)
+    return user

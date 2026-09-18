@@ -51,6 +51,15 @@ class Settings(BaseSettings):
     # finishes (success or failure) — the dashboard's settings page.
     DASHBOARD_URL: str = "https://business.taskflowos.dev"
 
+    # The Product.slug of Taskflow's own "Taskflow OS Subscription" product
+    # — app/services/subscription_access.py checks a merchant's payment
+    # status against this specific product to decide whether their Amara
+    # stays enabled. Deliberately explicit config rather than inferred by
+    # name-matching (e.g. account.name == "taskflow"): getting this wrong
+    # would either lock out every merchant or gate nobody at all. Gating is
+    # a no-op (nobody affected) while this is unset.
+    PLATFORM_SUBSCRIPTION_PRODUCT_SLUG: Optional[str] = None
+
     # Facebook Login — an independent alternative to WhatsApp OTP login
     # (not account-linking), added because OTP delivery has been unreliable.
     # Lives under the same Meta App as Instagram ("Taskflow - IG"), but

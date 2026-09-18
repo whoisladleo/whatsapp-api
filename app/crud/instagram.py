@@ -116,6 +116,15 @@ def upsert_account(
 
     db.commit()
     db.refresh(account)
+
+    # Overrides the ai_enabled=True just set above if this merchant doesn't
+    # have a valid Taskflow subscription — connecting/reconnecting Instagram
+    # isn't itself enough to turn Amara on for a gated merchant. No-op while
+    # gating isn't configured.
+    from app.services.subscription_access import sync_ai_access_for_merchant
+
+    sync_ai_access_for_merchant(db, account.owner)
+
     return account
 
 

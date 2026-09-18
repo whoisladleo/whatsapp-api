@@ -168,6 +168,10 @@ def create_whatsapp_account(
         pool_number.whatsapp_account_id = db_account.id
         db.commit()
 
+    from app.services.subscription_access import sync_ai_access_for_merchant
+
+    sync_ai_access_for_merchant(db, db_account.owner)
+
     return db_account
 
 
@@ -192,6 +196,15 @@ def update_whatsapp_account(
         setattr(db_account, field, value)
     db.commit()
     db.refresh(db_account)
+
+    # Overrides whatever ai_enabled the request just set — a merchant
+    # without a valid Taskflow subscription can't turn Amara back on for
+    # themselves this way. No-op while gating isn't configured (or the
+    # merchant isn't gated at all, e.g. this dashboard's own dev/test use).
+    from app.services.subscription_access import sync_ai_access_for_merchant
+
+    sync_ai_access_for_merchant(db, db_account.owner)
+
     return db_account
 
 

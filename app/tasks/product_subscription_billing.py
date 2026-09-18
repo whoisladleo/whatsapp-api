@@ -51,3 +51,36 @@ async def _do_charge_renewal(subscription_id: int) -> None:
             logger.error(f"Failed to push renewal charge for subscription {subscription_id}: {e}")
     finally:
         db.close()
+
+
+@celery_app.task
+def check_past_due_grace_expired(subscription_id: int):
+    """
+    Scheduled once, exactly PAST_DUE_ACCESS_GRACE_DAYS out, the first time a
+    subscription goes PAST_DUE (see
+    product_subscription.handle_renewal_payment_result) — nothing else
+    re-evaluates access at that precise moment otherwise, since renewal
+    retries run on their own independent 36h cadence. A no-op if the
+    subscription already recovered (ACTIVE) or was cancelled by then.
+    """
+    _run_async(_do_check_past_due_grace_expired(subscription_id))
+
+
+async def _do_check_past_due_grace_expired(subscription_id: int) -> None:
+    from app.db.models import ProductSubscription, ProductSubscriptionStatus
+    from app.services import product_subscription
+
+    db = SessionLocal()
+    try:
+        subscription = (
+            db.query(ProductSubscription).filter(ProductSubscription.id == subscription_id).first()
+        )
+        if not subscription:
+            logger.error(f"check_past_due_grace_expired: subscription {subscription_id} not found")
+            return
+        if subscription.status != ProductSubscriptionStatus.PAST_DUE:
+            return
+
+        product_subscription.sync_access_if_platform_subscription(db, subscription)
+    finally:
+        db.close()

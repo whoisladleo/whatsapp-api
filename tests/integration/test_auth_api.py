@@ -230,3 +230,65 @@ def test_request_otp_skips_template_when_not_configured(client, db_session, monk
     assert route.call_count == 1
     payload = json.loads(route.calls[0].request.content)
     assert payload["type"] == "text"
+
+
+# --- /me -----------------------------------------------------------------------
+
+
+def test_get_me_requires_auth(client):
+    resp = client.get("/api/v1/auth/me")
+
+    assert resp.status_code in (401, 403)
+
+
+def test_get_me_returns_profile(client, auth_user):
+    user, headers = auth_user
+
+    resp = client.get("/api/v1/auth/me", headers=headers)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["id"] == user.id
+    assert body["username"] == user.username
+    assert body["phone_number"] is None
+
+
+def test_patch_me_sets_phone_number(client, auth_user, db_session):
+    user, headers = auth_user
+
+    resp = client.patch("/api/v1/auth/me", json={"phone_number": "0712345999"}, headers=headers)
+
+    assert resp.status_code == 200
+    assert resp.json()["phone_number"] == "255712345999"
+    db_session.refresh(user)
+    assert user.phone_number == "255712345999"
+
+
+def test_patch_me_rejects_phone_number_already_in_use(client, auth_user, db_session):
+    _, headers = auth_user
+    other = User(username="255700000050", phone_number="255711119999")
+    db_session.add(other)
+    db_session.commit()
+
+    resp = client.patch("/api/v1/auth/me", json={"phone_number": "255711119999"}, headers=headers)
+
+    assert resp.status_code == 400
+
+
+def test_patch_me_allows_setting_same_phone_number_already_on_own_account(client, auth_user, db_session):
+    user, headers = auth_user
+    user.phone_number = "255711119999"
+    db_session.commit()
+
+    resp = client.patch("/api/v1/auth/me", json={"phone_number": "255711119999"}, headers=headers)
+
+    assert resp.status_code == 200
+
+
+def test_patch_me_without_phone_number_leaves_profile_unchanged(client, auth_user):
+    user, headers = auth_user
+
+    resp = client.patch("/api/v1/auth/me", json={}, headers=headers)
+
+    assert resp.status_code == 200
+    assert resp.json()["phone_number"] is None

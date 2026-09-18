@@ -158,3 +158,83 @@ def test_charge_renewal_logs_and_swallows_payment_push_failure(db_session, order
     monkeypatch.setattr("app.services.tunzaa.TunzaaService.initiate_payment", fake_initiate_fails)
 
     product_subscription_tasks.charge_renewal(sub.id)  # no exception
+
+
+# --- check_past_due_grace_expired ----------------------------------------------
+
+
+@pytest.fixture
+def self_paying_merchant_order(db_session, owner, account, product):
+    """The gated merchant IS the customer here — a Customer row whose phone
+    matches `owner.username`, simulating a merchant who bought their own
+    platform subscription with their login phone number."""
+    customer = Customer(phone_number=owner.username)
+    db_session.add(customer)
+    db_session.commit()
+    db_session.refresh(customer)
+
+    o = Order(
+        customer_id=customer.id, product_id=product.id, account_id=account.id,
+        quantity=1, agreed_price=100000, payment_type=PaymentType.FULL, status=OrderStatus.PAID,
+    )
+    db_session.add(o)
+    db_session.commit()
+    db_session.refresh(o)
+    return o, customer
+
+
+def test_grace_expired_disables_ai_when_still_past_due(
+    db_session, self_paying_merchant_order, account, monkeypatch
+):
+    from datetime import datetime, timedelta
+
+    from app.core.config import settings
+
+    order, customer = self_paying_merchant_order
+    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", "sub-product")
+    account.ai_enabled = True
+    db_session.commit()
+
+    sub = ProductSubscription(
+        order_id=order.id, customer_id=customer.id, product_id=order.product_id,
+        status=ProductSubscriptionStatus.PAST_DUE, monthly_amount=100000, retry_count=3,
+        past_due_since=datetime.utcnow() - timedelta(days=7),
+    )
+    db_session.add(sub)
+    db_session.commit()
+    db_session.refresh(sub)
+
+    account_id = account.id
+    product_subscription_tasks.check_past_due_grace_expired(sub.id)
+
+    reloaded = db_session.query(WhatsAppAccount).filter(WhatsAppAccount.id == account_id).first()
+    assert reloaded.ai_enabled is False
+
+
+def test_grace_expired_no_op_if_already_recovered(
+    db_session, self_paying_merchant_order, account, monkeypatch
+):
+    from app.core.config import settings
+
+    order, customer = self_paying_merchant_order
+    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", "sub-product")
+    account.ai_enabled = True
+    db_session.commit()
+
+    sub = ProductSubscription(
+        order_id=order.id, customer_id=customer.id, product_id=order.product_id,
+        status=ProductSubscriptionStatus.ACTIVE, monthly_amount=100000,
+    )
+    db_session.add(sub)
+    db_session.commit()
+    db_session.refresh(sub)
+
+    account_id = account.id
+    product_subscription_tasks.check_past_due_grace_expired(sub.id)
+
+    reloaded = db_session.query(WhatsAppAccount).filter(WhatsAppAccount.id == account_id).first()
+    assert reloaded.ai_enabled is True
+
+
+def test_grace_expired_missing_subscription_does_not_crash(db_session):
+    product_subscription_tasks.check_past_due_grace_expired(999999)  # no exception

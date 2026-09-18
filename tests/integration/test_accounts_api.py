@@ -506,3 +506,107 @@ def test_get_number_subscription_404_when_none(client, auth_user):
     resp = client.get(f"{BASE}/{created['id']}/number-subscription", headers=headers)
 
     assert resp.status_code == 404
+
+
+# --- subscription access gating -----------------------------------------------
+
+
+def _seed_platform_product(db_session):
+    """The gating check fails open when no Product matches
+    PLATFORM_SUBSCRIPTION_PRODUCT_SLUG — these tests are about a merchant
+    with no *subscription*, not a missing product, so the product itself
+    must actually exist."""
+    from app.db.models import Product
+
+    platform_owner = User(username="255700000998")
+    db_session.add(platform_owner)
+    db_session.commit()
+    db_session.refresh(platform_owner)
+
+    product = Product(
+        slug="taskflow-os-subscription", name="Taskflow OS Subscription", max_price=100000, min_price=100000,
+        quantity=999999, merchant_id=platform_owner.id, is_subscription=True,
+    )
+    db_session.add(product)
+    db_session.commit()
+
+
+@respx.mock
+def test_create_account_denies_ai_enabled_for_unsubscribed_merchant(client, auth_user, db_session, monkeypatch):
+    _seed_platform_product(db_session)
+    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", "taskflow-os-subscription")
+    _, headers = auth_user
+    respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
+
+    resp = client.post(BASE, json=_account_payload(ai_enabled=True), headers=headers)
+
+    assert resp.status_code == 201
+    assert resp.json()["ai_enabled"] is False
+
+
+@respx.mock
+def test_update_account_denies_ai_enabled_for_unsubscribed_merchant(client, auth_user, db_session, monkeypatch):
+    _, headers = auth_user
+    respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
+    created = client.post(BASE, json=_account_payload(), headers=headers).json()
+
+    _seed_platform_product(db_session)
+    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", "taskflow-os-subscription")
+
+    resp = client.put(
+        f"{BASE}/{created['id']}", json={"ai_enabled": True}, headers=headers
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["ai_enabled"] is False
+
+
+@respx.mock
+def test_create_account_allows_ai_enabled_for_actively_subscribed_merchant(
+    client, auth_user, db_session, monkeypatch
+):
+    from app.db.models import Customer, Order, OrderStatus, PaymentType, Product, ProductSubscription, ProductSubscriptionStatus
+
+    user, headers = auth_user
+    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", "taskflow-os-subscription")
+
+    platform_owner = User(username="255700000999")
+    db_session.add(platform_owner)
+    db_session.commit()
+    db_session.refresh(platform_owner)
+
+    product = Product(
+        slug="taskflow-os-subscription", name="Taskflow OS Subscription", max_price=100000, min_price=100000,
+        quantity=999999, merchant_id=platform_owner.id, is_subscription=True,
+    )
+    db_session.add(product)
+    db_session.commit()
+    db_session.refresh(product)
+
+    customer = Customer(phone_number=user.username)
+    db_session.add(customer)
+    db_session.commit()
+    db_session.refresh(customer)
+
+    order = Order(
+        customer_id=customer.id, product_id=product.id, quantity=1, agreed_price=100000,
+        payment_type=PaymentType.FULL, status=OrderStatus.PAID,
+    )
+    db_session.add(order)
+    db_session.commit()
+    db_session.refresh(order)
+
+    db_session.add(
+        ProductSubscription(
+            order_id=order.id, customer_id=customer.id, product_id=product.id,
+            status=ProductSubscriptionStatus.ACTIVE, monthly_amount=100000,
+        )
+    )
+    db_session.commit()
+
+    respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
+
+    resp = client.post(BASE, json=_account_payload(ai_enabled=True), headers=headers)
+
+    assert resp.status_code == 201
+    assert resp.json()["ai_enabled"] is True

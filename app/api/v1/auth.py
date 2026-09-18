@@ -7,12 +7,21 @@ from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 from datetime import timedelta, datetime
 
+from app.api.deps import get_current_user
+from app.db.models import User
 from app.db.session import get_db
 from app.core import security
 from app.core.config import settings
 from app.core.rate_limit import check_and_increment
 from app.core.security import normalize_phone
-from app.schemas.auth import Token, OTPRequest, OTPVerify, FacebookExchangeRequest
+from app.schemas.auth import (
+    Token,
+    OTPRequest,
+    OTPVerify,
+    FacebookExchangeRequest,
+    UserProfile,
+    UserProfileUpdate,
+)
 from app.crud import user as crud_user
 from app.core.provider import WhatsAppProvider
 from app.services import facebook_oauth
@@ -197,3 +206,30 @@ def exchange_facebook_login_code(payload: FacebookExchangeRequest, db: Session =
         ),
         "token_type": "bearer",
     }
+
+
+@router.get("/me", response_model=UserProfile)
+def get_my_profile(current_user: User = Depends(get_current_user)):
+    return current_user
+
+
+@router.patch("/me", response_model=UserProfile)
+def update_my_profile(
+    payload: UserProfileUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Currently only phone_number is settable — self-reported billing contact
+    for a Facebook-login merchant (who has no phone tied to their account
+    any other way), matched against the Customer who paid for the platform
+    subscription. See app/services/subscription_access.py.
+    """
+    if payload.phone_number is not None:
+        normalized = normalize_phone(payload.phone_number)
+        existing = crud_user.get_user_by_phone_number(db, normalized)
+        if existing and existing.id != current_user.id:
+            raise HTTPException(status_code=400, detail="This phone number is already in use.")
+        crud_user.set_user_phone_number(db, current_user, normalized)
+
+    return current_user

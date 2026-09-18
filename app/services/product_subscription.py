@@ -4,7 +4,7 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
-from app.db.models import ProductSubscription, ProductSubscriptionStatus
+from app.db.models import Product, ProductSubscription, ProductSubscriptionStatus, User
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +13,46 @@ RENEWAL_PERIOD_DAYS = 30
 # "10 retries over 2 weeks" policy (14 days / 10 is an ugly 33.6h).
 RENEWAL_RETRY_DELAY_SECONDS = 36 * 60 * 60
 MAX_RENEWAL_RETRIES = 10
+
+
+def _resolve_merchant_for_platform_subscription(db: Session, subscription: ProductSubscription) -> Optional[User]:
+    """
+    A ProductSubscription can belong to *any* merchant's subscription
+    product — most only need the billing mechanics above. Access gating
+    (app/services/subscription_access.py) only applies to the one specific
+    product identified by settings.PLATFORM_SUBSCRIPTION_PRODUCT_SLUG (a
+    merchant paying *Taskflow* for the platform itself), so this resolves
+    "which Taskflow dashboard User does this subscription's paying customer
+    correspond to" — and returns None for every other merchant's
+    subscription products, which must never affect anyone's ai_enabled.
+    """
+    from app.core.config import settings
+
+    if not settings.PLATFORM_SUBSCRIPTION_PRODUCT_SLUG:
+        return None
+
+    product = subscription.product or db.query(Product).filter(Product.id == subscription.product_id).first()
+    if not product or product.slug != settings.PLATFORM_SUBSCRIPTION_PRODUCT_SLUG:
+        return None
+
+    customer = subscription.customer
+    phone = customer.phone_number if customer else None
+    if not phone:
+        return None
+
+    return (
+        db.query(User)
+        .filter((User.username == phone) | (User.phone_number == phone))
+        .first()
+    )
+
+
+def sync_access_if_platform_subscription(db: Session, subscription: ProductSubscription) -> None:
+    from app.services import subscription_access
+
+    merchant = _resolve_merchant_for_platform_subscription(db, subscription)
+    if merchant:
+        subscription_access.sync_ai_access_for_merchant(db, merchant)
 
 
 def activate_after_first_payment(db: Session, subscription: ProductSubscription) -> None:
@@ -26,6 +66,7 @@ def activate_after_first_payment(db: Session, subscription: ProductSubscription)
 
     subscription.status = ProductSubscriptionStatus.ACTIVE
     subscription.retry_count = 0
+    subscription.past_due_since = None
     subscription.next_billing_at = datetime.utcnow() + timedelta(days=RENEWAL_PERIOD_DAYS)
     db.commit()
 
@@ -36,6 +77,8 @@ def activate_after_first_payment(db: Session, subscription: ProductSubscription)
     except Exception as e:
         logger.error(f"Failed to schedule first renewal for subscription {subscription.id}: {e}")
 
+    sync_access_if_platform_subscription(db, subscription)
+
 
 def mark_first_payment_failed(db: Session, subscription: ProductSubscription) -> None:
     """Called from the same webhook's FAILED/CANCELLED branch. No retry —
@@ -44,12 +87,14 @@ def mark_first_payment_failed(db: Session, subscription: ProductSubscription) ->
     subscription.status = ProductSubscriptionStatus.PAYMENT_FAILED
     db.commit()
 
+    sync_access_if_platform_subscription(db, subscription)
+
 
 async def handle_renewal_payment_result(
     db: Session, subscription: ProductSubscription, status_value: Optional[str], transaction_id: Optional[str]
 ) -> None:
     """Called from the Tunzaa webhook for a "product-subscription-renewal-<id>" reference."""
-    from app.tasks.product_subscription_billing import charge_renewal
+    from app.tasks.product_subscription_billing import charge_renewal, check_past_due_grace_expired
 
     if transaction_id:
         subscription.tunzaa_transaction_id = transaction_id
@@ -57,6 +102,7 @@ async def handle_renewal_payment_result(
     if status_value == "COMPLETED":
         subscription.status = ProductSubscriptionStatus.ACTIVE
         subscription.retry_count = 0
+        subscription.past_due_since = None
         subscription.next_billing_at = datetime.utcnow() + timedelta(days=RENEWAL_PERIOD_DAYS)
         db.commit()
         try:
@@ -66,10 +112,18 @@ async def handle_renewal_payment_result(
         except Exception as e:
             logger.error(f"Failed to schedule next renewal for subscription {subscription.id}: {e}")
 
+        sync_access_if_platform_subscription(db, subscription)
+
     elif status_value in ("FAILED", "CANCELLED"):
         if subscription.retry_count < MAX_RENEWAL_RETRIES:
             subscription.status = ProductSubscriptionStatus.PAST_DUE
             subscription.retry_count += 1
+            # Only the *first* failure in a past-due streak starts the
+            # access-grace clock and schedules its expiry check — later
+            # retries within the same streak leave it alone.
+            newly_past_due = subscription.past_due_since is None
+            if newly_past_due:
+                subscription.past_due_since = datetime.utcnow()
             db.commit()
             try:
                 charge_renewal.apply_async(
@@ -77,6 +131,18 @@ async def handle_renewal_payment_result(
                 )
             except Exception as e:
                 logger.error(f"Failed to schedule renewal retry for subscription {subscription.id}: {e}")
+
+            if newly_past_due:
+                from app.services.subscription_access import PAST_DUE_ACCESS_GRACE_DAYS
+
+                try:
+                    check_past_due_grace_expired.apply_async(
+                        args=[subscription.id], countdown=PAST_DUE_ACCESS_GRACE_DAYS * 86400
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Failed to schedule past-due grace check for subscription {subscription.id}: {e}"
+                    )
 
             await notify_customer(
                 db, subscription,
@@ -89,6 +155,7 @@ async def handle_renewal_payment_result(
                 f"⚠️ A renewal payment for {subscription.product.name} failed "
                 f"(attempt {subscription.retry_count}/{MAX_RENEWAL_RETRIES}). Retrying automatically.",
             )
+            sync_access_if_platform_subscription(db, subscription)
         else:
             subscription.status = ProductSubscriptionStatus.CANCELLED
             db.commit()
@@ -103,6 +170,7 @@ async def handle_renewal_payment_result(
                 f"🚨 Subscription to {subscription.product.name} was cancelled after "
                 f"{MAX_RENEWAL_RETRIES} failed renewal attempts.",
             )
+            sync_access_if_platform_subscription(db, subscription)
     else:
         db.commit()
 

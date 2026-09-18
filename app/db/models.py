@@ -71,6 +71,12 @@ class User(Base):
     facebook_id = Column(String, unique=True, index=True, nullable=True)
     email = Column(String, nullable=True)
     name = Column(String, nullable=True)
+    # Self-reported phone number for a Facebook-login merchant (who has no
+    # `username`/phone otherwise) — the only way app/services/subscription_access.py
+    # can match them against the Customer who paid for the platform
+    # subscription. OTP merchants don't need this; their phone is already
+    # `username`.
+    phone_number = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     accounts = relationship("WhatsAppAccount", back_populates="owner")
@@ -465,6 +471,12 @@ class ProductSubscription(Base):
     # 0-10: counts consecutive renewal-charge failures. Hitting
     # product_subscription.MAX_RENEWAL_RETRIES triggers CANCELLED.
     retry_count = Column(Integer, default=0, nullable=False)
+    # Set once when status first transitions to PAST_DUE (not touched by
+    # later retries within the same past-due streak); cleared back to NULL
+    # on a successful renewal. app/services/subscription_access.py denies
+    # AI access once this has been set for >= 7 days — see
+    # PAST_DUE_ACCESS_GRACE_DAYS.
+    past_due_since = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     order = relationship("Order", back_populates="subscription")
