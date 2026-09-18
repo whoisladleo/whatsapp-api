@@ -275,3 +275,34 @@ def test_sync_is_a_no_op_without_gating_configured(db_session, merchant, whatsap
 
     db_session.refresh(whatsapp_account)
     assert whatsapp_account.ai_enabled is True
+
+
+def test_sync_enables_ai_for_platform_product_seller_with_no_subscription(
+    db_session, platform_owner, platform_product
+):
+    """
+    End-to-end version of test_allowed_when_merchant_is_the_platform_product_seller
+    — confirms the exemption actually reaches sync_ai_access_for_merchant
+    (the path upsert_account/create_whatsapp_account call on every connect),
+    not just is_merchant_allowed_ai in isolation. The seller has no
+    ProductSubscription row at all (can't subscribe to themselves), which
+    would deny any other merchant — their own accounts must still end up
+    ai_enabled=True.
+    """
+    whatsapp_account = WhatsAppAccount(
+        name="Taskflow", phone_number_id="PLATFORM_PHONE", access_token="tok",
+        user_id=platform_owner.id, ai_enabled=False,
+    )
+    instagram_account = InstagramAccount(
+        ig_business_id="ig_platform_1", access_token="ig-tok", username="taskflow_os",
+        user_id=platform_owner.id, ai_enabled=False,
+    )
+    db_session.add_all([whatsapp_account, instagram_account])
+    db_session.commit()
+
+    subscription_access.sync_ai_access_for_merchant(db_session, platform_owner)
+
+    db_session.refresh(whatsapp_account)
+    db_session.refresh(instagram_account)
+    assert whatsapp_account.ai_enabled is True
+    assert instagram_account.ai_enabled is True

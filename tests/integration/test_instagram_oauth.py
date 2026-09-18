@@ -6,7 +6,7 @@ import pytest
 import respx
 
 from app.core.config import settings
-from app.db.models import InstagramAccount
+from app.db.models import InstagramAccount, User
 
 SHORT_TOKEN_URL_RE = r"https://api\.instagram\.com/oauth/access_token$"
 LONG_TOKEN_URL_RE = r"https://graph\.instagram\.com/access_token"
@@ -170,6 +170,89 @@ def test_callback_reconnect_updates_existing_account_instead_of_duplicating(
     db_session.refresh(existing)
     assert existing.access_token == "long-tok"
     assert existing.username == "new_name"
+
+
+def _seed_platform_product(db_session, slug="taskflow-os-subscription"):
+    from app.db.models import Product
+
+    platform_owner = User(username="255700000997")
+    db_session.add(platform_owner)
+    db_session.commit()
+    db_session.refresh(platform_owner)
+
+    product = Product(
+        slug=slug, name="Taskflow OS Subscription", max_price=100000, min_price=100000,
+        quantity=999999, merchant_id=platform_owner.id, is_subscription=True,
+    )
+    db_session.add(product)
+    db_session.commit()
+    return product
+
+
+@respx.mock
+def test_callback_denies_ai_enabled_for_unsubscribed_merchant(client, db_session, auth_user, monkeypatch):
+    user, _ = auth_user
+    _seed_platform_product(db_session)
+    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", "taskflow-os-subscription")
+    _mock_successful_exchange(ig_user_id="ig_user_1", username="shopowner")
+
+    resp = client.get(
+        "/api/v1/instagram/oauth/callback",
+        params={"code": "auth-code", "state": _valid_state_for(user.id)},
+        follow_redirects=False,
+    )
+
+    assert resp.status_code in (302, 307)
+    account = db_session.query(InstagramAccount).filter(
+        InstagramAccount.ig_business_id == "ig_user_1"
+    ).first()
+    assert account is not None
+    assert account.ai_enabled is False
+
+
+@respx.mock
+def test_callback_allows_ai_enabled_for_actively_subscribed_merchant(client, db_session, auth_user, monkeypatch):
+    from app.db.models import Customer, Order, OrderStatus, PaymentType, ProductSubscription, ProductSubscriptionStatus
+
+    user, _ = auth_user
+    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", "taskflow-os-subscription")
+    product = _seed_platform_product(db_session)
+
+    customer = Customer(phone_number=user.username)
+    db_session.add(customer)
+    db_session.commit()
+    db_session.refresh(customer)
+
+    order = Order(
+        customer_id=customer.id, product_id=product.id, quantity=1, agreed_price=100000,
+        payment_type=PaymentType.FULL, status=OrderStatus.PAID,
+    )
+    db_session.add(order)
+    db_session.commit()
+    db_session.refresh(order)
+
+    db_session.add(
+        ProductSubscription(
+            order_id=order.id, customer_id=customer.id, product_id=product.id,
+            status=ProductSubscriptionStatus.ACTIVE, monthly_amount=100000,
+        )
+    )
+    db_session.commit()
+
+    _mock_successful_exchange(ig_user_id="ig_user_1", username="shopowner")
+
+    resp = client.get(
+        "/api/v1/instagram/oauth/callback",
+        params={"code": "auth-code", "state": _valid_state_for(user.id)},
+        follow_redirects=False,
+    )
+
+    assert resp.status_code in (302, 307)
+    account = db_session.query(InstagramAccount).filter(
+        InstagramAccount.ig_business_id == "ig_user_1"
+    ).first()
+    assert account is not None
+    assert account.ai_enabled is True
 
 
 @respx.mock
