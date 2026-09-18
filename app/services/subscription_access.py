@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 PAST_DUE_ACCESS_GRACE_DAYS = 7
 
 
-def _platform_subscription_product(db: Session) -> Optional[Product]:
+def get_platform_subscription_product(db: Session) -> Optional[Product]:
     if not settings.PLATFORM_SUBSCRIPTION_PRODUCT_SLUG:
         return None
     return (
@@ -34,8 +34,8 @@ def _platform_subscription_product(db: Session) -> Optional[Product]:
     )
 
 
-def _find_platform_subscription(db: Session, user: User) -> Optional[ProductSubscription]:
-    product = _platform_subscription_product(db)
+def find_platform_subscription(db: Session, user: User) -> Optional[ProductSubscription]:
+    product = get_platform_subscription_product(db)
     if not product:
         return None
 
@@ -72,7 +72,7 @@ def is_merchant_allowed_ai(db: Session, user: User) -> bool:
     if not settings.PLATFORM_SUBSCRIPTION_PRODUCT_SLUG:
         return True
 
-    if not _platform_subscription_product(db):
+    if not get_platform_subscription_product(db):
         logger.error(
             "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG is set but no matching Product "
             "exists; failing open (not gating anyone) rather than locking out "
@@ -80,7 +80,7 @@ def is_merchant_allowed_ai(db: Session, user: User) -> bool:
         )
         return True
 
-    subscription = _find_platform_subscription(db, user)
+    subscription = find_platform_subscription(db, user)
     if not subscription:
         return False
 

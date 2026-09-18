@@ -21,10 +21,13 @@ from app.schemas.auth import (
     FacebookExchangeRequest,
     UserProfile,
     UserProfileUpdate,
+    MySubscriptionRead,
+    PayNowRequest,
+    PayNowResponse,
 )
 from app.crud import user as crud_user
 from app.core.provider import WhatsAppProvider
-from app.services import facebook_oauth
+from app.services import facebook_oauth, self_service_billing
 
 router = APIRouter()
 
@@ -233,3 +236,48 @@ def update_my_profile(
         crud_user.set_user_phone_number(db, current_user, normalized)
 
     return current_user
+
+
+@router.get("/me/subscription", response_model=MySubscriptionRead)
+def get_my_subscription(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Self-service status view — see app/services/self_service_billing.py."""
+    subscription = self_service_billing.get_my_subscription(db, current_user)
+    if not subscription:
+        return MySubscriptionRead()
+
+    return MySubscriptionRead(
+        status=subscription.status.value,
+        monthly_amount=subscription.monthly_amount,
+        next_billing_at=subscription.next_billing_at,
+        retry_count=subscription.retry_count,
+        past_due_since=subscription.past_due_since,
+    )
+
+
+@router.post("/me/subscription/pay", response_model=PayNowResponse)
+async def pay_now(
+    payload: PayNowRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Dashboard-native Pay Now for Taskflow's own subscription — same flow
+    regardless of whether this is a first payment, catching up a lapsed
+    one, or resubscribing after cancellation. See
+    app/services/self_service_billing.py.
+    """
+    try:
+        result = await self_service_billing.pay_now(db, current_user, payload.phone_number)
+    except self_service_billing.NoPlatformProductConfiguredError:
+        raise HTTPException(status_code=503, detail="Subscription billing isn't configured yet.")
+    except self_service_billing.PhoneNumberRequiredError:
+        raise HTTPException(status_code=400, detail="A phone number is required to pay.")
+    except self_service_billing.PhoneNumberInUseError:
+        raise HTTPException(status_code=400, detail="This phone number is already in use.")
+    except Exception:
+        raise HTTPException(status_code=502, detail="Failed to start payment. Please try again.")
+
+    return result

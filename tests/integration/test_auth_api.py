@@ -6,6 +6,7 @@ import pytest
 import respx
 
 from app.core.config import settings
+from app.core.security import create_access_token
 from app.db.models import User
 
 PHONE = "255712345678"
@@ -292,3 +293,229 @@ def test_patch_me_without_phone_number_leaves_profile_unchanged(client, auth_use
 
     assert resp.status_code == 200
     assert resp.json()["phone_number"] is None
+
+
+# --- /me/subscription -----------------------------------------------------------
+
+TOKEN_URL = "https://pay.tunzaa.co.tz/accounts/request/token"
+PAYMENT_URL = "https://pay.tunzaa.co.tz/payments/initiate-payment"
+PLATFORM_SLUG = "taskflow-os-subscription"
+
+
+def _seed_platform_product(db_session, slug=PLATFORM_SLUG, price=100000):
+    from app.db.models import Product
+
+    platform_owner = User(username="255700000997")
+    db_session.add(platform_owner)
+    db_session.commit()
+    db_session.refresh(platform_owner)
+
+    product = Product(
+        slug=slug, name="Taskflow OS Subscription", max_price=price, min_price=price,
+        quantity=999999, merchant_id=platform_owner.id, is_subscription=True,
+    )
+    db_session.add(product)
+    db_session.commit()
+    db_session.refresh(product)
+    return product
+
+
+def test_get_my_subscription_requires_auth(client):
+    resp = client.get("/api/v1/auth/me/subscription")
+
+    assert resp.status_code in (401, 403)
+
+
+def test_get_my_subscription_none_when_no_subscription(client, auth_user, db_session, monkeypatch):
+    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", PLATFORM_SLUG)
+    _seed_platform_product(db_session)
+    _, headers = auth_user
+
+    resp = client.get("/api/v1/auth/me/subscription", headers=headers)
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "status": None, "monthly_amount": None, "next_billing_at": None,
+        "retry_count": None, "past_due_since": None,
+    }
+
+
+def test_get_my_subscription_returns_status_when_found(client, auth_user, db_session, monkeypatch):
+    from app.db.models import Customer, Order, OrderStatus, PaymentType, ProductSubscription, ProductSubscriptionStatus
+
+    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", PLATFORM_SLUG)
+    product = _seed_platform_product(db_session)
+    user, headers = auth_user
+
+    customer = Customer(phone_number=user.username)
+    db_session.add(customer)
+    db_session.commit()
+    db_session.refresh(customer)
+
+    order = Order(
+        customer_id=customer.id, product_id=product.id, quantity=1, agreed_price=100000,
+        payment_type=PaymentType.FULL, status=OrderStatus.PAID,
+    )
+    db_session.add(order)
+    db_session.commit()
+    db_session.refresh(order)
+
+    db_session.add(
+        ProductSubscription(
+            order_id=order.id, customer_id=customer.id, product_id=product.id,
+            status=ProductSubscriptionStatus.ACTIVE, monthly_amount=100000,
+        )
+    )
+    db_session.commit()
+
+    resp = client.get("/api/v1/auth/me/subscription", headers=headers)
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ACTIVE"
+    assert resp.json()["monthly_amount"] == 100000
+
+
+# --- POST /me/subscription/pay --------------------------------------------------
+
+
+def test_pay_now_requires_auth(client):
+    resp = client.post("/api/v1/auth/me/subscription/pay", json={})
+
+    assert resp.status_code in (401, 403)
+
+
+def test_pay_now_503_when_not_configured(client, auth_user, monkeypatch):
+    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", None)
+    _, headers = auth_user
+
+    resp = client.post("/api/v1/auth/me/subscription/pay", json={}, headers=headers)
+
+    assert resp.status_code == 503
+
+
+def test_pay_now_400_when_no_phone_on_file_and_none_supplied(client, db_session, monkeypatch):
+    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", PLATFORM_SLUG)
+    _seed_platform_product(db_session)
+
+    fb_user = User(facebook_id="fb789")
+    db_session.add(fb_user)
+    db_session.commit()
+    db_session.refresh(fb_user)
+    headers = {"Authorization": f"Bearer {create_access_token(fb_user.id)}"}
+
+    resp = client.post("/api/v1/auth/me/subscription/pay", json={}, headers=headers)
+
+    assert resp.status_code == 400
+
+
+@respx.mock
+def test_pay_now_uses_existing_username_as_phone(client, auth_user, db_session, monkeypatch):
+    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", PLATFORM_SLUG)
+    _seed_platform_product(db_session)
+    user, headers = auth_user
+
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "tok-1"}))
+    payment_route = respx.post(PAYMENT_URL).mock(
+        return_value=httpx.Response(200, json={"statusCode": 202, "success": True, "transactionID": "MOCK_TXN_PAYNOW_1"})
+    )
+
+    resp = client.post("/api/v1/auth/me/subscription/pay", json={}, headers=headers)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "order_id" in body
+    assert payment_route.called
+    sent = json.loads(payment_route.calls.last.request.content)
+    assert sent["customer_msisdn"] == user.username
+
+
+@respx.mock
+def test_pay_now_with_inline_phone_number_saves_it_to_user(client, auth_user, db_session, monkeypatch):
+    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", PLATFORM_SLUG)
+    _seed_platform_product(db_session)
+
+    fb_user = User(facebook_id="fb999")
+    db_session.add(fb_user)
+    db_session.commit()
+    db_session.refresh(fb_user)
+    headers = {"Authorization": f"Bearer {create_access_token(fb_user.id)}"}
+
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "tok-1"}))
+    payment_route = respx.post(PAYMENT_URL).mock(
+        return_value=httpx.Response(200, json={"statusCode": 202, "success": True, "transactionID": "MOCK_TXN_PAYNOW_2"})
+    )
+
+    resp = client.post(
+        "/api/v1/auth/me/subscription/pay", json={"phone_number": "0712345888"}, headers=headers
+    )
+
+    assert resp.status_code == 200
+    db_session.refresh(fb_user)
+    assert fb_user.phone_number == "255712345888"
+    sent = json.loads(payment_route.calls.last.request.content)
+    assert sent["customer_msisdn"] == "255712345888"
+
+
+def test_pay_now_400_when_inline_phone_already_used_by_another_user(client, auth_user, db_session, monkeypatch):
+    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", PLATFORM_SLUG)
+    _seed_platform_product(db_session)
+    _, headers = auth_user
+
+    other = User(username="255700000996", phone_number="255711119999")
+    db_session.add(other)
+    db_session.commit()
+
+    resp = client.post(
+        "/api/v1/auth/me/subscription/pay", json={"phone_number": "255711119999"}, headers=headers
+    )
+
+    assert resp.status_code == 400
+
+
+@respx.mock
+def test_pay_now_creates_order_and_pending_subscription(client, auth_user, db_session, monkeypatch):
+    from app.db.models import Order, ProductSubscription, ProductSubscriptionStatus
+
+    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", PLATFORM_SLUG)
+    _seed_platform_product(db_session)
+    _, headers = auth_user
+
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "tok-1"}))
+    respx.post(PAYMENT_URL).mock(
+        return_value=httpx.Response(200, json={"statusCode": 202, "success": True, "transactionID": "MOCK_TXN_PAYNOW_3"})
+    )
+
+    resp = client.post("/api/v1/auth/me/subscription/pay", json={}, headers=headers)
+
+    assert resp.status_code == 200
+    order_id = resp.json()["order_id"]
+    order = db_session.query(Order).filter(Order.id == order_id).first()
+    assert order is not None
+    assert order.agreed_price == 100000
+    assert order.tunzaa_transaction_id == "MOCK_TXN_PAYNOW_3"
+
+    subscription = db_session.query(ProductSubscription).filter(ProductSubscription.order_id == order.id).first()
+    assert subscription is not None
+    assert subscription.status == ProductSubscriptionStatus.PENDING_PAYMENT
+
+
+@respx.mock
+def test_pay_now_releases_reservation_on_dispatch_failure(client, auth_user, db_session, monkeypatch):
+    from app.db.models import Order, OrderStatus
+
+    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", PLATFORM_SLUG)
+    product = _seed_platform_product(db_session)
+    quantity_before = product.quantity
+    _, headers = auth_user
+
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "tok-1"}))
+    respx.post(PAYMENT_URL).mock(return_value=httpx.Response(500))
+
+    resp = client.post("/api/v1/auth/me/subscription/pay", json={}, headers=headers)
+
+    assert resp.status_code == 502
+    db_session.refresh(product)
+    assert product.quantity == quantity_before
+
+    order = db_session.query(Order).filter(Order.product_id == product.id).first()
+    assert order.status == OrderStatus.CANCELLED
