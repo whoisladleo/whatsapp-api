@@ -253,6 +253,35 @@ async def test_regular_account_catalog_uses_account_owner_products(db_session, s
     assert "Test Shop" in instruction
 
 
+async def test_regular_account_catalog_includes_product_description(db_session, shop_account, merchant):
+    """
+    Regression test: the catalog string used to only include name/price/
+    stock, so the model had no real product details for anything that
+    wasn't self-explanatory from its name (e.g. a service/subscription) and
+    would invent plausible-sounding but false ones instead.
+    """
+    db_session.add(
+        Product(
+            slug="subscription", name="Taskflow OS Subscription", max_price=100000, min_price=100000,
+            quantity=999999, merchant_id=merchant.id,
+            description="AI sales assistant for WhatsApp & Instagram — 0 TZS upfront, 100,000 TZS/month.",
+        )
+    )
+    db_session.commit()
+
+    captured = {}
+    service = _service_with_fake_client(captured=captured)
+
+    await service.generate_response(
+        message_body="what is this?",
+        from_phone="255711111113",
+        db=db_session,
+        account=shop_account,
+    )
+
+    assert "AI sales assistant for WhatsApp & Instagram" in captured["system"]
+
+
 async def test_regular_account_no_products_shows_placeholder(db_session, shop_account):
     captured = {}
     service = _service_with_fake_client(captured=captured)

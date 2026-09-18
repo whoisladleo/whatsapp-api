@@ -101,6 +101,31 @@ async def test_generate_comment_reply_success(db_session, merchant, shoes):
     assert "Shoes: Price 45000" in captured["system"]
 
 
+async def test_generate_comment_reply_includes_product_description_in_catalog(db_session, merchant):
+    """
+    Regression test: the catalog string used to only include name/price/
+    stock, so the model had no real product details for anything that
+    wasn't self-explanatory from its name (e.g. a service/subscription) and
+    would invent plausible-sounding but false ones instead.
+    """
+    p = Product(
+        slug="ig-subscription", name="Taskflow OS Subscription", max_price=100000, min_price=100000,
+        quantity=999999, merchant_id=merchant.id,
+        description="AI sales assistant for WhatsApp & Instagram — 0 TZS upfront, 100,000 TZS/month.",
+    )
+    db_session.add(p)
+    db_session.commit()
+
+    captured = {}
+    service = _service_with_fake_client(captured=captured)
+
+    await service.generate_comment_reply(
+        "what is this?", merchant_id=merchant.id, db=db_session
+    )
+
+    assert "AI sales assistant for WhatsApp & Instagram" in captured["system"]
+
+
 async def test_generate_comment_reply_no_products_says_so_in_catalog(db_session, merchant):
     captured = {}
     service = _service_with_fake_client(captured=captured)

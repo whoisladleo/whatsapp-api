@@ -161,6 +161,31 @@ async def test_generate_dm_response_includes_conversation_history(db_session, ig
     assert "and the red ones?" in prompt
 
 
+async def test_generate_dm_response_includes_product_description_in_catalog(db_session, ig_account, ig_context):
+    """
+    Regression test: the catalog string used to only include name/price/
+    stock, so the model had no real product details for anything that
+    wasn't self-explanatory from its name (e.g. a service/subscription) and
+    would invent plausible-sounding but false ones instead.
+    """
+    p = Product(
+        slug="ig-dm-subscription", name="Taskflow OS Subscription", max_price=100000, min_price=100000,
+        quantity=999999, merchant_id=ig_account.user_id,
+        description="AI sales assistant for WhatsApp & Instagram — 0 TZS upfront, 100,000 TZS/month.",
+    )
+    db_session.add(p)
+    db_session.commit()
+
+    captured = {}
+    service = _service_with_fake_client(captured=captured)
+
+    await service.generate_dm_response(
+        "what is this?", db=db_session, account=ig_account, context=ig_context, conversation_history=[]
+    )
+
+    assert "AI sales assistant for WhatsApp & Instagram" in captured["system"]
+
+
 async def test_generate_dm_response_no_products_says_so_in_catalog(db_session, ig_account, ig_context):
     captured = {}
     service = _service_with_fake_client(captured=captured)
