@@ -90,6 +90,7 @@ def _no_real_celery_broker(monkeypatch):
     from app.tasks.order_reminders import auto_cancel_order, send_scarcity_nudge, send_soft_nudge
     from app.tasks.location_capture import capture_customer_location
     from app.tasks.quote_nudges import send_quote_nudge
+    from app.tasks.product_subscription_billing import charge_renewal as charge_product_subscription_renewal
 
     monkeypatch.setattr(send_handoff_reminder, "apply_async", lambda *a, **kw: None)
     monkeypatch.setattr(send_soft_nudge, "apply_async", lambda *a, **kw: None)
@@ -97,6 +98,7 @@ def _no_real_celery_broker(monkeypatch):
     monkeypatch.setattr(auto_cancel_order, "apply_async", lambda *a, **kw: None)
     monkeypatch.setattr(capture_customer_location, "apply_async", lambda *a, **kw: None)
     monkeypatch.setattr(send_quote_nudge, "apply_async", lambda *a, **kw: None)
+    monkeypatch.setattr(charge_product_subscription_renewal, "apply_async", lambda *a, **kw: None)
 
 
 @pytest.fixture

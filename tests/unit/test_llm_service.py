@@ -12,6 +12,8 @@ from app.db.models import (
     OrderStatus,
     PaymentType,
     Product,
+    ProductSubscription,
+    ProductSubscriptionStatus,
     User,
     WhatsAppAccount,
 )
@@ -723,6 +725,70 @@ async def test_agreement_full_payment_creates_order_and_dispatches(db_session, s
     customer = db_session.query(Customer).filter(Customer.phone_number == "255711130000").first()
     context = db_session.query(ConversationContext).filter(ConversationContext.customer_id == customer.id).first()
     assert context.last_offer == 45000
+
+
+@respx.mock
+async def test_agreement_for_subscription_product_creates_product_subscription(db_session, shop_account, merchant):
+    subscription_product = Product(
+        slug="taskflow-sub", name="Taskflow OS Subscription", max_price=100000, min_price=100000,
+        quantity=999999, merchant_id=merchant.id, is_subscription=True,
+    )
+    db_session.add(subscription_product)
+    db_session.commit()
+
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "tok-1"}))
+    respx.post(PAYMENT_URL).mock(
+        return_value=httpx.Response(200, json={"statusCode": 202, "success": True, "transactionID": "MOCK_TXN_SUB_1"})
+    )
+
+    async def handler(**kwargs):
+        return _FakeResponse(
+            "Deal! [AGREEMENT_REACHED: product=Taskflow OS Subscription price=100000 payment=full]"
+        )
+
+    service = _service_with_fake_client(handler=handler)
+
+    await service.generate_response(
+        message_body="sign me up",
+        from_phone="255711130050",
+        db=db_session,
+        account=shop_account,
+    )
+
+    order = db_session.query(Order).filter(Order.agreed_price == 100000).first()
+    assert order is not None
+
+    subscription = db_session.query(ProductSubscription).filter(ProductSubscription.order_id == order.id).first()
+    assert subscription is not None
+    assert subscription.product_id == subscription_product.id
+    assert subscription.customer_id == order.customer_id
+    assert subscription.instagram_customer_id is None
+    assert subscription.monthly_amount == 100000
+    assert subscription.status == ProductSubscriptionStatus.PENDING_PAYMENT
+
+
+@respx.mock
+async def test_agreement_for_regular_product_does_not_create_product_subscription(db_session, shop_account, shoes):
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "tok-1"}))
+    respx.post(PAYMENT_URL).mock(
+        return_value=httpx.Response(200, json={"statusCode": 202, "success": True, "transactionID": "MOCK_TXN_2"})
+    )
+
+    async def handler(**kwargs):
+        return _FakeResponse("Deal! [AGREEMENT_REACHED: product=Shoes price=45000 payment=full]")
+
+    service = _service_with_fake_client(handler=handler)
+
+    await service.generate_response(
+        message_body="I'll take the shoes",
+        from_phone="255711130051",
+        db=db_session,
+        account=shop_account,
+    )
+
+    order = db_session.query(Order).filter(Order.agreed_price == 45000).first()
+    assert order is not None
+    assert db_session.query(ProductSubscription).filter(ProductSubscription.order_id == order.id).count() == 0
 
 
 @respx.mock

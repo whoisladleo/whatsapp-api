@@ -1,7 +1,7 @@
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
-from app.db.models import OrderStatus, PaymentType, InstallmentStatus
+from app.db.models import OrderStatus, PaymentType, InstallmentStatus, ProductSubscriptionStatus
 
 
 class InstallmentRead(BaseModel):
@@ -27,6 +27,14 @@ class OrderRead(BaseModel):
     customer_phone: Optional[str] = None
     reserved_until: Optional[datetime] = None
     created_at: datetime
+    # Present only when Order.product.is_subscription — see
+    # app/services/product_subscription.py. This is the merchant-visibility
+    # surface for recurring billing: a merchant sees a subscription go
+    # PAST_DUE/CANCELLED here even without a WhatsApp account to receive
+    # the best-effort push alert on.
+    subscription_status: Optional[ProductSubscriptionStatus] = None
+    subscription_next_billing_at: Optional[datetime] = None
+    subscription_retry_count: Optional[int] = None
 
 
 class OrderDetail(OrderRead):

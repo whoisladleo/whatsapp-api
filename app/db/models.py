@@ -350,6 +350,13 @@ class Product(Base):
     quantity = Column(Integer, default=0)
     weight = Column(Float, nullable=True)
     is_active = Column(Boolean, default=True)
+    # Opts this product into recurring billing instead of a one-time sale —
+    # see ProductSubscription / app/services/product_subscription.py. A deal
+    # closed on a subscription product still rides the normal one-time
+    # Order/_dispatch_payment flow for its first charge; this flag is what
+    # tells _close_deal/_close_instagram_deal to also create the
+    # ProductSubscription that drives billing from month 2 onward.
+    is_subscription = Column(Boolean, default=False, nullable=False)
     merchant_id = Column(Integer, ForeignKey("users.id"))
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -404,6 +411,7 @@ class Order(Base):
     product = relationship("Product")
     account = relationship("WhatsAppAccount")
     instagram_account = relationship("InstagramAccount")
+    subscription = relationship("ProductSubscription", back_populates="order", uselist=False)
 
 
 class Installment(Base):
@@ -418,6 +426,51 @@ class Installment(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     order = relationship("Order", back_populates="installments")
+
+
+class ProductSubscriptionStatus(enum.Enum):
+    PENDING_PAYMENT = "PENDING_PAYMENT"  # first Tunzaa push sent, awaiting the customer's approval
+    ACTIVE = "ACTIVE"  # first payment confirmed, billing on schedule
+    PAYMENT_FAILED = "PAYMENT_FAILED"  # first payment failed/cancelled — no retry, customer re-negotiates via chat
+    PAST_DUE = "PAST_DUE"  # a renewal charge failed — retrying on a schedule, see app/services/product_subscription.py
+    CANCELLED = "CANCELLED"  # renewal retries exhausted
+
+
+class ProductSubscription(Base):
+    """
+    Recurring billing for a Product with is_subscription=True — created
+    alongside the Order that closed the deal (see LLMService._close_deal /
+    _close_instagram_deal), and self-reschedules its own renewal charge the
+    same way NumberSubscription does (no Celery Beat in this stack — see
+    app/tasks/product_subscription_billing.py). The first charge still rides
+    the normal one-time Order/_dispatch_payment flow; this row is what turns
+    that into recurring billing from month 2 onward.
+    """
+    __tablename__ = "product_subscriptions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    order_id = Column(Integer, ForeignKey("orders.id"), unique=True, nullable=False)
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False)
+    product_id = Column(Integer, ForeignKey("products.id"), nullable=False)
+    # Set only when the deal closed over Instagram DM — the phone-keyed
+    # Customer above has no IGSID, so this is what lets renewal-failure
+    # notifications go out as an Instagram DM instead of (silently failing
+    # to send as) a WhatsApp message. NULL means the deal closed on
+    # WhatsApp; see app/services/product_subscription.py's channel handling.
+    instagram_customer_id = Column(Integer, ForeignKey("instagram_customers.id"), nullable=True)
+    status = Column(Enum(ProductSubscriptionStatus), default=ProductSubscriptionStatus.PENDING_PAYMENT, nullable=False)
+    monthly_amount = Column(Float, nullable=False)
+    tunzaa_transaction_id = Column(String, nullable=True)
+    next_billing_at = Column(DateTime, nullable=True)
+    # 0-10: counts consecutive renewal-charge failures. Hitting
+    # product_subscription.MAX_RENEWAL_RETRIES triggers CANCELLED.
+    retry_count = Column(Integer, default=0, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    order = relationship("Order", back_populates="subscription")
+    customer = relationship("Customer")
+    product = relationship("Product")
+    instagram_customer = relationship("InstagramCustomer")
 
 
 class ConversationContext(Base):

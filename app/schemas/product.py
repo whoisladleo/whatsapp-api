@@ -15,6 +15,9 @@ class ProductBase(BaseModel):
     cost_price: Optional[float] = None
     weight: Optional[float] = None
     is_active: bool = True
+    # Opts this product into recurring billing — see
+    # app/services/product_subscription.py.
+    is_subscription: bool = False
 
 class ProductCreate(ProductBase):
     pass
@@ -33,6 +36,7 @@ class ProductUpdate(BaseModel):
     cost_price: Optional[float] = None
     weight: Optional[float] = None
     is_active: Optional[bool] = None
+    is_subscription: Optional[bool] = None
 
 class ProductResponse(ProductBase):
     id: int

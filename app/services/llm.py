@@ -21,6 +21,7 @@ from app.db.models import (
     OrderStatus,
     PaymentType,
     Product,
+    ProductSubscription,
     WhatsAppAccount,
     Message,
     User,
@@ -210,6 +211,8 @@ class LLMService:
         db.commit()
         db.refresh(order)
 
+        self._create_subscription_if_needed(db, order, product, customer)
+
         context.last_offer = price
         # No longer just a quote — it's a real order now, so nothing to
         # nudge the customer about, and the failed-attempts count resets.
@@ -223,6 +226,38 @@ class LLMService:
 
         note = await self._dispatch_payment(db, order, product, normalized_from_phone, payment_type)
         return note
+
+    def _create_subscription_if_needed(
+        self,
+        db: Session,
+        order: Order,
+        product: Product,
+        customer: Customer,
+        instagram_customer: Optional[InstagramCustomer] = None,
+    ) -> None:
+        """
+        For a Product with is_subscription=True, creates the
+        ProductSubscription that turns this order's first charge into
+        recurring billing (see app/services/product_subscription.py). The
+        first charge itself still rides the normal one-time
+        Order/_dispatch_payment flow below; app/api/v1/tunzaa_webhook.py
+        activates this row once that first payment is confirmed.
+        instagram_customer is only passed for a deal closed over Instagram
+        DM — it's what lets renewal-failure notices go out as a DM instead
+        of a WhatsApp message nobody would receive.
+        """
+        if not product.is_subscription:
+            return
+
+        subscription = ProductSubscription(
+            order_id=order.id,
+            customer_id=customer.id,
+            product_id=product.id,
+            instagram_customer_id=instagram_customer.id if instagram_customer else None,
+            monthly_amount=order.agreed_price,
+        )
+        db.add(subscription)
+        db.commit()
 
     async def _dispatch_payment(
         self, db: Session, order: Order, product: Product, phone: str, payment_type: PaymentType
@@ -485,7 +520,7 @@ Match the customer's language (Swahili or English). Keep both lines to one sente
         return {"public_reply": public_reply, "private_reply": private_reply}
 
     async def _close_instagram_deal(
-        self, db: Session, account: InstagramAccount, agreement: dict
+        self, db: Session, account: InstagramAccount, ig_customer: InstagramCustomer, agreement: dict
     ) -> Optional[str]:
         """
         Instagram counterpart to _close_deal: validates the parsed
@@ -500,6 +535,10 @@ Match the customer's language (Swahili or English). Keep both lines to one sente
         reminders, and the dashboard Orders page all work identically
         regardless of which channel the deal originated on — the only
         difference is Order.instagram_account_id instead of .account_id.
+        ig_customer (the InstagramCustomer, distinct from the phone-keyed
+        Customer above) is only needed to let a subscription product's
+        renewal notices go out as an Instagram DM later — see
+        _create_subscription_if_needed.
         """
         product = (
             db.query(Product)
@@ -552,6 +591,8 @@ Match the customer's language (Swahili or English). Keep both lines to one sente
         db.commit()
         db.refresh(order)
 
+        self._create_subscription_if_needed(db, order, product, customer, ig_customer)
+
         self._schedule_reminders(order.id)
 
         return await self._dispatch_payment(db, order, product, normalized_phone, payment_type)
@@ -561,6 +602,7 @@ Match the customer's language (Swahili or English). Keep both lines to one sente
         message_body: str,
         db: Session,
         account: InstagramAccount,
+        customer: InstagramCustomer,
         context: InstagramConversationContext,
         conversation_history: List[dict],
         account_name: str = "the shop",
@@ -646,7 +688,7 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
         response_text, agreement = _parse_and_strip_agreement(response_text)
         if agreement:
             try:
-                note = await self._close_instagram_deal(db, account, agreement)
+                note = await self._close_instagram_deal(db, account, customer, agreement)
             except Exception as deal_err:
                 logger.error(f"Instagram order/payment completion failed: {deal_err}")
                 note = None

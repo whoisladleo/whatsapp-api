@@ -13,6 +13,7 @@ from app.db.models import (
     Order,
     OrderStatus,
     Product,
+    ProductSubscription,
     WhatsAppAccount,
 )
 import logging
@@ -72,6 +73,9 @@ async def handle_tunzaa_webhook(
     if order_ref.startswith("number-purchase-") or order_ref.startswith("number-renewal-"):
         return await _handle_number_subscription_webhook(db, order_ref, status_value, transaction_id)
 
+    if order_ref.startswith("product-subscription-renewal-"):
+        return await _handle_product_subscription_renewal_webhook(db, order_ref, status_value, transaction_id)
+
     order = db.query(Order).filter(Order.id == int(order_ref.split("-")[-1])).first() if "-" in order_ref else None
 
     if not order:
@@ -117,6 +121,7 @@ async def handle_tunzaa_webhook(
         # in app/services/llm.py) — nothing further to do there. Just
         # confirm to the customer.
         await _notify_customer(db, order, "payment_complete")
+        await _activate_subscription_if_linked(db, order)
 
         return {"status": "success", "message": f"Order status: {order.status.value}"}
 
@@ -128,6 +133,7 @@ async def handle_tunzaa_webhook(
         db.commit()
 
         await _notify_customer(db, order, "payment_failed")
+        _fail_subscription_if_linked(db, order)
 
         return {"status": "success", "message": "Order marked as FAILED"}
 
@@ -168,6 +174,61 @@ async def _handle_number_subscription_webhook(
         "status": "success",
         "message": f"Subscription {subscription.id} status: {subscription.status.value}",
     }
+
+
+async def _handle_product_subscription_renewal_webhook(
+    db: Session, order_ref: str, status_value: Optional[str], transaction_id: Optional[str]
+) -> dict:
+    """Routes a "product-subscription-renewal-<id>" callback to
+    app/services/product_subscription.py. The *first* charge for a
+    subscription product is a normal "order-<id>" reference handled by the
+    Order-shaped logic above (see _activate_subscription_if_linked /
+    _fail_subscription_if_linked) — only renewals from month 2 onward use
+    this prefix."""
+    from app.services import product_subscription
+
+    try:
+        subscription_id = int(order_ref.split("-")[-1])
+    except ValueError:
+        return {"status": "ignored", "reason": "Malformed reference_id"}
+
+    subscription = (
+        db.query(ProductSubscription).filter(ProductSubscription.id == subscription_id).first()
+    )
+    if not subscription:
+        return {"status": "ignored", "reason": "Subscription not found"}
+
+    if transaction_id and subscription.tunzaa_transaction_id == transaction_id:
+        return {"status": "ignored", "reason": "Already processed"}
+
+    await product_subscription.handle_renewal_payment_result(db, subscription, status_value, transaction_id)
+
+    return {
+        "status": "success",
+        "message": f"Subscription {subscription.id} status: {subscription.status.value}",
+    }
+
+
+async def _activate_subscription_if_linked(db: Session, order: Order) -> None:
+    from app.db.models import ProductSubscriptionStatus
+    from app.services import product_subscription
+
+    subscription = (
+        db.query(ProductSubscription).filter(ProductSubscription.order_id == order.id).first()
+    )
+    if subscription and subscription.status == ProductSubscriptionStatus.PENDING_PAYMENT:
+        product_subscription.activate_after_first_payment(db, subscription)
+
+
+def _fail_subscription_if_linked(db: Session, order: Order) -> None:
+    from app.db.models import ProductSubscriptionStatus
+    from app.services import product_subscription
+
+    subscription = (
+        db.query(ProductSubscription).filter(ProductSubscription.order_id == order.id).first()
+    )
+    if subscription and subscription.status == ProductSubscriptionStatus.PENDING_PAYMENT:
+        product_subscription.mark_first_payment_failed(db, subscription)
 
 
 def _mark_single_installment_paid(db: Session, order: Order, installment_id) -> None:

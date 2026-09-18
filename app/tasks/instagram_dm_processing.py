@@ -56,6 +56,7 @@ async def _process(db, account_id: int, customer_id: int, dm_row_id: int) -> str
         message_body=message_body or "",
         db=db,
         account=account,
+        customer=customer,
         context=context,
         conversation_history=history,
         account_name=account.username or "the shop",

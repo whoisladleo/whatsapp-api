@@ -116,12 +116,12 @@ def shoes(db_session, merchant):
 async def test_generate_dm_response_returns_none_without_client(ig_context):
     service = LLMService(api_key=None)
     result = await service.generate_dm_response(
-        "how much?", db=None, account=None, context=ig_context, conversation_history=[]
+        "how much?", db=None, account=None, customer=None, context=ig_context, conversation_history=[]
     )
     assert result is None
 
 
-async def test_generate_dm_response_success(db_session, ig_account, ig_context, shoes):
+async def test_generate_dm_response_success(db_session, ig_account, ig_customer, ig_context, shoes):
     captured = {}
     service = _service_with_fake_client(captured=captured)
 
@@ -129,6 +129,7 @@ async def test_generate_dm_response_success(db_session, ig_account, ig_context, 
         "how much for the shoes?",
         db=db_session,
         account=ig_account,
+        customer=ig_customer,
         context=ig_context,
         conversation_history=[],
         account_name="Shoe Shop",
@@ -140,7 +141,7 @@ async def test_generate_dm_response_success(db_session, ig_account, ig_context, 
     assert "how much for the shoes?" in captured["messages"][0]["content"]
 
 
-async def test_generate_dm_response_includes_conversation_history(db_session, ig_account, ig_context, shoes):
+async def test_generate_dm_response_includes_conversation_history(db_session, ig_account, ig_customer, ig_context, shoes):
     captured = {}
     service = _service_with_fake_client(captured=captured)
 
@@ -148,6 +149,7 @@ async def test_generate_dm_response_includes_conversation_history(db_session, ig
         "and the red ones?",
         db=db_session,
         account=ig_account,
+        customer=ig_customer,
         context=ig_context,
         conversation_history=[
             {"direction": "inbound", "body": "hi, how much for shoes?"},
@@ -161,7 +163,7 @@ async def test_generate_dm_response_includes_conversation_history(db_session, ig
     assert "and the red ones?" in prompt
 
 
-async def test_generate_dm_response_includes_product_description_in_catalog(db_session, ig_account, ig_context):
+async def test_generate_dm_response_includes_product_description_in_catalog(db_session, ig_account, ig_customer, ig_context):
     """
     Regression test: the catalog string used to only include name/price/
     stock, so the model had no real product details for anything that
@@ -180,24 +182,24 @@ async def test_generate_dm_response_includes_product_description_in_catalog(db_s
     service = _service_with_fake_client(captured=captured)
 
     await service.generate_dm_response(
-        "what is this?", db=db_session, account=ig_account, context=ig_context, conversation_history=[]
+        "what is this?", db=db_session, account=ig_account, customer=ig_customer, context=ig_context, conversation_history=[]
     )
 
     assert "AI sales assistant for WhatsApp & Instagram" in captured["system"]
 
 
-async def test_generate_dm_response_no_products_says_so_in_catalog(db_session, ig_account, ig_context):
+async def test_generate_dm_response_no_products_says_so_in_catalog(db_session, ig_account, ig_customer, ig_context):
     captured = {}
     service = _service_with_fake_client(captured=captured)
 
     await service.generate_dm_response(
-        "anything for sale?", db=db_session, account=ig_account, context=ig_context, conversation_history=[]
+        "anything for sale?", db=db_session, account=ig_account, customer=ig_customer, context=ig_context, conversation_history=[]
     )
 
     assert "No products currently available." in captured["system"]
 
 
-async def test_generate_dm_response_includes_knowledge_content(db_session, ig_account, ig_context):
+async def test_generate_dm_response_includes_knowledge_content(db_session, ig_account, ig_customer, ig_context):
     captured = {}
     service = _service_with_fake_client(captured=captured)
 
@@ -205,6 +207,7 @@ async def test_generate_dm_response_includes_knowledge_content(db_session, ig_ac
         "when do you ship?",
         db=db_session,
         account=ig_account,
+        customer=ig_customer,
         context=ig_context,
         conversation_history=[],
         knowledge_content="We ship within 2 days.",
@@ -213,13 +216,13 @@ async def test_generate_dm_response_includes_knowledge_content(db_session, ig_ac
     assert "We ship within 2 days." in captured["system"]
 
 
-async def test_generate_dm_response_handoff_marker_sets_context_state(db_session, ig_account, ig_context):
+async def test_generate_dm_response_handoff_marker_sets_context_state(db_session, ig_account, ig_customer, ig_context):
     service = _service_with_fake_client(
         reply_text="Let me get a teammate to help with that. [HUMAN_HANDOFF]"
     )
 
     result = await service.generate_dm_response(
-        "this is unreasonable", db=db_session, account=ig_account, context=ig_context, conversation_history=[]
+        "this is unreasonable", db=db_session, account=ig_account, customer=ig_customer, context=ig_context, conversation_history=[]
     )
 
     assert "[HUMAN_HANDOFF]" not in result
@@ -229,11 +232,11 @@ async def test_generate_dm_response_handoff_marker_sets_context_state(db_session
     assert ig_context.handoff_at is not None
 
 
-async def test_generate_dm_response_handoff_only_marker_uses_fallback_text(db_session, ig_account, ig_context):
+async def test_generate_dm_response_handoff_only_marker_uses_fallback_text(db_session, ig_account, ig_customer, ig_context):
     service = _service_with_fake_client(reply_text="[HUMAN_HANDOFF]")
 
     result = await service.generate_dm_response(
-        "??", db=db_session, account=ig_account, context=ig_context, conversation_history=[]
+        "??", db=db_session, account=ig_account, customer=ig_customer, context=ig_context, conversation_history=[]
     )
 
     assert result
@@ -241,14 +244,14 @@ async def test_generate_dm_response_handoff_only_marker_uses_fallback_text(db_se
     assert ig_context.state == ConversationState.HUMAN_HANDOFF
 
 
-async def test_generate_dm_response_returns_none_on_client_exception(db_session, ig_account, ig_context):
+async def test_generate_dm_response_returns_none_on_client_exception(db_session, ig_account, ig_customer, ig_context):
     async def handler(**kwargs):
         raise RuntimeError("API down")
 
     service = _service_with_fake_client(handler=handler)
 
     result = await service.generate_dm_response(
-        "how much?", db=db_session, account=ig_account, context=ig_context, conversation_history=[]
+        "how much?", db=db_session, account=ig_account, customer=ig_customer, context=ig_context, conversation_history=[]
     )
 
     assert result is None
@@ -259,7 +262,7 @@ async def test_generate_dm_response_returns_none_on_client_exception(db_session,
 
 @respx.mock
 async def test_agreement_with_phone_creates_instagram_order_and_dispatches(
-    db_session, ig_account, ig_context, shoes
+    db_session, ig_account, ig_customer, ig_context, shoes
 ):
     respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "tok-1"}))
     payment_route = respx.post(PAYMENT_URL).mock(
@@ -274,6 +277,7 @@ async def test_agreement_with_phone_creates_instagram_order_and_dispatches(
         "I'll take them, full payment, my number is 255711130099",
         db=db_session,
         account=ig_account,
+        customer=ig_customer,
         context=ig_context,
         conversation_history=[],
     )
@@ -299,8 +303,48 @@ async def test_agreement_with_phone_creates_instagram_order_and_dispatches(
 
 
 @respx.mock
+async def test_agreement_for_subscription_product_links_instagram_customer(
+    db_session, ig_account, ig_customer, ig_context
+):
+    subscription_product = Product(
+        slug="ig-taskflow-sub", name="Taskflow OS Subscription", max_price=100000, min_price=100000,
+        quantity=999999, merchant_id=ig_account.user_id, is_subscription=True,
+    )
+    db_session.add(subscription_product)
+    db_session.commit()
+
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "tok-1"}))
+    respx.post(PAYMENT_URL).mock(
+        return_value=httpx.Response(200, json={"statusCode": 202, "success": True, "transactionID": "MOCK_TXN_SUB_IG_1"})
+    )
+
+    service = _service_with_fake_client(
+        reply_text="Deal! [AGREEMENT_REACHED: product=Taskflow OS Subscription price=100000 payment=full phone=255711130093]"
+    )
+
+    await service.generate_dm_response(
+        "sign me up, 255711130093",
+        db=db_session,
+        account=ig_account,
+        customer=ig_customer,
+        context=ig_context,
+        conversation_history=[],
+    )
+
+    order = db_session.query(Order).filter(Order.agreed_price == 100000).first()
+    assert order is not None
+
+    from app.db.models import ProductSubscription, ProductSubscriptionStatus
+
+    subscription = db_session.query(ProductSubscription).filter(ProductSubscription.order_id == order.id).first()
+    assert subscription is not None
+    assert subscription.instagram_customer_id == ig_customer.id
+    assert subscription.status == ProductSubscriptionStatus.PENDING_PAYMENT
+
+
+@respx.mock
 async def test_agreement_installment_creates_instagram_order_and_installments(
-    db_session, ig_account, ig_context, shoes
+    db_session, ig_account, ig_customer, ig_context, shoes
 ):
     respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "tok-1"}))
     respx.post(INSTALLMENT_URL).mock(
@@ -325,6 +369,7 @@ async def test_agreement_installment_creates_instagram_order_and_installments(
         "installments please, 255711130098",
         db=db_session,
         account=ig_account,
+        customer=ig_customer,
         context=ig_context,
         conversation_history=[],
     )
@@ -340,13 +385,13 @@ async def test_agreement_installment_creates_instagram_order_and_installments(
     assert len(installments) == 2
 
 
-async def test_agreement_without_phone_is_ignored(db_session, ig_account, ig_context, shoes):
+async def test_agreement_without_phone_is_ignored(db_session, ig_account, ig_customer, ig_context, shoes):
     service = _service_with_fake_client(
         reply_text="Deal! [AGREEMENT_REACHED: product=Shoes price=45000 payment=full]"
     )
 
     result = await service.generate_dm_response(
-        "I'll take it", db=db_session, account=ig_account, context=ig_context, conversation_history=[]
+        "I'll take it", db=db_session, account=ig_account, customer=ig_customer, context=ig_context, conversation_history=[]
     )
 
     assert "AGREEMENT_REACHED" not in result
@@ -355,33 +400,33 @@ async def test_agreement_without_phone_is_ignored(db_session, ig_account, ig_con
     assert shoes.quantity == 3
 
 
-async def test_agreement_price_below_min_ignored(db_session, ig_account, ig_context, shoes):
+async def test_agreement_price_below_min_ignored(db_session, ig_account, ig_customer, ig_context, shoes):
     service = _service_with_fake_client(
         reply_text="Deal! [AGREEMENT_REACHED: product=Shoes price=1000 payment=full phone=255711130097]"
     )
 
     result = await service.generate_dm_response(
-        "1000 only", db=db_session, account=ig_account, context=ig_context, conversation_history=[]
+        "1000 only", db=db_session, account=ig_account, customer=ig_customer, context=ig_context, conversation_history=[]
     )
 
     assert "AGREEMENT_REACHED" not in result
     assert db_session.query(Order).count() == 0
 
 
-async def test_agreement_unknown_product_ignored(db_session, ig_account, ig_context, shoes):
+async def test_agreement_unknown_product_ignored(db_session, ig_account, ig_customer, ig_context, shoes):
     service = _service_with_fake_client(
         reply_text="Deal! [AGREEMENT_REACHED: product=Nonexistent price=45000 payment=full phone=255711130096]"
     )
 
     result = await service.generate_dm_response(
-        "sure", db=db_session, account=ig_account, context=ig_context, conversation_history=[]
+        "sure", db=db_session, account=ig_account, customer=ig_customer, context=ig_context, conversation_history=[]
     )
 
     assert "AGREEMENT_REACHED" not in result
     assert db_session.query(Order).count() == 0
 
 
-async def test_agreement_out_of_stock_ignored(db_session, ig_account, ig_context, shoes):
+async def test_agreement_out_of_stock_ignored(db_session, ig_account, ig_customer, ig_context, shoes):
     shoes.quantity = 0
     db_session.commit()
 
@@ -390,14 +435,14 @@ async def test_agreement_out_of_stock_ignored(db_session, ig_account, ig_context
     )
 
     result = await service.generate_dm_response(
-        "sure", db=db_session, account=ig_account, context=ig_context, conversation_history=[]
+        "sure", db=db_session, account=ig_account, customer=ig_customer, context=ig_context, conversation_history=[]
     )
 
     assert "AGREEMENT_REACHED" not in result
     assert db_session.query(Order).count() == 0
 
 
-async def test_agreement_close_deal_exception_does_not_lose_reply(db_session, ig_account, ig_context, shoes, monkeypatch):
+async def test_agreement_close_deal_exception_does_not_lose_reply(db_session, ig_account, ig_customer, ig_context, shoes, monkeypatch):
     service = _service_with_fake_client(
         reply_text="Deal! [AGREEMENT_REACHED: product=Shoes price=45000 payment=full phone=255711130094]"
     )
@@ -408,7 +453,7 @@ async def test_agreement_close_deal_exception_does_not_lose_reply(db_session, ig
     monkeypatch.setattr(service, "_close_instagram_deal", raising_close)
 
     result = await service.generate_dm_response(
-        "sure", db=db_session, account=ig_account, context=ig_context, conversation_history=[]
+        "sure", db=db_session, account=ig_account, customer=ig_customer, context=ig_context, conversation_history=[]
     )
 
     assert result == "Deal!"

@@ -13,6 +13,8 @@ from app.db.models import (
     Order,
     OrderStatus,
     Product,
+    ProductSubscription,
+    ProductSubscriptionStatus,
     User,
     WhatsAppAccount,
 )
@@ -480,3 +482,184 @@ def test_duplicate_transaction_id_ignored_after_processed(client, db_session, or
 
     assert resp.status_code == 200
     assert resp.json() == {"status": "ignored", "reason": "Already processed"}
+
+
+# --- ProductSubscription: first payment (order-<id> reference) --------------
+
+
+@pytest.fixture
+def subscription_product(db_session, owner):
+    p = Product(
+        slug="tunzaa-sub", name="Taskflow OS Subscription", max_price=100000, min_price=100000,
+        quantity=999999, merchant_id=owner.id, is_subscription=True,
+    )
+    db_session.add(p)
+    db_session.commit()
+    db_session.refresh(p)
+    return p
+
+
+@pytest.fixture
+def subscription_order(db_session, customer, account, subscription_product):
+    o = Order(
+        customer_id=customer.id, account_id=account.id, product_id=subscription_product.id,
+        quantity=1, agreed_price=100000, status=OrderStatus.PENDING,
+    )
+    db_session.add(o)
+    db_session.commit()
+    db_session.refresh(o)
+    return o
+
+
+@pytest.fixture
+def pending_subscription(db_session, subscription_order, customer):
+    sub = ProductSubscription(
+        order_id=subscription_order.id, customer_id=customer.id, product_id=subscription_order.product_id,
+        monthly_amount=100000,
+    )
+    db_session.add(sub)
+    db_session.commit()
+    db_session.refresh(sub)
+    return sub
+
+
+def test_first_payment_completed_activates_linked_subscription(
+    client, db_session, subscription_order, pending_subscription, monkeypatch
+):
+    _mock_send_text(monkeypatch)
+
+    resp = _post(
+        client, {"status": "COMPLETED", "reference_id": f"order-{subscription_order.id}", "transaction_id": "T-SUB-1"}
+    )
+
+    assert resp.status_code == 200
+    db_session.refresh(pending_subscription)
+    assert pending_subscription.status == ProductSubscriptionStatus.ACTIVE
+    assert pending_subscription.next_billing_at is not None
+
+
+def test_first_payment_failed_marks_subscription_payment_failed(
+    client, db_session, subscription_order, pending_subscription, monkeypatch
+):
+    _mock_send_text(monkeypatch)
+
+    resp = _post(client, {"status": "FAILED", "reference_id": f"order-{subscription_order.id}"})
+
+    assert resp.status_code == 200
+    db_session.refresh(pending_subscription)
+    assert pending_subscription.status == ProductSubscriptionStatus.PAYMENT_FAILED
+
+
+def test_completed_order_with_no_linked_subscription_is_unaffected(client, db_session, order, monkeypatch):
+    """A regular (non-subscription) order's COMPLETED callback shouldn't
+    error out just because _activate_subscription_if_linked runs for every
+    order now."""
+    _mock_send_text(monkeypatch)
+
+    resp = _post(client, {"status": "COMPLETED", "reference_id": f"order-{order.id}", "transaction_id": "T-REG-1"})
+
+    assert resp.status_code == 200
+    assert db_session.query(ProductSubscription).count() == 0
+
+
+# --- ProductSubscription: renewals (product-subscription-renewal-<id>) ------
+
+
+def test_renewal_reference_for_unknown_subscription_is_ignored(client):
+    resp = _post(client, {"status": "COMPLETED", "reference_id": "product-subscription-renewal-999999"})
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ignored", "reason": "Subscription not found"}
+
+
+def test_renewal_completed_reactivates_subscription(client, db_session, subscription_order, customer):
+    sub = ProductSubscription(
+        order_id=subscription_order.id, customer_id=customer.id, product_id=subscription_order.product_id,
+        status=ProductSubscriptionStatus.PAST_DUE, monthly_amount=100000, retry_count=2,
+    )
+    db_session.add(sub)
+    db_session.commit()
+    db_session.refresh(sub)
+
+    resp = _post(
+        client,
+        {"status": "COMPLETED", "reference_id": f"product-subscription-renewal-{sub.id}", "transaction_id": "T-REN-1"},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "success"
+    db_session.refresh(sub)
+    assert sub.status == ProductSubscriptionStatus.ACTIVE
+    assert sub.retry_count == 0
+    assert sub.tunzaa_transaction_id == "T-REN-1"
+
+
+def test_renewal_failed_moves_to_past_due_and_notifies_customer(
+    client, db_session, subscription_order, customer, monkeypatch
+):
+    _mock_send_text(monkeypatch)
+    sub = ProductSubscription(
+        order_id=subscription_order.id, customer_id=customer.id, product_id=subscription_order.product_id,
+        status=ProductSubscriptionStatus.ACTIVE, monthly_amount=100000, retry_count=0,
+    )
+    db_session.add(sub)
+    db_session.commit()
+    db_session.refresh(sub)
+
+    resp = _post(
+        client, {"status": "FAILED", "reference_id": f"product-subscription-renewal-{sub.id}", "transaction_id": "T-REN-2"}
+    )
+
+    assert resp.status_code == 200
+    db_session.refresh(sub)
+    assert sub.status == ProductSubscriptionStatus.PAST_DUE
+    assert sub.retry_count == 1
+
+
+def test_renewal_failed_cancels_after_max_retries(
+    client, db_session, subscription_order, customer, monkeypatch
+):
+    from app.services import product_subscription as product_subscription_service
+
+    _mock_send_text(monkeypatch)
+    sub = ProductSubscription(
+        order_id=subscription_order.id, customer_id=customer.id, product_id=subscription_order.product_id,
+        status=ProductSubscriptionStatus.PAST_DUE, monthly_amount=100000,
+        retry_count=product_subscription_service.MAX_RENEWAL_RETRIES,
+    )
+    db_session.add(sub)
+    db_session.commit()
+    db_session.refresh(sub)
+
+    resp = _post(
+        client, {"status": "FAILED", "reference_id": f"product-subscription-renewal-{sub.id}", "transaction_id": "T-REN-3"}
+    )
+
+    assert resp.status_code == 200
+    db_session.refresh(sub)
+    assert sub.status == ProductSubscriptionStatus.CANCELLED
+
+
+def test_renewal_duplicate_transaction_id_ignored(client, db_session, subscription_order, customer):
+    sub = ProductSubscription(
+        order_id=subscription_order.id, customer_id=customer.id, product_id=subscription_order.product_id,
+        status=ProductSubscriptionStatus.ACTIVE, monthly_amount=100000, tunzaa_transaction_id="T-REN-4",
+    )
+    db_session.add(sub)
+    db_session.commit()
+    db_session.refresh(sub)
+
+    resp = _post(
+        client, {"status": "COMPLETED", "reference_id": f"product-subscription-renewal-{sub.id}", "transaction_id": "T-REN-4"}
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ignored", "reason": "Already processed"}
+
+
+def test_renewal_malformed_reference_is_ignored(client):
+    resp = _post(client, {"status": "COMPLETED", "reference_id": "product-subscription-renewal-not-a-number"})
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ignored", "reason": "Malformed reference_id"}

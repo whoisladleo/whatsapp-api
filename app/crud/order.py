@@ -29,6 +29,9 @@ def _to_order_read(order: Order) -> OrderRead:
         customer_phone=order.customer.phone_number if order.customer else None,
         reserved_until=order.reserved_until,
         created_at=order.created_at,
+        subscription_status=order.subscription.status if order.subscription else None,
+        subscription_next_billing_at=order.subscription.next_billing_at if order.subscription else None,
+        subscription_retry_count=order.subscription.retry_count if order.subscription else None,
     )
 
 
