@@ -102,6 +102,25 @@ def test_allowed_fail_open_when_configured_product_missing(db_session, merchant,
     assert subscription_access.is_merchant_allowed_ai(db_session, merchant) is True
 
 
+def test_allowed_when_merchant_is_the_platform_product_seller(db_session, platform_owner, platform_product):
+    """
+    The merchant who sells the platform subscription product (Taskflow
+    itself) can never have a subscription to it, and must never be gated by
+    it — this is the account that most needs to keep responding, since it's
+    the one pitching new merchants. No ProductSubscription row exists here
+    at all, which would otherwise deny.
+    """
+    assert subscription_access.is_merchant_allowed_ai(db_session, platform_owner) is True
+
+
+def test_platform_product_seller_exemption_does_not_apply_to_other_merchants(
+    db_session, merchant, platform_product
+):
+    """Sanity check the exemption is scoped to product.merchant_id, not a
+    blanket bypass — an unrelated merchant is still gated normally."""
+    assert subscription_access.is_merchant_allowed_ai(db_session, merchant) is False
+
+
 def test_denied_when_no_customer_match_at_all(db_session, merchant, platform_product):
     assert subscription_access.is_merchant_allowed_ai(db_session, merchant) is False
 

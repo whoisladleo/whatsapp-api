@@ -164,7 +164,33 @@ def test_charge_renewal_logs_and_swallows_payment_push_failure(db_session, order
 
 
 @pytest.fixture
-def self_paying_merchant_order(db_session, owner, account, product):
+def platform_seller(db_session):
+    """The merchant who *sells* the platform subscription product — deliberately
+    NOT `owner`, since a product's own seller is unconditionally exempt from
+    being gated by it (see subscription_access.is_merchant_allowed_ai), which
+    would make self_paying_merchant_order's whole premise impossible if this
+    were the same user as the gated merchant/account under test."""
+    user = User(username="255700000901")
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+    return user
+
+
+@pytest.fixture
+def platform_product(db_session, platform_seller):
+    p = Product(
+        slug="sub-product", name="Taskflow OS Subscription", max_price=100000, min_price=100000,
+        quantity=999999, merchant_id=platform_seller.id, is_subscription=True,
+    )
+    db_session.add(p)
+    db_session.commit()
+    db_session.refresh(p)
+    return p
+
+
+@pytest.fixture
+def self_paying_merchant_order(db_session, owner, account, platform_product):
     """The gated merchant IS the customer here — a Customer row whose phone
     matches `owner.username`, simulating a merchant who bought their own
     platform subscription with their login phone number."""
@@ -174,7 +200,7 @@ def self_paying_merchant_order(db_session, owner, account, product):
     db_session.refresh(customer)
 
     o = Order(
-        customer_id=customer.id, product_id=product.id, account_id=account.id,
+        customer_id=customer.id, product_id=platform_product.id, account_id=account.id,
         quantity=1, agreed_price=100000, payment_type=PaymentType.FULL, status=OrderStatus.PAID,
     )
     db_session.add(o)

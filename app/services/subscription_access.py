@@ -72,12 +72,23 @@ def is_merchant_allowed_ai(db: Session, user: User) -> bool:
     if not settings.PLATFORM_SUBSCRIPTION_PRODUCT_SLUG:
         return True
 
-    if not get_platform_subscription_product(db):
+    product = get_platform_subscription_product(db)
+    if not product:
         logger.error(
             "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG is set but no matching Product "
             "exists; failing open (not gating anyone) rather than locking out "
             "every merchant over a config error."
         )
+        return True
+
+    # The merchant who *sells* the platform subscription product can't also
+    # be gated by it — there's no one for Taskflow's own account(s) to
+    # subscribe to, and this is exactly the account that most needs to keep
+    # responding (it's the one pitching new merchants). Exempts every
+    # account this merchant owns, the same way llm.py's is_platform_account
+    # check exempts the WhatsApp "taskflow" account from being negotiated
+    # with as a customer.
+    if product.merchant_id == user.id:
         return True
 
     subscription = find_platform_subscription(db, user)
