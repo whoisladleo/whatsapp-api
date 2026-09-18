@@ -264,6 +264,20 @@ class LLMService:
     ) -> str:
         from app.services.tunzaa import tunzaa_service
 
+        # WhatsApp's location-sharing feature has no Instagram equivalent we
+        # actually process — InstagramWebhookParser.parse_inbound_messages
+        # only ever extracts message.text, there's no location-message
+        # handling for that channel at all (unlike WhatsApp's
+        # capture_customer_location task). Telling an Instagram customer to
+        # use a feature we can't read would be actively misleading, so this
+        # asks for a plain text address there instead.
+        location_note = (
+            "reply here with your delivery address so we know where to deliver it."
+            if order.instagram_account_id
+            else "share your delivery location using WhatsApp's location-sharing feature (the 📎 "
+            "attach icon) so we know where to deliver it."
+        )
+
         try:
             if payment_type == PaymentType.FULL:
                 resp = await tunzaa_service.initiate_payment(
@@ -273,9 +287,7 @@ class LLMService:
                 db.commit()
                 return (
                     f"A payment request for TZS {order.agreed_price:,.0f} has been sent to your "
-                    "phone — please approve it to complete your order. While you're at it, please "
-                    "share your delivery location using WhatsApp's location-sharing feature (the 📎 "
-                    "attach icon) so we know where to deliver it."
+                    f"phone — please approve it to complete your order. While you're at it, please {location_note}"
                 )
             else:
                 resp = await tunzaa_service.create_installment_plan(order, product.name)
@@ -297,8 +309,7 @@ class LLMService:
                 db.commit()
                 return (
                     "Your installment plan has been created! We'll be in touch with payment "
-                    "details. Please also share your delivery location using WhatsApp's "
-                    "location-sharing feature (the 📎 attach icon) so we know where to deliver it."
+                    f"details. Please also {location_note}"
                 )
         except Exception as e:
             logger.error(f"Tunzaa dispatch failed for order {order.id}: {e}")

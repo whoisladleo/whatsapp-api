@@ -707,6 +707,10 @@ async def test_agreement_full_payment_creates_order_and_dispatches(db_session, s
     assert "AGREEMENT_REACHED" not in result
     assert "sent to your phone" in result
     assert "location" in result.lower()
+    # WhatsApp orders should reference WhatsApp's own location-sharing
+    # feature — see the Instagram-side regression test in
+    # test_llm_dm_response.py for why this can't be generic/hardcoded.
+    assert "WhatsApp's location-sharing feature" in result
 
     order = db_session.query(Order).filter(Order.agreed_price == 45000).first()
     assert order is not None

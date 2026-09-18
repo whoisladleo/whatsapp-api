@@ -285,6 +285,12 @@ async def test_agreement_with_phone_creates_instagram_order_and_dispatches(
     assert "AGREEMENT_REACHED" not in result
     assert "sent to your phone" in result
     assert payment_route.called
+    # Regression: this used to unconditionally tell the customer to use
+    # "WhatsApp's location-sharing feature" even over an Instagram DM —
+    # misleading, since that channel has no equivalent we actually process
+    # (InstagramWebhookParser never extracts a location, only message.text).
+    assert "WhatsApp" not in result
+    assert "delivery address" in result
 
     order = db_session.query(Order).filter(Order.agreed_price == 45000).first()
     assert order is not None
