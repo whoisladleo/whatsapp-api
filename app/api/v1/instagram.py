@@ -55,6 +55,28 @@ async def get_instagram_account(
 OAUTH_STATE_EXPIRE_MINUTES = 10
 
 
+async def _fetch_instagram_display_name(account: InstagramAccount, igsid: str) -> Optional[str]:
+    """
+    Best-effort lookup for a DM sender's real name, since the messaging
+    webhook only ever gives us their IGSID (see
+    InstagramWebhookParser.parse_inbound_messages) — unlike the comments
+    webhook, which includes from.username directly. Failures (network,
+    permission, deactivated account, etc.) are swallowed: worst case the
+    customer keeps showing as "Instagram user" in the dashboard, same as
+    today, rather than breaking DM processing over a cosmetic lookup.
+    """
+    provider = InstagramProvider(account.access_token)
+    try:
+        profile = await provider.get_user_profile(igsid)
+    except Exception as e:
+        print(f"Failed to fetch Instagram profile for {igsid}: {e}")
+        return None
+    if "error" in profile:
+        print(f"Instagram profile lookup for {igsid} returned an error: {profile}")
+        return None
+    return profile.get("username") or profile.get("name")
+
+
 @router.get("/webhook")
 async def verify_webhook(
     hub_mode: str = Query(None, alias="hub.mode"),
@@ -132,6 +154,12 @@ async def handle_webhook(
         customer = crud_instagram.get_or_create_customer(
             db, account.id, item["sender_id"]
         )
+        if not customer.username:
+            fetched_username = await _fetch_instagram_display_name(account, item["sender_id"])
+            if fetched_username:
+                customer = crud_instagram.get_or_create_customer(
+                    db, account.id, item["sender_id"], username=fetched_username
+                )
         dm = crud_instagram.create_direct_message(
             db,
             account_id=account.id,

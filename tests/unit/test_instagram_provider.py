@@ -8,6 +8,7 @@ from app.core.instagram_provider import InstagramProvider
 
 REPLIES_URL_RE = r"https://graph\.instagram\.com/.+/replies$"
 MESSAGES_URL_RE = r"https://graph\.instagram\.com/.+/messages$"
+PROFILE_URL_RE = r"https://graph\.instagram\.com/.+/igsid_1"
 
 
 @pytest.fixture
@@ -74,3 +75,29 @@ async def test_send_direct_message_payload(provider):
     assert result["message_id"] == "msg_2"
     request_url = str(route.calls.last.request.url)
     assert request_url.endswith("/ig_business_1/messages")
+
+
+@respx.mock
+async def test_get_user_profile_returns_name_and_username(provider):
+    route = respx.get(url__regex=PROFILE_URL_RE).mock(
+        return_value=httpx.Response(200, json={"id": "igsid_1", "name": "Jane Doe", "username": "janedoe"})
+    )
+
+    result = await provider.get_user_profile("igsid_1")
+
+    assert route.called
+    assert result["username"] == "janedoe"
+    assert result["name"] == "Jane Doe"
+    assert route.calls.last.request.url.params["fields"] == "name,username"
+    assert route.calls.last.request.headers["Authorization"] == "Bearer ig-tok"
+
+
+@respx.mock
+async def test_get_user_profile_returns_error_payload_as_is(provider):
+    respx.get(url__regex=PROFILE_URL_RE).mock(
+        return_value=httpx.Response(400, json={"error": {"message": "Unsupported request"}})
+    )
+
+    result = await provider.get_user_profile("igsid_1")
+
+    assert "error" in result

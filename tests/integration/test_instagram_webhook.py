@@ -2,7 +2,9 @@ import hashlib
 import hmac
 import json
 
+import httpx
 import pytest
+import respx
 
 from app.core.config import settings
 from app.core.security import verify_meta_signature
@@ -53,6 +55,13 @@ def _dm_payload(ig_business_id: str, ig_message_id: str, text: str = "is it stil
             }
         ]
     }
+
+
+async def _no_display_name(account, igsid):
+    """Stub for app.api.v1.instagram._fetch_instagram_display_name — used by
+    tests that aren't exercising the display-name lookup itself, so they
+    don't make a real outbound HTTP call."""
+    return None
 
 
 @pytest.fixture
@@ -261,7 +270,7 @@ def test_unknown_ig_business_id_ignored_for_dm(client, db_session):
 
 
 def test_known_account_ai_enabled_stores_dm_and_dispatches_task(
-    client, db_session, merchant_owner
+    client, db_session, merchant_owner, monkeypatch
 ):
     account = InstagramAccount(
         ig_business_id="ig_business_dm_1",
@@ -272,6 +281,11 @@ def test_known_account_ai_enabled_stores_dm_and_dispatches_task(
     db_session.add(account)
     db_session.commit()
     db_session.refresh(account)
+
+    # Not under test here — see test_new_dm_customer_gets_display_name_backfilled
+    # and test_display_name_lookup_failure_does_not_block_dm_processing below.
+    import app.api.v1.instagram as instagram_router
+    monkeypatch.setattr(instagram_router, "_fetch_instagram_display_name", _no_display_name)
 
     import app.tasks.instagram_dm_processing as task_module
 
@@ -305,7 +319,7 @@ def test_known_account_ai_enabled_stores_dm_and_dispatches_task(
 
 
 def test_known_account_ai_disabled_stores_dm_without_dispatch(
-    client, db_session, merchant_owner
+    client, db_session, merchant_owner, monkeypatch
 ):
     account = InstagramAccount(
         ig_business_id="ig_business_dm_2",
@@ -315,6 +329,9 @@ def test_known_account_ai_disabled_stores_dm_without_dispatch(
     )
     db_session.add(account)
     db_session.commit()
+
+    import app.api.v1.instagram as instagram_router
+    monkeypatch.setattr(instagram_router, "_fetch_instagram_display_name", _no_display_name)
 
     import app.tasks.instagram_dm_processing as task_module
 
@@ -335,7 +352,7 @@ def test_known_account_ai_disabled_stores_dm_without_dispatch(
 
 
 def test_duplicate_delivery_of_same_dm_id_is_not_reprocessed(
-    client, db_session, merchant_owner
+    client, db_session, merchant_owner, monkeypatch
 ):
     account = InstagramAccount(
         ig_business_id="ig_business_dm_3",
@@ -345,6 +362,9 @@ def test_duplicate_delivery_of_same_dm_id_is_not_reprocessed(
     )
     db_session.add(account)
     db_session.commit()
+
+    import app.api.v1.instagram as instagram_router
+    monkeypatch.setattr(instagram_router, "_fetch_instagram_display_name", _no_display_name)
 
     import app.tasks.instagram_dm_processing as task_module
 
@@ -364,3 +384,72 @@ def test_duplicate_delivery_of_same_dm_id_is_not_reprocessed(
         InstagramDirectMessage.ig_message_id == "mid_dupe"
     ).count() == 1
     assert len(calls) == 1
+
+
+# --- display-name backfill for new DM customers -----------------------------
+
+
+@respx.mock
+def test_new_dm_customer_gets_display_name_backfilled(client, db_session, merchant_owner, monkeypatch):
+    """
+    The messaging webhook only ever gives us the sender's IGSID (see
+    _dm_payload) — unlike the comments webhook, which includes from.username
+    directly — so a brand-new InstagramCustomer is looked up via the Graph
+    API and given a real display name instead of staying "Instagram user"
+    in the dashboard forever.
+    """
+    account = InstagramAccount(
+        ig_business_id="ig_business_dm_4",
+        access_token="ig-tok",
+        ai_enabled=False,  # keep this test focused; dispatch is covered elsewhere
+        user_id=merchant_owner.id,
+    )
+    db_session.add(account)
+    db_session.commit()
+
+    respx.get(url__regex=r"https://graph\.instagram\.com/.+/igsid_dm_1").mock(
+        return_value=httpx.Response(200, json={"id": "igsid_dm_1", "name": "Jane Doe", "username": "janedoe"})
+    )
+
+    payload = _dm_payload("ig_business_dm_4", "mid_name_1")
+    resp = client.post(WEBHOOK_URL, json=payload)
+
+    assert resp.status_code == 200
+    customer = db_session.query(InstagramCustomer).filter(
+        InstagramCustomer.ig_scoped_id == "igsid_dm_1"
+    ).first()
+    assert customer is not None
+    assert customer.username == "janedoe"
+
+
+@respx.mock
+def test_display_name_lookup_failure_does_not_block_dm_processing(client, db_session, merchant_owner):
+    """A failed/errored profile lookup must not stop the DM itself from
+    being stored — worst case the customer just keeps showing as
+    "Instagram user" in the dashboard."""
+    account = InstagramAccount(
+        ig_business_id="ig_business_dm_5",
+        access_token="ig-tok",
+        ai_enabled=False,
+        user_id=merchant_owner.id,
+    )
+    db_session.add(account)
+    db_session.commit()
+
+    respx.get(url__regex=r"https://graph\.instagram\.com/.+/igsid_dm_1").mock(
+        return_value=httpx.Response(400, json={"error": {"message": "Unsupported request"}})
+    )
+
+    payload = _dm_payload("ig_business_dm_5", "mid_name_2")
+    resp = client.post(WEBHOOK_URL, json=payload)
+
+    assert resp.status_code == 200
+    dm = db_session.query(InstagramDirectMessage).filter(
+        InstagramDirectMessage.ig_message_id == "mid_name_2"
+    ).first()
+    assert dm is not None
+    customer = db_session.query(InstagramCustomer).filter(
+        InstagramCustomer.ig_scoped_id == "igsid_dm_1"
+    ).first()
+    assert customer is not None
+    assert customer.username is None

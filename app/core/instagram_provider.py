@@ -54,3 +54,17 @@ class InstagramProvider:
         async with httpx.AsyncClient() as client:
             response = await client.post(url, json=payload, headers=self.headers)
             return response.json()
+
+    async def get_user_profile(self, igsid: str) -> Dict[str, Any]:
+        """
+        Looks up a DM sender's profile by IGSID. Meta's messaging webhook
+        only ever gives us the sender's id (see
+        InstagramWebhookParser.parse_inbound_messages) — unlike the comments
+        webhook, which includes from.username directly — so this is the only
+        way to get a real display name for a DM-only InstagramCustomer.
+        """
+        url = f"{self.base_url}/{igsid}"
+        params = {"fields": "name,username"}
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, params=params, headers=self.headers)
+            return response.json()
