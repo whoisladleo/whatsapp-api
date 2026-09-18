@@ -500,6 +500,40 @@ def test_pay_now_creates_order_and_pending_subscription(client, auth_user, db_se
 
 
 @respx.mock
+def test_pay_now_called_twice_reuses_pending_subscription_row(client, auth_user, db_session, monkeypatch):
+    """
+    Regression test: clicking Pay Now more than once before the first
+    payment ever confirms (abandoned Tunzaa prompt, page refresh, etc.)
+    must not accumulate one orphaned PENDING_PAYMENT ProductSubscription
+    row per click — see product_subscription.get_or_create_pending_subscription.
+    """
+    from app.db.models import Order, ProductSubscription
+
+    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", PLATFORM_SLUG)
+    _seed_platform_product(db_session)
+    _, headers = auth_user
+
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "tok-1"}))
+    respx.post(PAYMENT_URL).mock(
+        return_value=httpx.Response(200, json={"statusCode": 202, "success": True, "transactionID": "MOCK_TXN_PAYNOW_DUP"})
+    )
+
+    first = client.post("/api/v1/auth/me/subscription/pay", json={}, headers=headers)
+    second = client.post("/api/v1/auth/me/subscription/pay", json={}, headers=headers)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["order_id"] != second.json()["order_id"]
+
+    orders = db_session.query(Order).filter(Order.id.in_([first.json()["order_id"], second.json()["order_id"]])).all()
+    assert len(orders) == 2
+
+    subscriptions = db_session.query(ProductSubscription).all()
+    assert len(subscriptions) == 1
+    assert subscriptions[0].order_id == second.json()["order_id"]
+
+
+@respx.mock
 def test_pay_now_releases_reservation_on_dispatch_failure(client, auth_user, db_session, monkeypatch):
     from app.db.models import Order, OrderStatus
 

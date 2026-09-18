@@ -4,7 +4,7 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
-from app.db.models import Product, ProductSubscription, ProductSubscriptionStatus, User
+from app.db.models import Order, Product, ProductSubscription, ProductSubscriptionStatus, User
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +13,56 @@ RENEWAL_PERIOD_DAYS = 30
 # "10 retries over 2 weeks" policy (14 days / 10 is an ugly 33.6h).
 RENEWAL_RETRY_DELAY_SECONDS = 36 * 60 * 60
 MAX_RENEWAL_RETRIES = 10
+
+
+def get_or_create_pending_subscription(
+    db: Session,
+    order: Order,
+    product: Product,
+    customer_id: int,
+    instagram_customer_id: Optional[int] = None,
+) -> ProductSubscription:
+    """
+    Called wherever a subscription-product deal closes (LLMService._create_subscription_if_needed,
+    self_service_billing.pay_now) — reuses an existing PENDING_PAYMENT
+    subscription for this exact customer+product instead of inserting a new
+    row every time. Without this, a customer who retries before their
+    first payment ever confirms (abandoned Tunzaa prompt, repeated "Pay
+    Now" clicks, re-negotiating in a later chat) accumulates one orphaned
+    PENDING_PAYMENT row per attempt — none of which ever resolve, since
+    only the newest one is ever checked (find_platform_subscription orders
+    by created_at desc) or paid against, and all of them skew any
+    reporting/counting done against this table. Re-pointing the existing
+    row at the new Order is correct here: the old order is abandoned (never
+    paid), so nothing else still depends on that order_id.
+    """
+    existing = (
+        db.query(ProductSubscription)
+        .filter(
+            ProductSubscription.customer_id == customer_id,
+            ProductSubscription.product_id == product.id,
+            ProductSubscription.status == ProductSubscriptionStatus.PENDING_PAYMENT,
+        )
+        .first()
+    )
+    if existing:
+        existing.order_id = order.id
+        existing.monthly_amount = order.agreed_price
+        if instagram_customer_id:
+            existing.instagram_customer_id = instagram_customer_id
+        db.commit()
+        return existing
+
+    subscription = ProductSubscription(
+        order_id=order.id,
+        customer_id=customer_id,
+        product_id=product.id,
+        instagram_customer_id=instagram_customer_id,
+        monthly_amount=order.agreed_price,
+    )
+    db.add(subscription)
+    db.commit()
+    return subscription
 
 
 def _resolve_merchant_for_platform_subscription(db: Session, subscription: ProductSubscription) -> Optional[User]:

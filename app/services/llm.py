@@ -21,7 +21,6 @@ from app.db.models import (
     OrderStatus,
     PaymentType,
     Product,
-    ProductSubscription,
     WhatsAppAccount,
     Message,
     User,
@@ -236,8 +235,9 @@ class LLMService:
         instagram_customer: Optional[InstagramCustomer] = None,
     ) -> None:
         """
-        For a Product with is_subscription=True, creates the
-        ProductSubscription that turns this order's first charge into
+        For a Product with is_subscription=True, creates (or reuses an
+        existing unpaid one — see product_subscription.get_or_create_pending_subscription)
+        the ProductSubscription that turns this order's first charge into
         recurring billing (see app/services/product_subscription.py). The
         first charge itself still rides the normal one-time
         Order/_dispatch_payment flow below; app/api/v1/tunzaa_webhook.py
@@ -249,15 +249,12 @@ class LLMService:
         if not product.is_subscription:
             return
 
-        subscription = ProductSubscription(
-            order_id=order.id,
-            customer_id=customer.id,
-            product_id=product.id,
+        from app.services import product_subscription
+
+        product_subscription.get_or_create_pending_subscription(
+            db, order, product, customer.id,
             instagram_customer_id=instagram_customer.id if instagram_customer else None,
-            monthly_amount=order.agreed_price,
         )
-        db.add(subscription)
-        db.commit()
 
     async def _dispatch_payment(
         self, db: Session, order: Order, product: Product, phone: str, payment_type: PaymentType

@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.security import normalize_phone
 from app.db.models import Customer, Order, OrderStatus, PaymentType, Product, ProductSubscription, User
+from app.services import product_subscription
 from app.services.subscription_access import get_platform_subscription_product
 
 logger = logging.getLogger(__name__)
@@ -90,12 +91,10 @@ async def pay_now(db: Session, user: User, phone_number: Optional[str]) -> dict:
     db.commit()
     db.refresh(order)
 
-    db.add(
-        ProductSubscription(
-            order_id=order.id, customer_id=customer.id, product_id=product.id, monthly_amount=price,
-        )
-    )
-    db.commit()
+    # Reuses an existing unpaid attempt for this customer+product rather
+    # than inserting a new row every time Pay Now is clicked — see
+    # product_subscription.get_or_create_pending_subscription.
+    product_subscription.get_or_create_pending_subscription(db, order, product, customer.id)
 
     try:
         resp = await tunzaa_service.initiate_payment(

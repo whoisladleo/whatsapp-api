@@ -772,6 +772,52 @@ async def test_agreement_for_subscription_product_creates_product_subscription(d
 
 
 @respx.mock
+async def test_repeated_subscription_agreement_reuses_pending_subscription_row(db_session, shop_account, merchant):
+    """
+    Regression test: a customer who negotiates a subscription product twice
+    before ever completing payment (e.g. abandons the first Tunzaa prompt
+    and starts over) must not end up with two orphaned PENDING_PAYMENT
+    ProductSubscription rows for the same customer+product — see
+    product_subscription.get_or_create_pending_subscription.
+    """
+    subscription_product = Product(
+        slug="taskflow-sub-2", name="Taskflow OS Subscription", max_price=100000, min_price=100000,
+        quantity=999999, merchant_id=merchant.id, is_subscription=True,
+    )
+    db_session.add(subscription_product)
+    db_session.commit()
+
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "tok-1"}))
+    respx.post(PAYMENT_URL).mock(
+        return_value=httpx.Response(200, json={"statusCode": 202, "success": True, "transactionID": "MOCK_TXN_SUB_2"})
+    )
+
+    async def handler(**kwargs):
+        return _FakeResponse(
+            "Deal! [AGREEMENT_REACHED: product=Taskflow OS Subscription price=100000 payment=full]"
+        )
+
+    service = _service_with_fake_client(handler=handler)
+
+    for _ in range(2):
+        await service.generate_response(
+            message_body="sign me up",
+            from_phone="255711130060",
+            db=db_session,
+            account=shop_account,
+        )
+
+    orders = db_session.query(Order).filter(Order.agreed_price == 100000, Order.product_id == subscription_product.id).all()
+    assert len(orders) == 2
+
+    subscriptions = (
+        db_session.query(ProductSubscription).filter(ProductSubscription.product_id == subscription_product.id).all()
+    )
+    assert len(subscriptions) == 1
+    assert subscriptions[0].order_id == orders[-1].id
+
+
+@respx.mock
 async def test_agreement_for_regular_product_does_not_create_product_subscription(db_session, shop_account, shoes):
     respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "tok-1"}))
     respx.post(PAYMENT_URL).mock(

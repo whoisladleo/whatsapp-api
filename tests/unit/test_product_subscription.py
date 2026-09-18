@@ -285,3 +285,112 @@ async def test_renewal_pending_status_is_ignored(db_session, whatsapp_order, cus
 
     assert sub.status == ProductSubscriptionStatus.ACTIVE
     assert calls == []
+
+
+# --- get_or_create_pending_subscription ----------------------------------------
+
+
+def test_get_or_create_pending_subscription_creates_when_none_exists(
+    db_session, whatsapp_order, product, customer
+):
+    sub = product_subscription.get_or_create_pending_subscription(
+        db_session, whatsapp_order, product, customer.id
+    )
+
+    assert sub.order_id == whatsapp_order.id
+    assert sub.customer_id == customer.id
+    assert sub.product_id == product.id
+    assert sub.status == ProductSubscriptionStatus.PENDING_PAYMENT
+    assert db_session.query(ProductSubscription).count() == 1
+
+
+def test_get_or_create_pending_subscription_reuses_existing_pending_row(
+    db_session, whatsapp_account, product, customer
+):
+    """
+    The exact bug this fixes: a customer retrying before their first
+    payment ever confirms (abandoned Tunzaa prompt, repeated Pay Now
+    clicks, re-negotiating a later chat) must not accumulate one orphaned
+    PENDING_PAYMENT row per attempt.
+    """
+    first_order = Order(
+        customer_id=customer.id, product_id=product.id, account_id=whatsapp_account.id,
+        quantity=1, agreed_price=100000, payment_type=PaymentType.FULL, status=OrderStatus.PENDING,
+    )
+    db_session.add(first_order)
+    db_session.commit()
+    db_session.refresh(first_order)
+    first_sub = product_subscription.get_or_create_pending_subscription(
+        db_session, first_order, product, customer.id
+    )
+
+    second_order = Order(
+        customer_id=customer.id, product_id=product.id, account_id=whatsapp_account.id,
+        quantity=1, agreed_price=100000, payment_type=PaymentType.FULL, status=OrderStatus.PENDING,
+    )
+    db_session.add(second_order)
+    db_session.commit()
+    db_session.refresh(second_order)
+    second_sub = product_subscription.get_or_create_pending_subscription(
+        db_session, second_order, product, customer.id
+    )
+
+    assert second_sub.id == first_sub.id
+    assert second_sub.order_id == second_order.id
+    assert db_session.query(ProductSubscription).count() == 1
+
+
+def test_get_or_create_pending_subscription_does_not_reuse_active_row(
+    db_session, whatsapp_order, product, customer
+):
+    """An ACTIVE/PAST_DUE/CANCELLED/PAYMENT_FAILED subscription is real
+    billing history, not an abandoned attempt — only PENDING_PAYMENT gets
+    deduped."""
+    db_session.add(
+        ProductSubscription(
+            order_id=whatsapp_order.id, customer_id=customer.id, product_id=product.id,
+            status=ProductSubscriptionStatus.ACTIVE, monthly_amount=100000,
+        )
+    )
+    db_session.commit()
+
+    new_order = Order(
+        customer_id=customer.id, product_id=product.id,
+        quantity=1, agreed_price=100000, payment_type=PaymentType.FULL, status=OrderStatus.PENDING,
+    )
+    db_session.add(new_order)
+    db_session.commit()
+    db_session.refresh(new_order)
+
+    sub = product_subscription.get_or_create_pending_subscription(db_session, new_order, product, customer.id)
+
+    assert sub.order_id == new_order.id
+    assert db_session.query(ProductSubscription).count() == 2
+
+
+def test_get_or_create_pending_subscription_sets_instagram_customer_id_on_reuse(
+    db_session, whatsapp_account, product, customer, ig_customer
+):
+    first_order = Order(
+        customer_id=customer.id, product_id=product.id, account_id=whatsapp_account.id,
+        quantity=1, agreed_price=100000, payment_type=PaymentType.FULL, status=OrderStatus.PENDING,
+    )
+    db_session.add(first_order)
+    db_session.commit()
+    db_session.refresh(first_order)
+    product_subscription.get_or_create_pending_subscription(db_session, first_order, product, customer.id)
+
+    second_order = Order(
+        customer_id=customer.id, product_id=product.id, account_id=whatsapp_account.id,
+        quantity=1, agreed_price=100000, payment_type=PaymentType.FULL, status=OrderStatus.PENDING,
+    )
+    db_session.add(second_order)
+    db_session.commit()
+    db_session.refresh(second_order)
+
+    sub = product_subscription.get_or_create_pending_subscription(
+        db_session, second_order, product, customer.id, instagram_customer_id=ig_customer.id
+    )
+
+    assert sub.instagram_customer_id == ig_customer.id
+    assert db_session.query(ProductSubscription).count() == 1
