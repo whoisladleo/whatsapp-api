@@ -1,3 +1,4 @@
+import uuid
 from fastapi import APIRouter, Depends, HTTPException, Header, Request, Query, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import PlainTextResponse
@@ -44,12 +45,17 @@ async def get_whatsapp_account(
 
     query = db.query(WhatsAppAccount)
 
-    # Try matching by internal ID (if numeric and small enough) or phone_number_id
-    is_numeric = str(account_id).isdigit()
+    # account_id is either our internal UUID id or Meta's phone_number_id
+    # string — try parsing as a UUID first, and only match against it when
+    # that succeeds (a phone_number_id never happens to be a valid UUID).
+    try:
+        internal_id = uuid.UUID(str(account_id))
+    except ValueError:
+        internal_id = None
 
-    if is_numeric and len(str(account_id)) < 10:  # Safe bound for 32-bit int to prevent Postgres out-of-range errors
+    if internal_id is not None:
         account = query.filter(
-            (WhatsAppAccount.id == int(account_id))
+            (WhatsAppAccount.id == internal_id)
             | (WhatsAppAccount.phone_number_id == str(account_id))
         ).first()
     else:
@@ -153,7 +159,7 @@ async def handle_webhook(
                 and item.get("type") == "text"
             ):
                 process_inbound_message.apply_async(
-                    args=[account_id, item.get("from_phone"), item.get("body")]
+                    args=[str(account_id), item.get("from_phone"), item.get("body")]
                 )
             elif (
                 item.get("direction") == "inbound"
@@ -166,7 +172,7 @@ async def handle_webhook(
                 loc = item["location"]
                 capture_customer_location.apply_async(
                     args=[
-                        account_id,
+                        str(account_id),
                         item.get("from_phone"),
                         loc.get("latitude"),
                         loc.get("longitude"),

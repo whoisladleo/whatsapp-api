@@ -1,3 +1,5 @@
+import uuid
+
 import httpx
 import pytest
 import respx
@@ -393,7 +395,7 @@ def test_purchase_number_conflict_when_already_active(client, auth_user, db_sess
         created = client.post(BASE, json=_account_payload(), headers=headers).json()
 
     db_session.add(
-        NumberSubscription(account_id=created["id"], status=NumberSubscriptionStatus.ACTIVE, monthly_amount=10000)
+        NumberSubscription(account_id=uuid.UUID(created["id"]), status=NumberSubscriptionStatus.ACTIVE, monthly_amount=10000)
     )
     db_session.commit()
 
@@ -416,7 +418,7 @@ def test_purchase_number_retries_by_reusing_deactivated_subscription(
         created = client.post(BASE, json=_account_payload(), headers=headers).json()
 
     existing = NumberSubscription(
-        account_id=created["id"],
+        account_id=uuid.UUID(created["id"]),
         status=NumberSubscriptionStatus.DEACTIVATED,
         monthly_amount=10000,
         retry_count=1,
@@ -431,10 +433,10 @@ def test_purchase_number_retries_by_reusing_deactivated_subscription(
 
     assert resp.status_code == 201
     body = resp.json()
-    assert body["id"] == existing.id  # same row reused, not a new one
+    assert body["id"] == str(existing.id)  # same row reused, not a new one
     assert body["status"] == "PENDING_PAYMENT"
     assert body["retry_count"] == 0
-    assert db_session.query(NumberSubscription).filter(NumberSubscription.account_id == created["id"]).count() == 1
+    assert db_session.query(NumberSubscription).filter(NumberSubscription.account_id == uuid.UUID(created["id"])).count() == 1
 
 
 def test_purchase_number_payment_failure_returns_502(client, auth_user, monkeypatch):
@@ -468,7 +470,7 @@ def test_purchase_number_failed_push_leaves_retryable_state_not_stuck(
     first = client.post(f"{BASE}/{created['id']}/purchase-number", headers=headers)
     assert first.status_code == 502
 
-    sub = db_session.query(NumberSubscription).filter(NumberSubscription.account_id == created["id"]).first()
+    sub = db_session.query(NumberSubscription).filter(NumberSubscription.account_id == uuid.UUID(created["id"])).first()
     assert sub.status == NumberSubscriptionStatus.PAYMENT_FAILED
 
     _mock_initiate_payment(monkeypatch, ok=True)
@@ -486,7 +488,7 @@ def test_get_number_subscription_returns_current_status(client, auth_user, db_se
 
     db_session.add(
         NumberSubscription(
-            account_id=created["id"], status=NumberSubscriptionStatus.ACTIVE, monthly_amount=10000
+            account_id=uuid.UUID(created["id"]), status=NumberSubscriptionStatus.ACTIVE, monthly_amount=10000
         )
     )
     db_session.commit()

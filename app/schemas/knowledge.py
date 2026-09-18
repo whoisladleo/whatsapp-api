@@ -1,3 +1,4 @@
+import uuid
 from pydantic import BaseModel, ConfigDict
 from typing import Optional
 from datetime import datetime
@@ -20,8 +21,8 @@ class KnowledgeBaseUpdate(BaseModel):
 
 
 class KnowledgeBaseInDB(KnowledgeBaseBase):
-    id: int
-    user_id: int
+    id: uuid.UUID
+    user_id: uuid.UUID
     created_at: datetime
     updated_at: datetime
 

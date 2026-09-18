@@ -1,3 +1,4 @@
+import uuid
 from pydantic import BaseModel, ConfigDict
 from typing import Optional, List
 from datetime import datetime
@@ -33,8 +34,8 @@ class WhatsAppAccountUpdate(BaseModel):
 
 
 class WhatsAppAccountInDB(WhatsAppAccountBase):
-    id: int
-    user_id: int
+    id: uuid.UUID
+    user_id: uuid.UUID
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -51,7 +52,7 @@ class MessageSend(BaseModel):
 
 
 class MessageRead(BaseModel):
-    id: int
+    id: uuid.UUID
     whatsapp_message_id: Optional[str]
     from_phone: Optional[str]
     to_phone: Optional[str]

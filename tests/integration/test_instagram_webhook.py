@@ -183,7 +183,7 @@ def test_known_account_ai_enabled_stores_comment_and_dispatches_task(
     assert comment.media_id == "media_1"
 
     assert len(calls) == 1
-    assert calls[0] == [account.id, comment.id]
+    assert calls[0] == [str(account.id), str(comment.id)]
 
 
 def test_known_account_ai_disabled_stores_comment_without_dispatch(
@@ -301,7 +301,7 @@ def test_known_account_ai_enabled_stores_dm_and_dispatches_task(
     assert dm.customer_id == customer.id
 
     assert len(calls) == 1
-    assert calls[0] == [account.id, customer.id, dm.id]
+    assert calls[0] == [str(account.id), str(customer.id), str(dm.id)]
 
 
 def test_known_account_ai_disabled_stores_dm_without_dispatch(

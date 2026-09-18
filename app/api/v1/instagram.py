@@ -1,6 +1,7 @@
 from datetime import timedelta
 from typing import Optional
 
+import uuid
 import jwt
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse, RedirectResponse
@@ -109,7 +110,7 @@ async def handle_webhook(
         comment = crud_instagram.create_comment(db, account.id, item)
 
         if account.ai_enabled:
-            process_inbound_comment.apply_async(args=[account.id, comment.id])
+            process_inbound_comment.apply_async(args=[str(account.id), str(comment.id)])
 
     parsed_messages = InstagramWebhookParser.parse_inbound_messages(data)
     print(f"Parsed {len(parsed_messages)} DM(s) from payload")
@@ -141,7 +142,7 @@ async def handle_webhook(
         )
 
         if account.ai_enabled:
-            process_inbound_dm.apply_async(args=[account.id, customer.id, dm.id])
+            process_inbound_dm.apply_async(args=[str(account.id), str(customer.id), str(dm.id)])
 
     return {"status": "ok"}
 
@@ -155,7 +156,7 @@ async def list_accounts(
 
 @router.delete("/accounts/{account_id}")
 async def disconnect_account(
-    account_id: int,
+    account_id: uuid.UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -213,7 +214,7 @@ async def oauth_callback(
 
     try:
         payload = jwt.decode(state, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        user_id = int(payload["sub"])
+        user_id = uuid.UUID(payload["sub"])
     except (jwt.InvalidTokenError, KeyError, TypeError, ValueError):
         return RedirectResponse(f"{settings_url}?instagram=error")
 
@@ -269,7 +270,7 @@ def get_pending_handoffs(
 
 @router.post("/handoffs/{customer_id}/resume")
 def resume_handoff(
-    customer_id: int,
+    customer_id: uuid.UUID,
     account: InstagramAccount = Depends(get_instagram_account),
     db: Session = Depends(get_db),
 ):
@@ -285,7 +286,7 @@ def resume_handoff(
 
 @router.get("/messages", response_model=list[InstagramMessageRead])
 def get_message_history(
-    customer_id: int,
+    customer_id: uuid.UUID,
     limit: int = 100,
     account: InstagramAccount = Depends(get_instagram_account),
     db: Session = Depends(get_db),

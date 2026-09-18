@@ -1,4 +1,5 @@
 import io
+import uuid
 
 import pytest
 
@@ -158,7 +159,7 @@ def test_delete_knowledge_base(client, auth_user, db_session):
 
     assert resp.status_code == 200
     assert db_session.query(KnowledgeBase).filter(
-        KnowledgeBase.id == created["id"]
+        KnowledgeBase.id == uuid.UUID(created["id"])
     ).first() is None
 
 

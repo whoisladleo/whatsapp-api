@@ -132,7 +132,7 @@ def test_activate_after_first_payment_sets_active_and_schedules_renewal(
 
     assert sub.status == ProductSubscriptionStatus.ACTIVE
     assert sub.next_billing_at is not None
-    assert calls[0]["args"] == [sub.id]
+    assert calls[0]["args"] == [str(sub.id)]
     assert calls[0]["kwargs"]["countdown"] == 30 * 86400
 
 

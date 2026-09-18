@@ -1,5 +1,6 @@
 import logging
 from app.core.celery_app import celery_app
+from app.core.ids import coerce_uuid
 from app.db.session import SessionLocal
 from app.db.models import ConversationContext, ConversationState
 
@@ -10,7 +11,7 @@ HANDOFF_REMINDER_DELAY_SECONDS = 15 * 60
 
 
 @celery_app.task
-def send_handoff_reminder(context_id: int):
+def send_handoff_reminder(context_id: str):
     """
     One-shot follow-up: if a conversation is still sitting in HUMAN_HANDOFF
     HANDOFF_REMINDER_DELAY_SECONDS after the initial alert, re-notify the
@@ -20,7 +21,10 @@ def send_handoff_reminder(context_id: int):
     logger.info(f"Executing handoff reminder for context {context_id}")
     db = SessionLocal()
     try:
-        context = db.query(ConversationContext).filter(ConversationContext.id == context_id).first()
+        context_uuid = coerce_uuid(context_id)
+        if context_uuid is None:
+            return "Context not found or no longer awaiting handoff."
+        context = db.query(ConversationContext).filter(ConversationContext.id == context_uuid).first()
         if not context or context.state != ConversationState.HUMAN_HANDOFF:
             return "Context not found or no longer awaiting handoff."
 

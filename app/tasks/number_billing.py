@@ -1,6 +1,7 @@
 import logging
 
 from app.core.celery_app import celery_app
+from app.core.ids import coerce_uuid
 from app.db.session import SessionLocal
 from app.tasks.webhook_processing import _run_async
 
@@ -8,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 
 @celery_app.task
-def provision_after_payment(subscription_id: int):
+def provision_after_payment(subscription_id: str):
     """Dispatched from number_billing.handle_purchase_payment_result once the
     Tunzaa payment for a number purchase is confirmed. Runs the same
     Twilio-buy -> Meta-register -> verify -> activate chain used for pool
@@ -18,7 +19,7 @@ def provision_after_payment(subscription_id: int):
     return _run_async(_do_provision_after_payment(subscription_id))
 
 
-async def _do_provision_after_payment(subscription_id: int) -> None:
+async def _do_provision_after_payment(subscription_id: str) -> None:
     from datetime import datetime, timedelta
 
     from app.api.v1.accounts import register_phone_number, request_display_name_change
@@ -29,8 +30,12 @@ async def _do_provision_after_payment(subscription_id: int) -> None:
 
     db = SessionLocal()
     try:
+        subscription_uuid = coerce_uuid(subscription_id)
+        if subscription_uuid is None:
+            logger.error(f"provision_after_payment: subscription {subscription_id} not found")
+            return
         subscription = (
-            db.query(NumberSubscription).filter(NumberSubscription.id == subscription_id).first()
+            db.query(NumberSubscription).filter(NumberSubscription.id == subscription_uuid).first()
         )
         if not subscription:
             logger.error(f"provision_after_payment: subscription {subscription_id} not found")
@@ -78,7 +83,7 @@ async def _do_provision_after_payment(subscription_id: int) -> None:
 
         try:
             charge_renewal.apply_async(
-                args=[subscription.id],
+                args=[str(subscription.id)],
                 countdown=number_billing.RENEWAL_PERIOD_DAYS * 86400,
             )
         except Exception as e:
@@ -95,21 +100,25 @@ async def _do_provision_after_payment(subscription_id: int) -> None:
 
 
 @celery_app.task
-def charge_renewal(subscription_id: int):
+def charge_renewal(subscription_id: str):
     """Self-rescheduling monthly billing task — see
     number_billing.handle_renewal_payment_result for what happens once the
     Tunzaa webhook confirms whether this charge succeeded."""
     return _run_async(_do_charge_renewal(subscription_id))
 
 
-async def _do_charge_renewal(subscription_id: int) -> None:
+async def _do_charge_renewal(subscription_id: str) -> None:
     from app.db.models import NumberSubscription, NumberSubscriptionStatus
     from app.services.tunzaa import tunzaa_service
 
     db = SessionLocal()
     try:
+        subscription_uuid = coerce_uuid(subscription_id)
+        if subscription_uuid is None:
+            logger.error(f"charge_renewal: subscription {subscription_id} not found")
+            return
         subscription = (
-            db.query(NumberSubscription).filter(NumberSubscription.id == subscription_id).first()
+            db.query(NumberSubscription).filter(NumberSubscription.id == subscription_uuid).first()
         )
         if not subscription:
             logger.error(f"charge_renewal: subscription {subscription_id} not found")

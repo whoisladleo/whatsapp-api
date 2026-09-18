@@ -1,3 +1,5 @@
+import uuid
+
 import httpx
 import respx
 
@@ -127,7 +129,7 @@ def test_disconnect_still_succeeds_when_meta_unsubscribe_fails(client, db_sessio
 def test_disconnect_404_for_unknown_account(client, auth_user):
     _, headers = auth_user
 
-    resp = client.delete(f"{URL}/999999", headers=headers)
+    resp = client.delete(f"{URL}/{uuid.uuid4()}", headers=headers)
 
     assert resp.status_code == 404
 

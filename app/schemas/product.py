@@ -1,3 +1,4 @@
+import uuid
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
@@ -39,9 +40,9 @@ class ProductUpdate(BaseModel):
     is_subscription: Optional[bool] = None
 
 class ProductResponse(ProductBase):
-    id: int
+    id: uuid.UUID
     slug: str
-    merchant_id: int
+    merchant_id: uuid.UUID
     created_at: datetime
 
     class Config:

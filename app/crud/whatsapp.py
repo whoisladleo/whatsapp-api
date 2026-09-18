@@ -1,3 +1,4 @@
+import uuid
 from datetime import datetime
 from typing import Optional
 
@@ -57,7 +58,7 @@ def claim_available_pool_number(db: Session) -> Optional[PhoneNumberPool]:
     return candidate
 
 
-def get_pool_number_for_account(db: Session, account_id: int) -> Optional[PhoneNumberPool]:
+def get_pool_number_for_account(db: Session, account_id: uuid.UUID) -> Optional[PhoneNumberPool]:
     return (
         db.query(PhoneNumberPool)
         .filter(PhoneNumberPool.whatsapp_account_id == account_id)
@@ -65,7 +66,7 @@ def get_pool_number_for_account(db: Session, account_id: int) -> Optional[PhoneN
     )
 
 
-def release_pool_number_for_account(db: Session, account_id: int) -> None:
+def release_pool_number_for_account(db: Session, account_id: uuid.UUID) -> None:
     pool_number = (
         db.query(PhoneNumberPool)
         .filter(PhoneNumberPool.whatsapp_account_id == account_id)
@@ -108,7 +109,7 @@ def reassign_account_to_pool_number(db: Session, db_account: WhatsAppAccount) ->
 
 
 def create_whatsapp_account(
-    db: Session, account_in: WhatsAppAccountCreate, user_id: int
+    db: Session, account_in: WhatsAppAccountCreate, user_id: uuid.UUID
 ) -> Optional[WhatsAppAccount]:
     phone_number_id = account_in.phone_number_id
     access_token = account_in.access_token
@@ -176,7 +177,7 @@ def create_whatsapp_account(
 
 
 def get_account_by_phone_id(
-    db: Session, phone_number_id: str, user_id: int
+    db: Session, phone_number_id: str, user_id: uuid.UUID
 ) -> WhatsAppAccount:
     return (
         db.query(WhatsAppAccount)
@@ -209,7 +210,7 @@ def update_whatsapp_account(
 
 
 def get_multi_by_user(
-    db: Session, user_id: int, skip: int = 0, limit: int = 100
+    db: Session, user_id: uuid.UUID, skip: int = 0, limit: int = 100
 ) -> list[WhatsAppAccount]:
     return (
         db.query(WhatsAppAccount)

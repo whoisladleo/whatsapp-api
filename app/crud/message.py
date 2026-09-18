@@ -1,3 +1,4 @@
+import uuid
 from datetime import datetime, timedelta
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -14,7 +15,7 @@ class ConversationNotInHandoffError(Exception):
 
 
 def create_message(
-    db: Session, message_data: Dict[str, Any], account_id: int
+    db: Session, message_data: Dict[str, Any], account_id: uuid.UUID
 ) -> Message:
     whatsapp_message_id = message_data.get("whatsapp_message_id")
     
@@ -41,7 +42,7 @@ def create_message(
 
 
 def get_messages_by_account(
-    db: Session, account_id: int, limit: int = 100, customer_phone: Optional[str] = None
+    db: Session, account_id: uuid.UUID, limit: int = 100, customer_phone: Optional[str] = None
 ) -> List[Message]:
     query = db.query(Message).filter(Message.account_id == account_id)
     if customer_phone:
@@ -62,7 +63,7 @@ def update_message_status(db: Session, whatsapp_message_id: str, status: str):
     db.commit()
 
 
-def resume_conversation_for_account(db: Session, account_id: int, phone: str) -> None:
+def resume_conversation_for_account(db: Session, account_id: uuid.UUID, phone: str) -> None:
     """
     Flips a HUMAN_HANDOFF conversation back to NEGOTIATING. Shared by the
     WhatsApp `/resume` merchant command (app/services/merchant_handler.py)
@@ -104,7 +105,7 @@ def resume_conversation_for_account(db: Session, account_id: int, phone: str) ->
 
 
 def get_conversations_for_account(
-    db: Session, account_id: int, exclude_phone: Optional[str] = None
+    db: Session, account_id: uuid.UUID, exclude_phone: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     """
     Every distinct customer this account has exchanged messages with,
@@ -158,7 +159,7 @@ def get_conversations_for_account(
 
 
 def get_message_stats_for_account(
-    db: Session, account_id: int, exclude_phone: Optional[str] = None
+    db: Session, account_id: uuid.UUID, exclude_phone: Optional[str] = None
 ) -> Dict[str, int]:
     """Total outbound messages sent vs. distinct customers messaged — same
     exclude_phone semantics as get_conversations_for_account, so the
@@ -184,7 +185,7 @@ def get_message_stats_for_account(
 
 
 def get_recent_send_failures(
-    db: Session, account_id: int, hours: int = 24
+    db: Session, account_id: uuid.UUID, hours: int = 24
 ) -> Dict[str, Any]:
     """
     Outbound sends that failed at the WhatsApp API level in the last `hours`
@@ -220,7 +221,7 @@ def get_recent_send_failures(
     }
 
 
-def get_pending_handoffs_for_account(db: Session, account_id: int) -> List[Dict[str, Any]]:
+def get_pending_handoffs_for_account(db: Session, account_id: uuid.UUID) -> List[Dict[str, Any]]:
     """
     Customers currently in ConversationState.HUMAN_HANDOFF whose most recent
     inbound message belongs to this account. There is no direct

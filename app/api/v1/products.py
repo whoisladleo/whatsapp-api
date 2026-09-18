@@ -35,7 +35,7 @@ def read_products(
 
 @router.put("/{product_id}", response_model=ProductResponse)
 def update_existing_product(
-    product_id: int,
+    product_id: uuid.UUID,
     product_in: ProductUpdate,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
@@ -48,7 +48,7 @@ def update_existing_product(
 
 @router.delete("/{product_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_existing_product(
-    product_id: int,
+    product_id: uuid.UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -109,7 +109,7 @@ def upload_csv_bulk(
 
 @router.post("/{product_id}/image", response_model=ProductResponse)
 def upload_product_image(
-    product_id: int,
+    product_id: uuid.UUID,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)

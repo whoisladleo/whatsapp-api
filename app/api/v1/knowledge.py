@@ -1,3 +1,4 @@
+import uuid
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from sqlalchemy.orm import Session
 from typing import List, Optional
@@ -49,7 +50,7 @@ def list_knowledge(
 
 @router.get("/{kb_id}", response_model=KnowledgeBaseInDB)
 def get_knowledge(
-    kb_id: int,
+    kb_id: uuid.UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -61,7 +62,7 @@ def get_knowledge(
 
 @router.put("/{kb_id}", response_model=KnowledgeBaseInDB)
 async def update_knowledge(
-    kb_id: int,
+    kb_id: uuid.UUID,
     name: Optional[str] = Form(None),
     slug: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
@@ -90,7 +91,7 @@ async def update_knowledge(
 
 @router.delete("/{kb_id}")
 def delete_knowledge(
-    kb_id: int,
+    kb_id: uuid.UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):

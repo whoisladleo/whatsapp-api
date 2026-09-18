@@ -195,7 +195,7 @@ async def test_renewal_failed_first_time_sets_past_due_since_and_schedules_grace
 
     assert sub.past_due_since is not None
     assert len(grace_calls) == 1
-    assert grace_calls[0]["args"] == [sub.id]
+    assert grace_calls[0]["args"] == [str(sub.id)]
     assert grace_calls[0]["kwargs"]["countdown"] == 7 * 86400
 
     # Still within grace — access stays on.

@@ -1,3 +1,5 @@
+import uuid
+
 import httpx
 import jwt
 import pytest
@@ -64,7 +66,7 @@ def test_callback_success_creates_user_and_redirects_with_code(client, db_sessio
 
     login_code = location.split("fb_code=")[1]
     payload = jwt.decode(login_code, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-    assert int(payload["sub"]) == user.id
+    assert uuid.UUID(payload["sub"]) == user.id
 
 
 @respx.mock
@@ -113,7 +115,7 @@ def test_exchange_with_valid_code_returns_session_token(client, db_session):
     body = resp.json()
     assert body["token_type"] == "bearer"
     payload = jwt.decode(body["access_token"], settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-    assert int(payload["sub"]) == user.id
+    assert uuid.UUID(payload["sub"]) == user.id
 
 
 def test_exchange_with_invalid_code_returns_401(client):

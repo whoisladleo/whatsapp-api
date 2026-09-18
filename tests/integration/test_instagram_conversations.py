@@ -1,3 +1,5 @@
+import uuid
+
 import pytest
 
 from app.core.instagram_provider import InstagramProvider
@@ -65,7 +67,7 @@ def test_conversations_lists_customers_with_messages(client, db_session, auth_us
     assert resp.status_code == 200
     body = resp.json()
     assert len(body) == 1
-    assert body[0]["customer_id"] == customer.id
+    assert body[0]["customer_id"] == str(customer.id)
     assert body[0]["last_message_body"] == "hi"
 
 
@@ -149,7 +151,7 @@ def test_messages_404_for_customer_belonging_to_another_account(client, db_sessi
 
 
 def test_send_requires_auth(client, customer):
-    resp = client.post(SEND_URL, json={"customer_id": customer.id, "message": "hi"})
+    resp = client.post(SEND_URL, json={"customer_id": str(customer.id), "message": "hi"})
     assert resp.status_code in (401, 403)
 
 
@@ -166,7 +168,7 @@ def test_send_success_creates_outbound_message(client, db_session, auth_user, ac
 
     resp = client.post(
         SEND_URL,
-        json={"customer_id": customer.id, "message": "We'll follow up shortly!"},
+        json={"customer_id": str(customer.id), "message": "We'll follow up shortly!"},
         headers=headers,
     )
 
@@ -190,7 +192,7 @@ def test_send_failure_returns_502(client, auth_user, account, customer, monkeypa
     monkeypatch.setattr(InstagramProvider, "send_direct_message", fake_send_direct_message)
 
     resp = client.post(
-        SEND_URL, json={"customer_id": customer.id, "message": "hi"}, headers=headers
+        SEND_URL, json={"customer_id": str(customer.id), "message": "hi"}, headers=headers
     )
 
     assert resp.status_code == 502
@@ -199,7 +201,7 @@ def test_send_failure_returns_502(client, auth_user, account, customer, monkeypa
 def test_send_404_for_unknown_customer(client, auth_user, account):
     _, headers = auth_user
 
-    resp = client.post(SEND_URL, json={"customer_id": 999999, "message": "hi"}, headers=headers)
+    resp = client.post(SEND_URL, json={"customer_id": str(uuid.uuid4()), "message": "hi"}, headers=headers)
 
     assert resp.status_code == 404
 
@@ -227,7 +229,7 @@ def test_handoffs_lists_only_human_handoff_state(client, db_session, auth_user, 
     assert resp.status_code == 200
     body = resp.json()
     assert len(body) == 1
-    assert body[0]["customer_id"] == customer.id
+    assert body[0]["customer_id"] == str(customer.id)
     assert body[0]["last_message_body"] == "help!"
 
 
@@ -252,7 +254,7 @@ def test_resume_success(client, db_session, auth_user, account, customer):
 def test_resume_404_for_unknown_customer(client, auth_user, account):
     _, headers = auth_user
 
-    resp = client.post(f"{HANDOFFS_URL}/999999/resume", headers=headers)
+    resp = client.post(f"{HANDOFFS_URL}/{uuid.uuid4()}/resume", headers=headers)
 
     assert resp.status_code == 404
 

@@ -1,3 +1,4 @@
+import uuid
 from fastapi import APIRouter, Depends, Header, Request, HTTPException
 from typing import Optional
 from sqlalchemy.orm import Session
@@ -20,6 +21,20 @@ import logging
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+def _parse_uuid_suffix(ref: str, prefix: str) -> Optional[uuid.UUID]:
+    """
+    Reference ids are built as f"{prefix}{model.id}" (e.g. "order-<uuid>").
+    IDs are now UUIDs, which themselves contain hyphens, so the id must be
+    parsed by stripping the known prefix rather than the old
+    ref.split("-")[-1] — that only grabbed the last 12 hex chars of a UUID
+    and would never parse as one.
+    """
+    try:
+        return uuid.UUID(ref[len(prefix):])
+    except ValueError:
+        return None
 
 
 @router.post("/tunzaa-webhook")
@@ -76,7 +91,8 @@ async def handle_tunzaa_webhook(
     if order_ref.startswith("product-subscription-renewal-"):
         return await _handle_product_subscription_renewal_webhook(db, order_ref, status_value, transaction_id)
 
-    order = db.query(Order).filter(Order.id == int(order_ref.split("-")[-1])).first() if "-" in order_ref else None
+    order_id = _parse_uuid_suffix(order_ref, "order-")
+    order = db.query(Order).filter(Order.id == order_id).first() if order_id else None
 
     if not order:
         return {"status": "ignored", "reason": "Order not found"}
@@ -148,9 +164,9 @@ async def _handle_number_subscription_webhook(
     below it, which these NumberSubscription rows have nothing to do with."""
     from app.services import number_billing
 
-    try:
-        subscription_id = int(order_ref.split("-")[-1])
-    except ValueError:
+    prefix = "number-purchase-" if order_ref.startswith("number-purchase-") else "number-renewal-"
+    subscription_id = _parse_uuid_suffix(order_ref, prefix)
+    if subscription_id is None:
         return {"status": "ignored", "reason": "Malformed reference_id"}
 
     subscription = (
@@ -187,9 +203,8 @@ async def _handle_product_subscription_renewal_webhook(
     this prefix."""
     from app.services import product_subscription
 
-    try:
-        subscription_id = int(order_ref.split("-")[-1])
-    except ValueError:
+    subscription_id = _parse_uuid_suffix(order_ref, "product-subscription-renewal-")
+    if subscription_id is None:
         return {"status": "ignored", "reason": "Malformed reference_id"}
 
     subscription = (

@@ -1,3 +1,4 @@
+import uuid
 from pydantic import BaseModel, ConfigDict
 from typing import Optional
 from datetime import datetime
@@ -13,7 +14,7 @@ class UserBase(BaseModel):
     username: str
 
 class UserInDB(UserBase):
-    id: int
+    id: uuid.UUID
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -22,13 +23,13 @@ class Token(BaseModel):
     token_type: str
 
 class TokenPayload(BaseModel):
-    sub: Optional[int] = None
+    sub: Optional[str] = None
 
 class FacebookExchangeRequest(BaseModel):
     code: str
 
 class UserProfile(BaseModel):
-    id: int
+    id: uuid.UUID
     username: Optional[str] = None
     email: Optional[str] = None
     name: Optional[str] = None
@@ -59,5 +60,5 @@ class PayNowRequest(BaseModel):
     phone_number: Optional[str] = None
 
 class PayNowResponse(BaseModel):
-    order_id: int
+    order_id: uuid.UUID
     message: str

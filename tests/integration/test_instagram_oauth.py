@@ -1,3 +1,5 @@
+import uuid
+
 import httpx
 import jwt
 import pytest
@@ -55,7 +57,7 @@ def test_start_oauth_returns_authorize_url_with_signed_state(client, auth_user):
 
     state = authorize_url.split("state=")[1].split("&")[0]
     payload = jwt.decode(state, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-    assert int(payload["sub"]) == user.id
+    assert uuid.UUID(payload["sub"]) == user.id
 
 
 def test_callback_missing_code_redirects_to_error(client):

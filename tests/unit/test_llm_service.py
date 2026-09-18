@@ -492,7 +492,7 @@ async def test_human_handoff_trigger_updates_state_and_alerts_merchant(
 
     # A follow-up reminder is scheduled, keyed on the conversation context id.
     assert len(scheduled) == 1
-    assert scheduled[0][0] == ([context.id],) or scheduled[0][1].get("args") == [context.id]
+    assert scheduled[0][0] == ([str(context.id)],) or scheduled[0][1].get("args") == [str(context.id)]
 
 
 @respx.mock
@@ -1166,7 +1166,7 @@ async def test_quote_marker_tracked_and_nudge_scheduled(db_session, shop_account
     assert context.pending_quote_at is not None
     assert context.quote_nudge_count == 0
 
-    assert scheduled["args"] == [context.id, shop_account.id, context.pending_quote_at.isoformat(), 1]
+    assert scheduled["args"] == [str(context.id), str(shop_account.id), context.pending_quote_at.isoformat(), 1]
     assert scheduled["countdown"] == QUOTE_NUDGE_INTERVALS_SECONDS[0]
 
 

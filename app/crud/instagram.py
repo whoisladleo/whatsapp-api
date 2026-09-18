@@ -1,3 +1,4 @@
+import uuid
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
@@ -30,7 +31,7 @@ def get_account_by_ig_business_id(
     )
 
 
-def get_accounts_by_user(db: Session, user_id: int) -> List[InstagramAccount]:
+def get_accounts_by_user(db: Session, user_id: uuid.UUID) -> List[InstagramAccount]:
     # access_token == "" marks a disconnected account (see disconnect_account)
     # — the row and its comment/DM/order history stick around, but it's no
     # longer "connected" from the merchant's point of view.
@@ -65,7 +66,7 @@ def comment_already_processed(db: Session, comment_id: str) -> bool:
 
 
 def upsert_account(
-    db: Session, user_id: int, ig_business_id: str, access_token: str, username: Optional[str]
+    db: Session, user_id: uuid.UUID, ig_business_id: str, access_token: str, username: Optional[str]
 ) -> InstagramAccount:
     """
     One Instagram connection per Taskflow user, enforced here rather than at
@@ -129,7 +130,7 @@ def upsert_account(
 
 
 def create_comment(
-    db: Session, account_id: int, item: Dict[str, Any]
+    db: Session, account_id: uuid.UUID, item: Dict[str, Any]
 ) -> InstagramComment:
     comment = InstagramComment(
         account_id=account_id,
@@ -157,7 +158,7 @@ def dm_already_processed(db: Session, ig_message_id: Optional[str]) -> bool:
 
 
 def get_or_create_customer(
-    db: Session, account_id: int, ig_scoped_id: str, username: Optional[str] = None
+    db: Session, account_id: uuid.UUID, ig_scoped_id: str, username: Optional[str] = None
 ) -> InstagramCustomer:
     customer = (
         db.query(InstagramCustomer)
@@ -181,7 +182,7 @@ def get_or_create_customer(
 
 
 def get_or_create_conversation(
-    db: Session, customer_id: int
+    db: Session, customer_id: uuid.UUID
 ) -> InstagramConversationContext:
     context = (
         db.query(InstagramConversationContext)
@@ -199,12 +200,12 @@ def get_or_create_conversation(
 
 
 def get_dm_history(
-    db: Session, customer_id: int, limit: int = 20
+    db: Session, customer_id: uuid.UUID, limit: int = 20
 ) -> List[InstagramDirectMessage]:
     return (
         db.query(InstagramDirectMessage)
         .filter(InstagramDirectMessage.customer_id == customer_id)
-        .order_by(InstagramDirectMessage.id.desc())
+        .order_by(InstagramDirectMessage.created_at.desc())
         .limit(limit)
         .all()
     )[::-1]
@@ -212,8 +213,8 @@ def get_dm_history(
 
 def create_direct_message(
     db: Session,
-    account_id: int,
-    customer_id: int,
+    account_id: uuid.UUID,
+    customer_id: uuid.UUID,
     direction: str,
     body: Optional[str],
     ig_message_id: Optional[str] = None,
@@ -232,7 +233,7 @@ def create_direct_message(
 
 
 def get_customer_for_account(
-    db: Session, account_id: int, customer_id: int
+    db: Session, account_id: uuid.UUID, customer_id: uuid.UUID
 ) -> InstagramCustomer:
     """Ownership-checked lookup used by every dashboard endpoint below —
     raises rather than returning None so callers can 404 without an extra
@@ -247,7 +248,7 @@ def get_customer_for_account(
     return customer
 
 
-def get_conversations_for_account(db: Session, account_id: int) -> List[Dict[str, Any]]:
+def get_conversations_for_account(db: Session, account_id: uuid.UUID) -> List[Dict[str, Any]]:
     """
     Every Instagram customer this account has exchanged DMs with, most
     recent activity first. Unlike WhatsApp's equivalent (crud/message.py),
@@ -263,7 +264,7 @@ def get_conversations_for_account(db: Session, account_id: int) -> List[Dict[str
         last_message = (
             db.query(InstagramDirectMessage)
             .filter(InstagramDirectMessage.customer_id == customer.id)
-            .order_by(InstagramDirectMessage.id.desc())
+            .order_by(InstagramDirectMessage.created_at.desc())
             .first()
         )
         if not last_message:
@@ -290,7 +291,7 @@ def get_conversations_for_account(db: Session, account_id: int) -> List[Dict[str
     return results
 
 
-def get_pending_handoffs_for_account(db: Session, account_id: int) -> List[Dict[str, Any]]:
+def get_pending_handoffs_for_account(db: Session, account_id: uuid.UUID) -> List[Dict[str, Any]]:
     rows = (
         db.query(InstagramConversationContext, InstagramCustomer)
         .join(InstagramCustomer, InstagramConversationContext.customer_id == InstagramCustomer.id)
@@ -306,7 +307,7 @@ def get_pending_handoffs_for_account(db: Session, account_id: int) -> List[Dict[
         last_message = (
             db.query(InstagramDirectMessage)
             .filter(InstagramDirectMessage.customer_id == customer.id)
-            .order_by(InstagramDirectMessage.id.desc())
+            .order_by(InstagramDirectMessage.created_at.desc())
             .first()
         )
         results.append(
@@ -320,7 +321,7 @@ def get_pending_handoffs_for_account(db: Session, account_id: int) -> List[Dict[
     return results
 
 
-def resume_conversation(db: Session, customer_id: int) -> None:
+def resume_conversation(db: Session, customer_id: uuid.UUID) -> None:
     """Flips a HUMAN_HANDOFF conversation back to NEGOTIATING — WhatsApp
     counterpart is crud/message.py's resume_conversation_for_account. No
     account-ownership check here since the caller (POST

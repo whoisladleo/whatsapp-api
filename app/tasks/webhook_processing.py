@@ -5,6 +5,7 @@ import uuid
 
 import app.core.rate_limit as rate_limit_module
 from app.core.celery_app import celery_app
+from app.core.ids import coerce_uuid
 from app.core.provider import WhatsAppProvider
 from app.core.rate_limit import check_and_increment
 from app.core.security import normalize_phone
@@ -53,7 +54,7 @@ def _run_async(coro):
         return pool.submit(asyncio.run, coro).result()
 
 
-def _lock_key(account_id: int, from_phone: str) -> str:
+def _lock_key(account_id: str, from_phone: str) -> str:
     return f"webhook_lock:{account_id}:{normalize_phone(from_phone)}"
 
 
@@ -77,7 +78,7 @@ def _release_lock(key: str) -> None:
 
 @celery_app.task
 def process_inbound_message(
-    account_id: int, from_phone: str, message_body: str, attempt: int = 0
+    account_id: str, from_phone: str, message_body: str, attempt: int = 0
 ):
     """
     Handles a single inbound customer/merchant text message: routes it to
@@ -99,7 +100,10 @@ def process_inbound_message(
     """
     db = SessionLocal()
     try:
-        account = db.query(WhatsAppAccount).filter(WhatsAppAccount.id == account_id).first()
+        account_uuid = coerce_uuid(account_id)
+        if account_uuid is None:
+            return "Account not found."
+        account = db.query(WhatsAppAccount).filter(WhatsAppAccount.id == account_uuid).first()
         if not account:
             return "Account not found."
 

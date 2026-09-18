@@ -1,3 +1,5 @@
+import uuid
+
 import pytest
 from fastapi import HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
@@ -44,7 +46,7 @@ async def test_get_current_user_missing_sub_claim_raises_401(db_session, monkeyp
 
 
 async def test_get_current_user_unknown_user_id_raises_404(db_session):
-    token = create_access_token(999999)
+    token = create_access_token(uuid.uuid4())
     creds = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
 
     with pytest.raises(HTTPException) as exc_info:

@@ -1,4 +1,5 @@
 import asyncio
+import uuid
 
 from app.api.v1.orders import _notify_customer_of_cancellation
 from app.db.models import Customer, Order
@@ -34,7 +35,7 @@ def test_notify_skips_when_account_not_found(db_session):
     db_session.commit()
     db_session.refresh(customer)
 
-    order = Order(customer_id=customer.id, account_id=999999)
+    order = Order(customer_id=customer.id, account_id=uuid.uuid4())
     db_session.add(order)
     db_session.commit()
     db_session.refresh(order)

@@ -1,4 +1,5 @@
 import io
+import uuid
 
 import pytest
 
@@ -37,7 +38,7 @@ def test_create_product(client, auth_user):
     body = resp.json()
     assert body["name"] == "Shoes"
     assert body["slug"] == "shoes"
-    assert body["merchant_id"] == auth_user[0].id
+    assert body["merchant_id"] == str(auth_user[0].id)
 
 
 def test_create_product_requires_auth(client):
@@ -88,7 +89,7 @@ def test_delete_product(client, auth_user, db_session):
     resp = client.delete(f"{BASE}/{created['id']}", headers=headers)
 
     assert resp.status_code == 204
-    assert db_session.query(Product).filter(Product.id == created["id"]).first() is None
+    assert db_session.query(Product).filter(Product.id == uuid.UUID(created["id"])).first() is None
 
 
 def test_delete_product_not_found_for_other_user(client, auth_user, other_user_headers):

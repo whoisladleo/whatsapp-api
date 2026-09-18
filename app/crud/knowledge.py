@@ -1,3 +1,4 @@
+import uuid
 from sqlalchemy.orm import Session
 from app.db.models import KnowledgeBase
 from app.schemas.knowledge import KnowledgeBaseCreate, KnowledgeBaseUpdate
@@ -5,7 +6,7 @@ from typing import List, Optional
 
 
 def create_knowledge_base(
-    db: Session, kb_in: KnowledgeBaseCreate, user_id: int
+    db: Session, kb_in: KnowledgeBaseCreate, user_id: uuid.UUID
 ) -> KnowledgeBase:
     db_kb = KnowledgeBase(**kb_in.model_dump(), user_id=user_id)
     db.add(db_kb)
@@ -14,7 +15,7 @@ def create_knowledge_base(
     return db_kb
 
 
-def get_knowledge_base(db: Session, kb_id: int, user_id: int) -> Optional[KnowledgeBase]:
+def get_knowledge_base(db: Session, kb_id: uuid.UUID, user_id: uuid.UUID) -> Optional[KnowledgeBase]:
     return (
         db.query(KnowledgeBase)
         .filter(KnowledgeBase.id == kb_id, KnowledgeBase.user_id == user_id)
@@ -23,7 +24,7 @@ def get_knowledge_base(db: Session, kb_id: int, user_id: int) -> Optional[Knowle
 
 
 def get_knowledge_base_by_slug(
-    db: Session, slug: str, user_id: int
+    db: Session, slug: str, user_id: uuid.UUID
 ) -> Optional[KnowledgeBase]:
     return (
         db.query(KnowledgeBase)
@@ -33,7 +34,7 @@ def get_knowledge_base_by_slug(
 
 
 def get_multi_by_user(
-    db: Session, user_id: int, skip: int = 0, limit: int = 100
+    db: Session, user_id: uuid.UUID, skip: int = 0, limit: int = 100
 ) -> List[KnowledgeBase]:
     return (
         db.query(KnowledgeBase)

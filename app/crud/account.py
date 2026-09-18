@@ -1,3 +1,4 @@
+import uuid
 from sqlalchemy.orm import Session
 from app.db.models import WhatsAppAccount
 from app.schemas.account import AccountCreate, AccountUpdate
@@ -32,18 +33,18 @@ __all__ = [
 ]
 
 
-def get_account_by_id(db: Session, account_id: int, user_id: int) -> Optional[WhatsAppAccount]:
+def get_account_by_id(db: Session, account_id: uuid.UUID, user_id: uuid.UUID) -> Optional[WhatsAppAccount]:
     return db.query(WhatsAppAccount).filter(
         WhatsAppAccount.id == account_id,
         WhatsAppAccount.user_id == user_id
     ).first()
 
 
-def get_accounts_by_user(db: Session, user_id: int) -> List[WhatsAppAccount]:
+def get_accounts_by_user(db: Session, user_id: uuid.UUID) -> List[WhatsAppAccount]:
     return crud_whatsapp.get_multi_by_user(db, user_id)
 
 
-def create_account(db: Session, account_in: AccountCreate, user_id: int) -> Optional[WhatsAppAccount]:
+def create_account(db: Session, account_in: AccountCreate, user_id: uuid.UUID) -> Optional[WhatsAppAccount]:
     whatsapp_account_in = WhatsAppAccountCreate(**account_in.model_dump())
     return crud_whatsapp.create_whatsapp_account(db, whatsapp_account_in, user_id)
 
@@ -57,7 +58,7 @@ def delete_account(db: Session, db_account: WhatsAppAccount) -> WhatsAppAccount:
     return crud_whatsapp.delete_whatsapp_account(db, db_account)
 
 
-def get_pool_two_step_pin(db: Session, account_id: int) -> Optional[str]:
+def get_pool_two_step_pin(db: Session, account_id: uuid.UUID) -> Optional[str]:
     pool_number = crud_whatsapp.get_pool_number_for_account(db, account_id)
     return pool_number.two_step_pin if pool_number else None
 

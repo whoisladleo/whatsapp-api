@@ -1,3 +1,4 @@
+import uuid
 import logging
 from datetime import datetime, timedelta
 from typing import Optional
@@ -19,8 +20,8 @@ def get_or_create_pending_subscription(
     db: Session,
     order: Order,
     product: Product,
-    customer_id: int,
-    instagram_customer_id: Optional[int] = None,
+    customer_id: uuid.UUID,
+    instagram_customer_id: Optional[uuid.UUID] = None,
 ) -> ProductSubscription:
     """
     Called wherever a subscription-product deal closes (LLMService._create_subscription_if_needed,
@@ -122,7 +123,7 @@ def activate_after_first_payment(db: Session, subscription: ProductSubscription)
 
     try:
         charge_renewal.apply_async(
-            args=[subscription.id], countdown=RENEWAL_PERIOD_DAYS * 86400
+            args=[str(subscription.id)], countdown=RENEWAL_PERIOD_DAYS * 86400
         )
     except Exception as e:
         logger.error(f"Failed to schedule first renewal for subscription {subscription.id}: {e}")
@@ -157,7 +158,7 @@ async def handle_renewal_payment_result(
         db.commit()
         try:
             charge_renewal.apply_async(
-                args=[subscription.id], countdown=RENEWAL_PERIOD_DAYS * 86400
+                args=[str(subscription.id)], countdown=RENEWAL_PERIOD_DAYS * 86400
             )
         except Exception as e:
             logger.error(f"Failed to schedule next renewal for subscription {subscription.id}: {e}")
@@ -177,7 +178,7 @@ async def handle_renewal_payment_result(
             db.commit()
             try:
                 charge_renewal.apply_async(
-                    args=[subscription.id], countdown=RENEWAL_RETRY_DELAY_SECONDS
+                    args=[str(subscription.id)], countdown=RENEWAL_RETRY_DELAY_SECONDS
                 )
             except Exception as e:
                 logger.error(f"Failed to schedule renewal retry for subscription {subscription.id}: {e}")
@@ -187,7 +188,7 @@ async def handle_renewal_payment_result(
 
                 try:
                     check_past_due_grace_expired.apply_async(
-                        args=[subscription.id], countdown=PAST_DUE_ACCESS_GRACE_DAYS * 86400
+                        args=[str(subscription.id)], countdown=PAST_DUE_ACCESS_GRACE_DAYS * 86400
                     )
                 except Exception as e:
                     logger.error(

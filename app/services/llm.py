@@ -317,7 +317,7 @@ class LLMService:
             db.commit()
             return "Something went wrong setting up your payment — please try again in a moment."
 
-    def _schedule_reminders(self, order_id: int) -> None:
+    def _schedule_reminders(self, order_id: uuid.UUID) -> None:
         from app.tasks.order_reminders import (
             SCARCITY_NUDGE_DELAY_SECONDS,
             SOFT_NUDGE_DELAY_SECONDS,
@@ -332,7 +332,7 @@ class LLMService:
             (auto_cancel_order, AUTO_CANCEL_DELAY_SECONDS),
         ):
             try:
-                task.apply_async(args=[order_id], countdown=delay)
+                task.apply_async(args=[str(order_id)], countdown=delay)
             except Exception as sched_err:
                 logger.error(f"Failed to schedule {task.name}: {sched_err}")
 
@@ -389,7 +389,7 @@ class LLMService:
         )
         try:
             send_handoff_reminder.apply_async(
-                args=[context.id], countdown=HANDOFF_REMINDER_DELAY_SECONDS
+                args=[str(context.id)], countdown=HANDOFF_REMINDER_DELAY_SECONDS
             )
         except Exception as sched_err:
             logger.error(f"Failed to schedule handoff reminder: {sched_err}")
@@ -448,7 +448,7 @@ class LLMService:
 
         try:
             send_quote_nudge.apply_async(
-                args=[context.id, account.id, context.pending_quote_at.isoformat(), 1],
+                args=[str(context.id), str(account.id), context.pending_quote_at.isoformat(), 1],
                 countdown=QUOTE_NUDGE_INTERVALS_SECONDS[0],
             )
         except Exception as sched_err:
@@ -457,7 +457,7 @@ class LLMService:
     async def generate_comment_reply(
         self,
         comment_body: str,
-        merchant_id: int,
+        merchant_id: uuid.UUID,
         db: Session,
         account_name: str = "the shop",
         knowledge_content: Optional[str] = None,

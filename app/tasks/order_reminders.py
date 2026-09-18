@@ -2,6 +2,7 @@ import asyncio
 import logging
 from app.core.celery_app import celery_app
 from app.core.config import settings
+from app.core.ids import coerce_uuid
 from app.db.session import SessionLocal
 from app.db.models import Order, OrderStatus, Product, WhatsAppAccount
 from app.crud import message as crud_message
@@ -52,7 +53,7 @@ def _log_outbound(db, account, to, body, resp):
 
 
 @celery_app.task
-def send_soft_nudge(order_id: int):
+def send_soft_nudge(order_id: str):
     """
     T+2h: nudge the customer that their payment is still pending. Likely
     still within WhatsApp's 24h customer-service window (they were just
@@ -61,7 +62,8 @@ def send_soft_nudge(order_id: int):
     logger.info(f"Executing soft nudge for order {order_id}")
     db = SessionLocal()
     try:
-        order = db.query(Order).filter(Order.id == order_id).first()
+        order_uuid = coerce_uuid(order_id)
+        order = db.query(Order).filter(Order.id == order_uuid).first() if order_uuid else None
         if not order or order.status != OrderStatus.PENDING:
             return "Order not found or not pending."
 
@@ -91,7 +93,7 @@ def send_soft_nudge(order_id: int):
 
 
 @celery_app.task
-def send_scarcity_nudge(order_id: int):
+def send_scarcity_nudge(order_id: str):
     """
     T+24h: likely outside the 24h session window by now, so this uses a
     template message rather than free-form text (see
@@ -102,7 +104,8 @@ def send_scarcity_nudge(order_id: int):
     logger.info(f"Executing scarcity nudge for order {order_id}")
     db = SessionLocal()
     try:
-        order = db.query(Order).filter(Order.id == order_id).first()
+        order_uuid = coerce_uuid(order_id)
+        order = db.query(Order).filter(Order.id == order_uuid).first() if order_uuid else None
         if not order or order.status != OrderStatus.PENDING:
             return "Order not found or not pending."
 
@@ -135,7 +138,7 @@ def send_scarcity_nudge(order_id: int):
 
 
 @celery_app.task
-def auto_cancel_order(order_id: int):
+def auto_cancel_order(order_id: str):
     """
     T+48h: cancel an unpaid order and release the reserved quantity back to
     Product.quantity (stock is decremented at reservation time, not
@@ -144,7 +147,8 @@ def auto_cancel_order(order_id: int):
     logger.info(f"Executing auto cancel for order {order_id}")
     db = SessionLocal()
     try:
-        order = db.query(Order).filter(Order.id == order_id).first()
+        order_uuid = coerce_uuid(order_id)
+        order = db.query(Order).filter(Order.id == order_uuid).first() if order_uuid else None
         if not order or order.status != OrderStatus.PENDING:
             return "Order not found or not pending."
 

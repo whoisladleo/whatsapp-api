@@ -97,7 +97,7 @@ def test_provision_after_payment_success(db_session, subscription, account, monk
     refreshed = db_session.query(NumberSubscription).filter(NumberSubscription.id == subscription.id).first()
     assert refreshed.status == NumberSubscriptionStatus.ACTIVE
     assert refreshed.next_billing_at is not None
-    assert renewal_calls[0]["args"] == [subscription.id]
+    assert renewal_calls[0]["args"] == [str(subscription.id)]
     assert renewal_calls[0]["kwargs"]["countdown"] == 30 * 86400
     assert "ready" in notify_calls[0]
 

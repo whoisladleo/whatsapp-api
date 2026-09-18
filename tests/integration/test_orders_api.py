@@ -1,3 +1,5 @@
+import uuid
+
 import httpx
 import pytest
 import respx
@@ -112,7 +114,7 @@ def test_list_orders_returns_merchant_order_with_derived_fields(
     assert resp.status_code == 200
     body = resp.json()
     assert len(body) == 1
-    assert body[0]["id"] == order.id
+    assert body[0]["id"] == str(order.id)
     assert body[0]["product_name"] == product.name
     assert body[0]["customer_phone"] == customer.phone_number
     assert body[0]["status"] == "PENDING"
@@ -154,7 +156,7 @@ def test_list_orders_filters_by_account_id(client, merchant_headers, order, acco
     assert resp.status_code == 200
     assert len(resp.json()) == 1
 
-    resp = client.get(f"{BASE}?account_id=999999", headers=merchant_headers)
+    resp = client.get(f"{BASE}?account_id={uuid.uuid4()}", headers=merchant_headers)
     assert resp.status_code == 200
     assert resp.json() == []
 
@@ -207,10 +209,10 @@ def test_list_orders_includes_instagram_originated_order_for_instagram_only_merc
     assert resp.status_code == 200
     body = resp.json()
     assert len(body) == 1
-    assert body[0]["id"] == ig_order.id
+    assert body[0]["id"] == str(ig_order.id)
     assert body[0]["channel"] == "instagram"
     assert body[0]["account_id"] is None
-    assert body[0]["instagram_account_id"] == ig_account.id
+    assert body[0]["instagram_account_id"] == str(ig_account.id)
 
 
 def test_get_order_detail_includes_payment_progress(client, merchant_headers, db_session, order):
@@ -233,7 +235,7 @@ def test_payment_history_requires_installment_plan(client, merchant_headers, ord
 
 
 def test_payment_history_not_found(client, merchant_headers):
-    resp = client.get(f"{BASE}/999999/payment-history", headers=merchant_headers)
+    resp = client.get(f"{BASE}/{uuid.uuid4()}/payment-history", headers=merchant_headers)
     assert resp.status_code == 404
 
 
@@ -291,7 +293,7 @@ def test_get_order_detail_includes_delivery_address_and_installments(
 
 
 def test_get_order_not_found(client, merchant_headers):
-    resp = client.get(f"{BASE}/999999", headers=merchant_headers)
+    resp = client.get(f"{BASE}/{uuid.uuid4()}", headers=merchant_headers)
     assert resp.status_code == 404
 
 
@@ -340,7 +342,7 @@ def test_cancel_already_paid_order_is_rejected(client, merchant_headers, db_sess
 
 
 def test_cancel_order_not_found(client, merchant_headers):
-    resp = client.post(f"{BASE}/999999/cancel", headers=merchant_headers)
+    resp = client.post(f"{BASE}/{uuid.uuid4()}/cancel", headers=merchant_headers)
     assert resp.status_code == 404
 
 

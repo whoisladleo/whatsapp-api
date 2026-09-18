@@ -16,16 +16,16 @@ def generate_slug(db: Session, name: str) -> str:
         slug = f"{base_slug}-{str(uuid.uuid4())[:4]}"
     return slug
 
-def get_product_by_id(db: Session, product_id: int, merchant_id: int) -> Optional[Product]:
+def get_product_by_id(db: Session, product_id: uuid.UUID, merchant_id: uuid.UUID) -> Optional[Product]:
     return db.query(Product).filter(
         Product.id == product_id,
         Product.merchant_id == merchant_id
     ).first()
 
-def get_products_by_merchant(db: Session, merchant_id: int) -> List[Product]:
+def get_products_by_merchant(db: Session, merchant_id: uuid.UUID) -> List[Product]:
     return db.query(Product).filter(Product.merchant_id == merchant_id).all()
 
-def create_product(db: Session, product_in: ProductCreate, merchant_id: int) -> Product:
+def create_product(db: Session, product_in: ProductCreate, merchant_id: uuid.UUID) -> Product:
     slug = generate_slug(db, product_in.name)
     db_product = Product(
         **product_in.model_dump(),
@@ -51,7 +51,7 @@ def delete_product(db: Session, db_product: Product) -> None:
     db.delete(db_product)
     db.commit()
 
-def bulk_upsert_products(db: Session, merchant_id: int, products_data: List[dict], dry_run: bool = False) -> dict:
+def bulk_upsert_products(db: Session, merchant_id: uuid.UUID, products_data: List[dict], dry_run: bool = False) -> dict:
     """
     products_data is a list of dictionaries.
     Uses 'sku' to identify existing products.

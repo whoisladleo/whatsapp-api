@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import uuid
 
 import pytest
 
@@ -461,7 +462,7 @@ def test_unhandled_status_is_ignored(client, order):
 
 
 def test_payment_completed_with_dangling_account_id_does_not_crash(client, db_session, customer):
-    o = Order(customer_id=customer.id, account_id=999999, agreed_price=1000, status=OrderStatus.PENDING)
+    o = Order(customer_id=customer.id, account_id=uuid.uuid4(), agreed_price=1000, status=OrderStatus.PENDING)
     db_session.add(o)
     db_session.commit()
     db_session.refresh(o)
@@ -566,7 +567,7 @@ def test_completed_order_with_no_linked_subscription_is_unaffected(client, db_se
 
 
 def test_renewal_reference_for_unknown_subscription_is_ignored(client):
-    resp = _post(client, {"status": "COMPLETED", "reference_id": "product-subscription-renewal-999999"})
+    resp = _post(client, {"status": "COMPLETED", "reference_id": f"product-subscription-renewal-{uuid.uuid4()}"})
 
     assert resp.status_code == 200
     assert resp.json() == {"status": "ignored", "reason": "Subscription not found"}

@@ -1,3 +1,4 @@
+import uuid
 import logging
 from typing import List, Optional
 
@@ -25,7 +26,7 @@ logger = logging.getLogger(__name__)
 @router.get("", response_model=List[OrderRead])
 def list_orders(
     status: Optional[OrderStatus] = None,
-    account_id: Optional[int] = None,
+    account_id: Optional[uuid.UUID] = None,
     skip: int = 0,
     limit: int = 100,
     db: Session = Depends(get_db),
@@ -38,7 +39,7 @@ def list_orders(
 
 @router.get("/{order_id}", response_model=OrderDetail)
 def get_order(
-    order_id: int,
+    order_id: uuid.UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -50,7 +51,7 @@ def get_order(
 
 @router.get("/{order_id}/payment-history")
 async def get_order_payment_history(
-    order_id: int,
+    order_id: uuid.UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -88,7 +89,7 @@ async def get_order_payment_history(
 
 @router.post("/{order_id}/cancel", response_model=OrderDetail)
 async def cancel_existing_order(
-    order_id: int,
+    order_id: uuid.UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):

@@ -1,3 +1,4 @@
+import uuid
 from datetime import datetime
 
 import pytest
@@ -113,7 +114,7 @@ def test_reminder_send_failure_logs_failed_status(db_session, handed_off_context
 def test_reminder_no_customer_linked(db_session):
     # A context row with no matching customer row (orphaned FK, allowed
     # since SQLite doesn't enforce FKs by default in this test DB).
-    orphan = ConversationContext(customer_id=999999, state=ConversationState.HUMAN_HANDOFF)
+    orphan = ConversationContext(customer_id=uuid.uuid4(), state=ConversationState.HUMAN_HANDOFF)
     db_session.add(orphan)
     db_session.commit()
     db_session.refresh(orphan)
@@ -140,7 +141,7 @@ def test_reminder_no_inbound_history_for_any_account(db_session):
 
 def test_reminder_account_owner_missing(db_session):
     orphan_account = WhatsAppAccount(
-        name="Orphan", phone_number_id="ORPHAN_PHONE", access_token="tok", user_id=999999,
+        name="Orphan", phone_number_id="ORPHAN_PHONE", access_token="tok", user_id=uuid.uuid4(),
     )
     db_session.add(orphan_account)
     db_session.commit()

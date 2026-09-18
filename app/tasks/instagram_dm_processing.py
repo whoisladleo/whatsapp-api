@@ -1,6 +1,7 @@
 import logging
 
 from app.core.celery_app import celery_app
+from app.core.ids import coerce_uuid
 from app.core.instagram_provider import InstagramProvider
 from app.crud import instagram as crud_instagram
 from app.db.models import ConversationState, InstagramAccount, InstagramCustomer
@@ -12,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 @celery_app.task
-def process_inbound_dm(account_id: int, customer_id: int, dm_row_id: int):
+def process_inbound_dm(account_id: str, customer_id: str, dm_row_id: str):
     """
     Generates and sends Amara's reply to an inbound Instagram DM, continuing
     whatever conversation is already on file for this customer. dm_row_id is
@@ -25,9 +26,14 @@ def process_inbound_dm(account_id: int, customer_id: int, dm_row_id: int):
         db.close()
 
 
-async def _process(db, account_id: int, customer_id: int, dm_row_id: int) -> str:
-    account = db.query(InstagramAccount).filter(InstagramAccount.id == account_id).first()
-    customer = db.query(InstagramCustomer).filter(InstagramCustomer.id == customer_id).first()
+async def _process(db, account_id: str, customer_id: str, dm_row_id: str) -> str:
+    account_uuid = coerce_uuid(account_id)
+    customer_uuid = coerce_uuid(customer_id)
+    dm_row_uuid = coerce_uuid(dm_row_id)
+    if account_uuid is None or customer_uuid is None:
+        return "Account or customer not found."
+    account = db.query(InstagramAccount).filter(InstagramAccount.id == account_uuid).first()
+    customer = db.query(InstagramCustomer).filter(InstagramCustomer.id == customer_uuid).first()
     if not account or not customer:
         return "Account or customer not found."
 
@@ -47,9 +53,9 @@ async def _process(db, account_id: int, customer_id: int, dm_row_id: int) -> str
     history = [
         {"direction": m.direction, "body": m.body}
         for m in history_rows
-        if m.id != dm_row_id
+        if m.id != dm_row_uuid
     ]
-    latest = next((m for m in history_rows if m.id == dm_row_id), None)
+    latest = next((m for m in history_rows if m.id == dm_row_uuid), None)
     message_body = latest.body if latest else ""
 
     reply_text = await llm_service.generate_dm_response(

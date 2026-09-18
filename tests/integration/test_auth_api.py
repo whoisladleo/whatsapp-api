@@ -1,4 +1,5 @@
 import json
+import uuid
 
 import httpx
 import jwt
@@ -87,7 +88,7 @@ def test_verify_otp_success_returns_token(client, db_session):
     payload = jwt.decode(
         body["access_token"], settings.SECRET_KEY, algorithms=[settings.ALGORITHM]
     )
-    assert int(payload["sub"]) == user.id
+    assert uuid.UUID(payload["sub"]) == user.id
 
     db_session.refresh(user)
     assert user.otp_code is None
@@ -249,7 +250,7 @@ def test_get_me_returns_profile(client, auth_user):
 
     assert resp.status_code == 200
     body = resp.json()
-    assert body["id"] == user.id
+    assert body["id"] == str(user.id)
     assert body["username"] == user.username
     assert body["phone_number"] is None
 
@@ -489,7 +490,7 @@ def test_pay_now_creates_order_and_pending_subscription(client, auth_user, db_se
 
     assert resp.status_code == 200
     order_id = resp.json()["order_id"]
-    order = db_session.query(Order).filter(Order.id == order_id).first()
+    order = db_session.query(Order).filter(Order.id == uuid.UUID(order_id)).first()
     assert order is not None
     assert order.agreed_price == 100000
     assert order.tunzaa_transaction_id == "MOCK_TXN_PAYNOW_3"
@@ -525,12 +526,14 @@ def test_pay_now_called_twice_reuses_pending_subscription_row(client, auth_user,
     assert second.status_code == 200
     assert first.json()["order_id"] != second.json()["order_id"]
 
-    orders = db_session.query(Order).filter(Order.id.in_([first.json()["order_id"], second.json()["order_id"]])).all()
+    orders = db_session.query(Order).filter(
+        Order.id.in_([uuid.UUID(first.json()["order_id"]), uuid.UUID(second.json()["order_id"])])
+    ).all()
     assert len(orders) == 2
 
     subscriptions = db_session.query(ProductSubscription).all()
     assert len(subscriptions) == 1
-    assert subscriptions[0].order_id == second.json()["order_id"]
+    assert subscriptions[0].order_id == uuid.UUID(second.json()["order_id"])
 
 
 @respx.mock

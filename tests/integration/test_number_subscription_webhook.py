@@ -1,4 +1,5 @@
 import hashlib
+import uuid
 import hmac
 import json
 
@@ -97,7 +98,7 @@ def test_purchase_completed_moves_to_provisioning_and_dispatches_task(
     db_session.refresh(subscription)
     assert subscription.status == NumberSubscriptionStatus.PROVISIONING
     assert subscription.tunzaa_transaction_id == "TXN1"
-    assert calls == [{"args": [subscription.id], "kwargs": {}}]
+    assert calls == [{"args": [str(subscription.id)], "kwargs": {}}]
 
 
 def test_purchase_failed_marks_payment_failed_and_notifies(client, db_session, subscription, monkeypatch):
@@ -132,7 +133,7 @@ def test_renewal_completed_activates_and_schedules_next_charge(client, db_sessio
     assert sub.status == NumberSubscriptionStatus.ACTIVE
     assert sub.retry_count == 0
     assert sub.next_billing_at is not None
-    assert calls[0]["args"] == [sub.id]
+    assert calls[0]["args"] == [str(sub.id)]
     assert calls[0]["kwargs"]["countdown"] == 30 * 86400
 
 
@@ -203,7 +204,7 @@ def test_duplicate_transaction_id_is_ignored(client, db_session, subscription, m
 
 
 def test_unknown_subscription_id_ignored(client):
-    resp = _post(client, {"status": "COMPLETED", "reference_id": "number-purchase-999999"})
+    resp = _post(client, {"status": "COMPLETED", "reference_id": f"number-purchase-{uuid.uuid4()}"})
 
     assert resp.status_code == 200
     assert resp.json()["reason"] == "Subscription not found"

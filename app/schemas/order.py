@@ -1,3 +1,4 @@
+import uuid
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
@@ -5,7 +6,7 @@ from app.db.models import OrderStatus, PaymentType, InstallmentStatus, ProductSu
 
 
 class InstallmentRead(BaseModel):
-    id: int
+    id: uuid.UUID
     amount_due: float
     due_date: datetime
     status: InstallmentStatus
@@ -15,13 +16,13 @@ class InstallmentRead(BaseModel):
 
 
 class OrderRead(BaseModel):
-    id: int
+    id: uuid.UUID
     status: OrderStatus
     payment_type: Optional[PaymentType] = None
     quantity: int
     agreed_price: Optional[float] = None
-    account_id: Optional[int] = None
-    instagram_account_id: Optional[int] = None
+    account_id: Optional[uuid.UUID] = None
+    instagram_account_id: Optional[uuid.UUID] = None
     channel: str = "whatsapp"
     product_name: Optional[str] = None
     customer_phone: Optional[str] = None

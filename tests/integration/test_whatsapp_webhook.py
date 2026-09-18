@@ -624,7 +624,7 @@ def test_inbound_location_message_dispatches_capture_task(client, db_session, me
 
     assert resp.status_code == 200
     assert len(calls) == 1
-    assert calls[0] == [account.id, "255711114444", -6.7924, 39.2083, "My Shop", "123 Main St"]
+    assert calls[0] == [str(account.id), "255711114444", -6.7924, 39.2083, "My Shop", "123 Main St"]
 
     inbound = db_session.query(Message).filter(Message.direction == "inbound").first()
     assert inbound is not None

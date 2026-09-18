@@ -1,3 +1,4 @@
+import uuid
 from typing import List, Optional
 
 from sqlalchemy import or_
@@ -54,9 +55,9 @@ def _to_order_detail(order: Order) -> OrderDetail:
 
 def get_orders_by_merchant(
     db: Session,
-    user_id: int,
+    user_id: uuid.UUID,
     status: Optional[OrderStatus] = None,
-    account_id: Optional[int] = None,
+    account_id: Optional[uuid.UUID] = None,
     skip: int = 0,
     limit: int = 100,
 ) -> List[OrderRead]:
@@ -84,7 +85,7 @@ def get_orders_by_merchant(
     return [_to_order_read(o) for o in orders]
 
 
-def get_order_for_merchant(db: Session, order_id: int, user_id: int) -> Optional[Order]:
+def get_order_for_merchant(db: Session, order_id: uuid.UUID, user_id: uuid.UUID) -> Optional[Order]:
     """Returns the raw ORM Order (not yet serialized) scoped to the merchant, or None."""
     return (
         db.query(Order)
@@ -101,7 +102,7 @@ def get_order_for_merchant(db: Session, order_id: int, user_id: int) -> Optional
     )
 
 
-def get_order_detail_for_merchant(db: Session, order_id: int, user_id: int) -> Optional[OrderDetail]:
+def get_order_detail_for_merchant(db: Session, order_id: uuid.UUID, user_id: uuid.UUID) -> Optional[OrderDetail]:
     order = get_order_for_merchant(db, order_id, user_id)
     return _to_order_detail(order) if order else None
 

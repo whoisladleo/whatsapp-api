@@ -104,7 +104,7 @@ async def handle_purchase_payment_result(
         from app.tasks.number_billing import provision_after_payment
 
         try:
-            provision_after_payment.apply_async(args=[subscription.id])
+            provision_after_payment.apply_async(args=[str(subscription.id)])
         except Exception as e:
             logger.error(f"Failed to schedule provision_after_payment for subscription {subscription.id}: {e}")
     elif status_value in ("FAILED", "CANCELLED"):
@@ -139,7 +139,7 @@ async def handle_renewal_payment_result(
         db.commit()
         try:
             charge_renewal.apply_async(
-                args=[subscription.id], countdown=RENEWAL_PERIOD_DAYS * 86400
+                args=[str(subscription.id)], countdown=RENEWAL_PERIOD_DAYS * 86400
             )
         except Exception as e:
             logger.error(f"Failed to schedule next renewal for subscription {subscription.id}: {e}")
@@ -150,7 +150,7 @@ async def handle_renewal_payment_result(
             db.commit()
             try:
                 charge_renewal.apply_async(
-                    args=[subscription.id], countdown=RENEWAL_RETRY_DELAY_SECONDS
+                    args=[str(subscription.id)], countdown=RENEWAL_RETRY_DELAY_SECONDS
                 )
             except Exception as e:
                 logger.error(f"Failed to schedule renewal retry for subscription {subscription.id}: {e}")

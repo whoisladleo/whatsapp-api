@@ -1,6 +1,7 @@
 import logging
 
 from app.core.celery_app import celery_app
+from app.core.ids import coerce_uuid
 from app.db.session import SessionLocal
 from app.tasks.webhook_processing import _run_async
 
@@ -8,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 
 @celery_app.task
-def charge_renewal(subscription_id: int):
+def charge_renewal(subscription_id: str):
     """Self-rescheduling monthly billing task for a ProductSubscription —
     see app.services.product_subscription.handle_renewal_payment_result for
     what happens once the Tunzaa webhook confirms whether this charge
@@ -16,14 +17,18 @@ def charge_renewal(subscription_id: int):
     return _run_async(_do_charge_renewal(subscription_id))
 
 
-async def _do_charge_renewal(subscription_id: int) -> None:
+async def _do_charge_renewal(subscription_id: str) -> None:
     from app.db.models import ProductSubscription, ProductSubscriptionStatus
     from app.services.tunzaa import tunzaa_service
 
     db = SessionLocal()
     try:
+        subscription_uuid = coerce_uuid(subscription_id)
+        if subscription_uuid is None:
+            logger.error(f"charge_renewal: subscription {subscription_id} not found")
+            return
         subscription = (
-            db.query(ProductSubscription).filter(ProductSubscription.id == subscription_id).first()
+            db.query(ProductSubscription).filter(ProductSubscription.id == subscription_uuid).first()
         )
         if not subscription:
             logger.error(f"charge_renewal: subscription {subscription_id} not found")
@@ -54,7 +59,7 @@ async def _do_charge_renewal(subscription_id: int) -> None:
 
 
 @celery_app.task
-def check_past_due_grace_expired(subscription_id: int):
+def check_past_due_grace_expired(subscription_id: str):
     """
     Scheduled once, exactly PAST_DUE_ACCESS_GRACE_DAYS out, the first time a
     subscription goes PAST_DUE (see
@@ -66,14 +71,18 @@ def check_past_due_grace_expired(subscription_id: int):
     _run_async(_do_check_past_due_grace_expired(subscription_id))
 
 
-async def _do_check_past_due_grace_expired(subscription_id: int) -> None:
+async def _do_check_past_due_grace_expired(subscription_id: str) -> None:
     from app.db.models import ProductSubscription, ProductSubscriptionStatus
     from app.services import product_subscription
 
     db = SessionLocal()
     try:
+        subscription_uuid = coerce_uuid(subscription_id)
+        if subscription_uuid is None:
+            logger.error(f"check_past_due_grace_expired: subscription {subscription_id} not found")
+            return
         subscription = (
-            db.query(ProductSubscription).filter(ProductSubscription.id == subscription_id).first()
+            db.query(ProductSubscription).filter(ProductSubscription.id == subscription_uuid).first()
         )
         if not subscription:
             logger.error(f"check_past_due_grace_expired: subscription {subscription_id} not found")

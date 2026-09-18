@@ -1,4 +1,5 @@
 import secrets
+import uuid
 from typing import Optional
 
 import jwt
@@ -194,7 +195,7 @@ def exchange_facebook_login_code(payload: FacebookExchangeRequest, db: Session =
     """Trades the short-lived code from /facebook/callback for a real session token."""
     try:
         decoded = jwt.decode(payload.code, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        user_id = int(decoded["sub"])
+        user_id = uuid.UUID(decoded["sub"])
     except (jwt.InvalidTokenError, KeyError, TypeError, ValueError):
         raise HTTPException(status_code=401, detail="Invalid or expired login code")
 

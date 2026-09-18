@@ -1,3 +1,4 @@
+import uuid
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
@@ -134,7 +135,7 @@ def read_accounts(
 
 @router.get("/{account_id}/status", response_model=AccountMetaStatus)
 async def get_account_meta_status(
-    account_id: int,
+    account_id: uuid.UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -169,7 +170,7 @@ async def get_account_meta_status(
 
 @router.put("/{account_id}", response_model=AccountResponse)
 async def update_existing_account(
-    account_id: int,
+    account_id: uuid.UUID,
     account_in: AccountUpdate,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
@@ -224,7 +225,7 @@ async def update_existing_account(
 
 @router.delete("/{account_id}")
 def delete_existing_account(
-    account_id: int,
+    account_id: uuid.UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -237,7 +238,7 @@ def delete_existing_account(
 
 @router.post("/{account_id}/purchase-number", response_model=NumberSubscriptionResponse, status_code=status.HTTP_201_CREATED)
 async def purchase_number(
-    account_id: int,
+    account_id: uuid.UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -287,7 +288,7 @@ async def purchase_number(
 
 @router.get("/{account_id}/number-subscription", response_model=NumberSubscriptionResponse)
 def get_number_subscription(
-    account_id: int,
+    account_id: uuid.UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):

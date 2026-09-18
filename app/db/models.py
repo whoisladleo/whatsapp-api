@@ -1,10 +1,18 @@
 import enum
-from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, JSON, Boolean, Float, Enum
+import uuid
+from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, JSON, Boolean, Float, Enum, Uuid
 from sqlalchemy.orm import relationship, DeclarativeBase
 from datetime import datetime
 
 class Base(DeclarativeBase):
     pass
+
+# Renders as a native Postgres UUID column in prod, and degrades to a
+# portable representation (CHAR(32)) on the SQLite test DB — see
+# tests/conftest.py — so every id/FK column uses this instead of Integer.
+# IDs are generated Python-side (default=uuid.uuid4) rather than via
+# server_default=gen_random_uuid(), so no Postgres extension is required.
+UUIDType = Uuid(as_uuid=True, native_uuid=True)
 
 class KYCStatus(enum.Enum):
     DRAFT = "DRAFT"
@@ -56,7 +64,7 @@ class ProvisioningStatus(enum.Enum):
 class User(Base):
     __tablename__ = "users"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(UUIDType, primary_key=True, default=uuid.uuid4, index=True)
     # Nullable: a Facebook-login-only account (see facebook_id below) has no
     # phone number and therefore no username — WhatsApp OTP login and
     # merchant-command routing (matching a WhatsApp sender against
@@ -88,11 +96,11 @@ class User(Base):
 class KnowledgeBase(Base):
     __tablename__ = "knowledge_bases"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(UUIDType, primary_key=True, default=uuid.uuid4, index=True)
     name = Column(String, nullable=False)
     slug = Column(String, unique=True, index=True, nullable=False)
     content = Column(String, nullable=False)  # The actual markdown/text content
-    user_id = Column(Integer, ForeignKey("users.id"))
+    user_id = Column(UUIDType, ForeignKey("users.id"))
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -102,7 +110,7 @@ class KnowledgeBase(Base):
 class WhatsAppAccount(Base):
     __tablename__ = "whatsapp_accounts"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(UUIDType, primary_key=True, default=uuid.uuid4, index=True)
     name = Column(String, nullable=False)
     phone_number_id = Column(String, unique=True, index=True, nullable=False)
     access_token = Column(String, nullable=False)
@@ -112,7 +120,7 @@ class WhatsAppAccount(Base):
     ai_enabled = Column(Boolean, default=True)
     system_prompt = Column(String, nullable=True)
     kyc_status = Column(Enum(KYCStatus), default=KYCStatus.DRAFT)
-    user_id = Column(Integer, ForeignKey("users.id"))
+    user_id = Column(UUIDType, ForeignKey("users.id"))
     created_at = Column(DateTime, default=datetime.utcnow)
 
     owner = relationship("User", back_populates="accounts")
@@ -123,7 +131,7 @@ class WhatsAppAccount(Base):
 class PhoneNumberPool(Base):
     __tablename__ = "phone_number_pool"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(UUIDType, primary_key=True, default=uuid.uuid4, index=True)
     phone_number_id = Column(String, unique=True, index=True, nullable=False)
     display_name = Column(String, nullable=True)  # plain reference label, e.g. "Taskflow Store #4"
     # This number's Cloud API two-step verification PIN, set once during its
@@ -133,7 +141,7 @@ class PhoneNumberPool(Base):
     # name can be submitted but never actually activated.
     two_step_pin = Column(String, nullable=True)
     status = Column(Enum(PhoneNumberStatus), default=PhoneNumberStatus.AVAILABLE, nullable=False)
-    whatsapp_account_id = Column(Integer, ForeignKey("whatsapp_accounts.id"), nullable=True)
+    whatsapp_account_id = Column(UUIDType, ForeignKey("whatsapp_accounts.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     assigned_at = Column(DateTime, nullable=True)
     released_at = Column(DateTime, nullable=True)
@@ -144,7 +152,7 @@ class PhoneNumberPool(Base):
 class PhoneNumberProvisioningAttempt(Base):
     __tablename__ = "phone_number_provisioning_attempts"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(UUIDType, primary_key=True, default=uuid.uuid4, index=True)
     # Twilio's SID for the purchased number — needed to release/cancel it if
     # a later step fails, so a failed run doesn't leave an orphaned,
     # still-billed Twilio number behind.
@@ -183,8 +191,8 @@ class NumberSubscription(Base):
     """
     __tablename__ = "number_subscriptions"
 
-    id = Column(Integer, primary_key=True, index=True)
-    account_id = Column(Integer, ForeignKey("whatsapp_accounts.id"), unique=True, nullable=False)
+    id = Column(UUIDType, primary_key=True, default=uuid.uuid4, index=True)
+    account_id = Column(UUIDType, ForeignKey("whatsapp_accounts.id"), unique=True, nullable=False)
     status = Column(Enum(NumberSubscriptionStatus), default=NumberSubscriptionStatus.PENDING_PAYMENT, nullable=False)
     monthly_amount = Column(Float, nullable=False, default=10000)
     tunzaa_transaction_id = Column(String, nullable=True)
@@ -195,7 +203,7 @@ class NumberSubscription(Base):
     # A second consecutive failure at retry_count == 1 triggers DEACTIVATED.
     retry_count = Column(Integer, default=0, nullable=False)
     provisioning_attempt_id = Column(
-        Integer, ForeignKey("phone_number_provisioning_attempts.id"), nullable=True
+        UUIDType, ForeignKey("phone_number_provisioning_attempts.id"), nullable=True
     )
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -207,8 +215,8 @@ class NumberSubscription(Base):
 class MediaEntry(Base):
     __tablename__ = "media_entries"
 
-    id = Column(Integer, primary_key=True, index=True)
-    account_id = Column(Integer, ForeignKey("whatsapp_accounts.id"))
+    id = Column(UUIDType, primary_key=True, default=uuid.uuid4, index=True)
+    account_id = Column(UUIDType, ForeignKey("whatsapp_accounts.id"))
     media_id = Column(String, nullable=False)
     file_name = Column(String, nullable=False)
     mime_type = Column(String, nullable=False)
@@ -220,7 +228,7 @@ class MediaEntry(Base):
 class Message(Base):
     __tablename__ = "messages"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(UUIDType, primary_key=True, default=uuid.uuid4, index=True)
     whatsapp_message_id = Column(String, unique=True, index=True, nullable=True)
     from_phone = Column(String, nullable=True)
     to_phone = Column(String, nullable=True)
@@ -229,7 +237,7 @@ class Message(Base):
     raw_data = Column(JSON, nullable=True)  # Full raw payload from Meta
     direction = Column(String, nullable=False)  # inbound, outbound
     status = Column(String, default="sent")  # sent, delivered, read, failed
-    account_id = Column(Integer, ForeignKey("whatsapp_accounts.id"))
+    account_id = Column(UUIDType, ForeignKey("whatsapp_accounts.id"))
     timestamp = Column(DateTime, default=datetime.utcnow)
 
     account = relationship("WhatsAppAccount", back_populates="messages")
@@ -246,12 +254,12 @@ class InstagramAccount(Base):
     """
     __tablename__ = "instagram_accounts"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(UUIDType, primary_key=True, default=uuid.uuid4, index=True)
     ig_business_id = Column(String, unique=True, index=True, nullable=False)
     access_token = Column(String, nullable=False)
     username = Column(String, nullable=True)
     ai_enabled = Column(Boolean, default=True)
-    user_id = Column(Integer, ForeignKey("users.id"))
+    user_id = Column(UUIDType, ForeignKey("users.id"))
     created_at = Column(DateTime, default=datetime.utcnow)
 
     owner = relationship("User", back_populates="instagram_accounts")
@@ -266,7 +274,7 @@ class InstagramComment(Base):
     """
     __tablename__ = "instagram_comments"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(UUIDType, primary_key=True, default=uuid.uuid4, index=True)
     comment_id = Column(String, unique=True, index=True, nullable=False)
     media_id = Column(String, nullable=True)
     from_username = Column(String, nullable=True)
@@ -278,7 +286,7 @@ class InstagramComment(Base):
     # Private replies are one-shot per comment (Meta allows exactly one),
     # so this also guards against re-sending on a duplicate webhook delivery.
     private_reply_sent = Column(Boolean, default=False, nullable=False)
-    account_id = Column(Integer, ForeignKey("instagram_accounts.id"))
+    account_id = Column(UUIDType, ForeignKey("instagram_accounts.id"))
     created_at = Column(DateTime, default=datetime.utcnow)
 
     account = relationship("InstagramAccount", back_populates="comments")
@@ -297,10 +305,10 @@ class InstagramCustomer(Base):
     """
     __tablename__ = "instagram_customers"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(UUIDType, primary_key=True, default=uuid.uuid4, index=True)
     ig_scoped_id = Column(String, unique=True, index=True, nullable=False)
     username = Column(String, nullable=True)
-    account_id = Column(Integer, ForeignKey("instagram_accounts.id"), nullable=False)
+    account_id = Column(UUIDType, ForeignKey("instagram_accounts.id"), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     account = relationship("InstagramAccount")
@@ -312,8 +320,8 @@ class InstagramCustomer(Base):
 class InstagramConversationContext(Base):
     __tablename__ = "instagram_conversation_contexts"
 
-    id = Column(Integer, primary_key=True, index=True)
-    customer_id = Column(Integer, ForeignKey("instagram_customers.id"), unique=True)
+    id = Column(UUIDType, primary_key=True, default=uuid.uuid4, index=True)
+    customer_id = Column(UUIDType, ForeignKey("instagram_customers.id"), unique=True)
     # Reuses WhatsApp's ConversationState enum (NEGOTIATING/HUMAN_HANDOFF/
     # MANAGEMENT) — same three states apply here.
     state = Column(Enum(ConversationState), default=ConversationState.NEGOTIATING)
@@ -327,10 +335,10 @@ class InstagramConversationContext(Base):
 class InstagramDirectMessage(Base):
     __tablename__ = "instagram_direct_messages"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(UUIDType, primary_key=True, default=uuid.uuid4, index=True)
     ig_message_id = Column(String, unique=True, index=True, nullable=True)
-    account_id = Column(Integer, ForeignKey("instagram_accounts.id"), nullable=False)
-    customer_id = Column(Integer, ForeignKey("instagram_customers.id"), nullable=False)
+    account_id = Column(UUIDType, ForeignKey("instagram_accounts.id"), nullable=False)
+    customer_id = Column(UUIDType, ForeignKey("instagram_customers.id"), nullable=False)
     direction = Column(String, nullable=False)  # inbound, outbound
     body = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -342,7 +350,7 @@ class InstagramDirectMessage(Base):
 class Product(Base):
     __tablename__ = "products"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(UUIDType, primary_key=True, default=uuid.uuid4, index=True)
     slug = Column(String, unique=True, index=True, nullable=False)
     name = Column(String, nullable=False)
     description = Column(String, nullable=True)
@@ -363,7 +371,7 @@ class Product(Base):
     # tells _close_deal/_close_instagram_deal to also create the
     # ProductSubscription that drives billing from month 2 onward.
     is_subscription = Column(Boolean, default=False, nullable=False)
-    merchant_id = Column(Integer, ForeignKey("users.id"))
+    merchant_id = Column(UUIDType, ForeignKey("users.id"))
     created_at = Column(DateTime, default=datetime.utcnow)
 
     merchant = relationship("User", back_populates="products")
@@ -372,7 +380,7 @@ class Product(Base):
 class Customer(Base):
     __tablename__ = "customers"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(UUIDType, primary_key=True, default=uuid.uuid4, index=True)
     phone_number = Column(String, unique=True, index=True, nullable=False)
     delivery_address = Column(String, nullable=True)
     delivery_latitude = Column(Float, nullable=True)
@@ -386,16 +394,16 @@ class Customer(Base):
 class Order(Base):
     __tablename__ = "orders"
 
-    id = Column(Integer, primary_key=True, index=True)
-    customer_id = Column(Integer, ForeignKey("customers.id"))
-    product_id = Column(Integer, ForeignKey("products.id"), nullable=True)
-    account_id = Column(Integer, ForeignKey("whatsapp_accounts.id"), nullable=True)
+    id = Column(UUIDType, primary_key=True, default=uuid.uuid4, index=True)
+    customer_id = Column(UUIDType, ForeignKey("customers.id"))
+    product_id = Column(UUIDType, ForeignKey("products.id"), nullable=True)
+    account_id = Column(UUIDType, ForeignKey("whatsapp_accounts.id"), nullable=True)
     # An order originates from exactly one channel — this is set instead of
     # account_id for a deal Amara closed over Instagram DM (see
     # LLMService._close_instagram_deal), which needs a real Customer/Order
     # too but has no WhatsAppAccount to hang off (a merchant can be
     # Instagram-only). Never both set on the same order.
-    instagram_account_id = Column(Integer, ForeignKey("instagram_accounts.id"), nullable=True)
+    instagram_account_id = Column(UUIDType, ForeignKey("instagram_accounts.id"), nullable=True)
     quantity = Column(Integer, default=1)
     payment_type = Column(Enum(PaymentType), nullable=True)
     tunzaa_transaction_id = Column(String, nullable=True)
@@ -423,8 +431,8 @@ class Order(Base):
 class Installment(Base):
     __tablename__ = "installments"
 
-    id = Column(Integer, primary_key=True, index=True)
-    order_id = Column(Integer, ForeignKey("orders.id"))
+    id = Column(UUIDType, primary_key=True, default=uuid.uuid4, index=True)
+    order_id = Column(UUIDType, ForeignKey("orders.id"))
     tunzaa_installment_id = Column(String, nullable=True)
     amount_due = Column(Float, nullable=False)
     due_date = Column(DateTime, nullable=False)
@@ -454,16 +462,16 @@ class ProductSubscription(Base):
     """
     __tablename__ = "product_subscriptions"
 
-    id = Column(Integer, primary_key=True, index=True)
-    order_id = Column(Integer, ForeignKey("orders.id"), unique=True, nullable=False)
-    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False)
-    product_id = Column(Integer, ForeignKey("products.id"), nullable=False)
+    id = Column(UUIDType, primary_key=True, default=uuid.uuid4, index=True)
+    order_id = Column(UUIDType, ForeignKey("orders.id"), unique=True, nullable=False)
+    customer_id = Column(UUIDType, ForeignKey("customers.id"), nullable=False)
+    product_id = Column(UUIDType, ForeignKey("products.id"), nullable=False)
     # Set only when the deal closed over Instagram DM — the phone-keyed
     # Customer above has no IGSID, so this is what lets renewal-failure
     # notifications go out as an Instagram DM instead of (silently failing
     # to send as) a WhatsApp message. NULL means the deal closed on
     # WhatsApp; see app/services/product_subscription.py's channel handling.
-    instagram_customer_id = Column(Integer, ForeignKey("instagram_customers.id"), nullable=True)
+    instagram_customer_id = Column(UUIDType, ForeignKey("instagram_customers.id"), nullable=True)
     status = Column(Enum(ProductSubscriptionStatus), default=ProductSubscriptionStatus.PENDING_PAYMENT, nullable=False)
     monthly_amount = Column(Float, nullable=False)
     tunzaa_transaction_id = Column(String, nullable=True)
@@ -488,8 +496,8 @@ class ProductSubscription(Base):
 class ConversationContext(Base):
     __tablename__ = "conversation_contexts"
 
-    id = Column(Integer, primary_key=True, index=True)
-    customer_id = Column(Integer, ForeignKey("customers.id"), unique=True)
+    id = Column(UUIDType, primary_key=True, default=uuid.uuid4, index=True)
+    customer_id = Column(UUIDType, ForeignKey("customers.id"), unique=True)
     state = Column(Enum(ConversationState), default=ConversationState.NEGOTIATING)
     failed_cycles = Column(Integer, default=0)
     current_product_intent = Column(String, nullable=True)

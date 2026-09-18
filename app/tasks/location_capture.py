@@ -2,6 +2,7 @@ import asyncio
 import logging
 
 from app.core.celery_app import celery_app
+from app.core.ids import coerce_uuid
 from app.core.security import normalize_phone
 from app.db.models import Customer, WhatsAppAccount
 from app.db.session import SessionLocal
@@ -11,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 @celery_app.task
 def capture_customer_location(
-    account_id: int,
+    account_id: str,
     from_phone: str,
     latitude: float,
     longitude: float,
@@ -44,7 +45,10 @@ def capture_customer_location(
             customer.delivery_address = label
         db.commit()
 
-        account = db.query(WhatsAppAccount).filter(WhatsAppAccount.id == account_id).first()
+        account_uuid = coerce_uuid(account_id)
+        if account_uuid is None:
+            return "Location saved; no account to send a confirmation from."
+        account = db.query(WhatsAppAccount).filter(WhatsAppAccount.id == account_uuid).first()
         if not account:
             return "Location saved; no account to send a confirmation from."
 

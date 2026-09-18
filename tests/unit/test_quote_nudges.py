@@ -1,3 +1,4 @@
+import uuid
 from datetime import datetime
 
 import pytest
@@ -137,7 +138,7 @@ def test_first_nudge_sends_increments_and_reschedules(db_session, quoted_context
     assert outbound is not None
     assert outbound.status == "sent"
 
-    assert rescheduled["args"] == [context_id, account_id, quote_iso, 2]
+    assert rescheduled["args"] == [str(context_id), str(account_id), quote_iso, 2]
     assert rescheduled["countdown"] == quote_nudges.QUOTE_NUDGE_INTERVALS_SECONDS[1]
 
 
@@ -226,7 +227,7 @@ def test_reschedule_failure_does_not_break_the_send(db_session, quoted_context, 
 def test_no_customer_linked(db_session, account):
     # customer_id points at a row that doesn't exist -> context.customer is None
     orphan_context = ConversationContext(
-        customer_id=999999,
+        customer_id=uuid.uuid4(),
         pending_quote_price=1000.0,
         pending_quote_at=datetime.utcnow(),
         quote_nudge_count=0,

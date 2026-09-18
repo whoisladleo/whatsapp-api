@@ -1,3 +1,4 @@
+import uuid
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
@@ -35,8 +36,8 @@ class AccountUpdate(BaseModel):
     reassign_from_pool: bool = False
 
 class AccountResponse(AccountBase):
-    id: int
-    user_id: int
+    id: uuid.UUID
+    user_id: uuid.UUID
     created_at: datetime
     # We omit access_token from response for security
 
@@ -68,7 +69,7 @@ class AccountMetaStatus(BaseModel):
 class NumberSubscriptionResponse(BaseModel):
     """Billing state for an on-demand purchased number — see
     app/services/number_billing.py and app/db/models.py's NumberSubscription."""
-    id: int
+    id: uuid.UUID
     status: str
     monthly_amount: float
     next_billing_at: Optional[datetime] = None

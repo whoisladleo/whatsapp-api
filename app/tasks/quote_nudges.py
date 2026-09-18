@@ -2,6 +2,7 @@ import asyncio
 import logging
 
 from app.core.celery_app import celery_app
+from app.core.ids import coerce_uuid
 from app.db.session import SessionLocal
 from app.db.models import ConversationContext, WhatsAppAccount
 from app.crud import message as crud_message
@@ -22,7 +23,7 @@ def _send_sync(provider, to, body):
 
 
 @celery_app.task
-def send_quote_nudge(context_id: int, account_id: int, scheduled_quote_at_iso: str, nudge_number: int):
+def send_quote_nudge(context_id: str, account_id: str, scheduled_quote_at_iso: str, nudge_number: int):
     """
     One leg of the "still interested?" follow-up cascade for a customer who
     was quoted a price and went quiet. Scheduled once at quote time (see
@@ -40,7 +41,11 @@ def send_quote_nudge(context_id: int, account_id: int, scheduled_quote_at_iso: s
     logger.info(f"Executing quote nudge {nudge_number} for context {context_id}")
     db = SessionLocal()
     try:
-        context = db.query(ConversationContext).filter(ConversationContext.id == context_id).first()
+        context_uuid = coerce_uuid(context_id)
+        account_uuid = coerce_uuid(account_id)
+        if context_uuid is None:
+            return "No pending quote for this context."
+        context = db.query(ConversationContext).filter(ConversationContext.id == context_uuid).first()
         if not context or not context.pending_quote_at:
             return "No pending quote for this context."
 
@@ -54,7 +59,9 @@ def send_quote_nudge(context_id: int, account_id: int, scheduled_quote_at_iso: s
         if not customer:
             return "No customer linked to this context."
 
-        account = db.query(WhatsAppAccount).filter(WhatsAppAccount.id == account_id).first()
+        if account_uuid is None:
+            return "Account not found."
+        account = db.query(WhatsAppAccount).filter(WhatsAppAccount.id == account_uuid).first()
         if not account:
             return "Account not found."
 
@@ -89,7 +96,7 @@ def send_quote_nudge(context_id: int, account_id: int, scheduled_quote_at_iso: s
         if nudge_number < MAX_QUOTE_NUDGES:
             try:
                 send_quote_nudge.apply_async(
-                    args=[context_id, account_id, scheduled_quote_at_iso, nudge_number + 1],
+                    args=[str(context_uuid), str(account_uuid), scheduled_quote_at_iso, nudge_number + 1],
                     countdown=QUOTE_NUDGE_INTERVALS_SECONDS[nudge_number],
                 )
             except Exception as sched_err:
