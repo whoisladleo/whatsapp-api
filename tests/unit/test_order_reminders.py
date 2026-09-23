@@ -195,6 +195,19 @@ def test_send_scarcity_nudge_sends_template(db_session, pending_order, monkeypat
     assert body_params[1]["text"] == "45,000"
 
 
+def test_send_scarcity_nudge_uses_customers_classified_language(db_session, pending_order, customer, monkeypatch):
+    customer.language = "sw"
+    db_session.commit()
+
+    calls = []
+    _mock_send_template(monkeypatch, calls=calls)
+
+    result = order_reminders.send_scarcity_nudge(pending_order.id)
+
+    assert result == "Success"
+    assert calls[0]["language_code"] == "sw"
+
+
 def test_send_scarcity_nudge_falls_back_to_generic_name_when_no_product(db_session, customer, account, monkeypatch):
     """order.product can be None (nullable product_id) — must not crash
     building the template parameters."""

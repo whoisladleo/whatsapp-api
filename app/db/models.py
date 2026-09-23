@@ -385,6 +385,15 @@ class Customer(Base):
     delivery_address = Column(String, nullable=True)
     delivery_latitude = Column(Float, nullable=True)
     delivery_longitude = Column(Float, nullable=True)
+    # Classified once by the model itself (see llm.py's [LANGUAGE: ..]
+    # marker) the first time this customer messages, from whichever
+    # channel gets there first — never re-classified afterward, so a
+    # customer who switches languages mid-conversation keeps whatever was
+    # detected first. NULL until classified; used to pick which language
+    # variant of a customer-facing template to send (see
+    # app/tasks/order_reminders.py), falling back to
+    # settings.WHATSAPP_REMINDER_TEMPLATE_LANGUAGE when still unset.
+    language = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     orders = relationship("Order", back_populates="customer")

@@ -17,7 +17,13 @@ from app.db.models import (
     User,
     WhatsAppAccount,
 )
-from app.services.llm import LLMService, _parse_and_strip_agreement, _parse_and_strip_quote, _truncate_for_alert
+from app.services.llm import (
+    LLMService,
+    _parse_and_strip_agreement,
+    _parse_and_strip_language,
+    _parse_and_strip_quote,
+    _truncate_for_alert,
+)
 
 MESSAGES_URL_RE = r"https://graph\.facebook\.com/.+/messages$"
 TOKEN_URL = "https://pay.tunzaa.co.tz/accounts/request/token"
@@ -163,6 +169,71 @@ async def test_creates_customer_and_context_on_first_contact(db_session, shop_ac
     ).first()
     assert context is not None
     assert context.state == ConversationState.NEGOTIATING
+
+
+# --- Customer.language classification -----------------------------------
+
+
+async def test_prompts_for_language_marker_when_customer_language_unset(db_session, shop_account):
+    captured = {}
+    service = _service_with_fake_client(captured=captured)
+
+    await service.generate_response(
+        message_body="hello", from_phone="255711130100", db=db_session, account=shop_account,
+    )
+
+    assert "[LANGUAGE: en]" in captured["system"]
+
+
+async def test_does_not_prompt_for_language_marker_once_already_classified(db_session, shop_account):
+    customer = Customer(phone_number="255711130101", language="sw")
+    db_session.add(customer)
+    db_session.commit()
+
+    captured = {}
+    service = _service_with_fake_client(captured=captured)
+
+    await service.generate_response(
+        message_body="habari", from_phone="255711130101", db=db_session, account=shop_account,
+    )
+
+    assert "[LANGUAGE:" not in captured["system"]
+
+
+async def test_language_marker_in_reply_is_persisted_and_stripped(db_session, shop_account):
+    async def handler(**kwargs):
+        return _FakeResponse("Karibu Taskflow OS! [LANGUAGE: sw]")
+
+    service = _service_with_fake_client(handler=handler)
+
+    result = await service.generate_response(
+        message_body="Habari, unauzaje?", from_phone="255711130102", db=db_session, account=shop_account,
+    )
+
+    assert result == "Karibu Taskflow OS!"
+    assert "[LANGUAGE:" not in result
+    customer = db_session.query(Customer).filter(Customer.phone_number == "255711130102").first()
+    assert customer.language == "sw"
+
+
+async def test_language_marker_does_not_overwrite_already_classified_language(db_session, shop_account):
+    customer = Customer(phone_number="255711130103", language="en")
+    db_session.add(customer)
+    db_session.commit()
+
+    async def handler(**kwargs):
+        # Model shouldn't be asked for this once classified, but confirm
+        # the guard holds even if one somehow slips through.
+        return _FakeResponse("Hi there! [LANGUAGE: sw]")
+
+    service = _service_with_fake_client(handler=handler)
+
+    await service.generate_response(
+        message_body="hi", from_phone="255711130103", db=db_session, account=shop_account,
+    )
+
+    db_session.refresh(customer)
+    assert customer.language == "en"
 
 
 async def test_extracts_text_when_thinking_block_precedes_it(db_session, shop_account):
@@ -1148,6 +1219,24 @@ def test_parse_and_strip_quote_no_marker_returns_none():
     text, quote = _parse_and_strip_quote("Just chatting, no price yet.")
     assert text == "Just chatting, no price yet."
     assert quote is None
+
+
+def test_parse_and_strip_language_extracts_and_strips_marker():
+    text, language = _parse_and_strip_language("Karibu! [LANGUAGE: sw]")
+    assert text == "Karibu!"
+    assert language == "sw"
+
+
+def test_parse_and_strip_language_case_insensitive():
+    text, language = _parse_and_strip_language("Hello! [language: EN]")
+    assert text == "Hello!"
+    assert language == "en"
+
+
+def test_parse_and_strip_language_no_marker_returns_none():
+    text, language = _parse_and_strip_language("Just a normal reply.")
+    assert text == "Just a normal reply."
+    assert language is None
 
 
 async def test_quote_marker_tracked_and_nudge_scheduled(db_session, shop_account, shoes, monkeypatch):

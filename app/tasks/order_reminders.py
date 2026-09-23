@@ -139,7 +139,12 @@ def send_scarcity_nudge(order_id: str):
                 provider,
                 order.customer.phone_number,
                 template_name=settings.WHATSAPP_REMINDER_TEMPLATE_NAME,
-                template_language=settings.WHATSAPP_REMINDER_TEMPLATE_LANGUAGE,
+                # order_reminder is registered in both "en" and "sw" under
+                # the same template name — Customer.language (classified
+                # once by the model itself, see llm.py's [LANGUAGE: ..]
+                # marker) picks which variant to send, falling back to the
+                # configured default while still unclassified.
+                template_language=order.customer.language or settings.WHATSAPP_REMINDER_TEMPLATE_LANGUAGE,
                 template_components=_order_reminder_components(order),
             )
         except Exception as e:

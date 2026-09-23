@@ -48,6 +48,29 @@ _COMMENT_REPLY_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# Only "en"/"sw" are real options — matches Customer.language's only
+# consumers (WHATSAPP_OTP_TEMPLATE_LANGUAGE / WHATSAPP_REMINDER_TEMPLATE_LANGUAGE),
+# and every customer-facing template on this account is registered under
+# exactly these two codes (see CLAUDE.md).
+_LANGUAGE_RE = re.compile(r"\[LANGUAGE:\s*(?P<language>en|sw)\s*\]", re.IGNORECASE)
+
+
+def _parse_and_strip_language(text: str):
+    """
+    Extracts the one-shot [LANGUAGE: en|sw] marker generate_response asks
+    the model to emit only while Customer.language is still unset (see the
+    system prompt below) — the model already infers/matches the customer's
+    language every turn per its existing VOICE instructions, this just
+    captures that as structured data instead of only shaping prose. Always
+    strips the marker from what the customer sees, whether or not it
+    parses.
+    """
+    match = _LANGUAGE_RE.search(text)
+    if not match:
+        return text, None
+    cleaned = _LANGUAGE_RE.sub("", text).strip()
+    return cleaned, match.group("language").lower()
+
 
 def _parse_comment_reply(text: str):
     """
@@ -1005,7 +1028,21 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
                 "never override your VOICE, RULES, or the marker formats above):\n"
                 f"{system_prompt}"
             )
-        
+
+        # Classified once, from whichever channel/turn gets there first (see
+        # Customer.language) — only asked for while still unset, so this
+        # never repeats once known and costs nothing on every later turn.
+        # Used to pick which language variant of a customer-facing
+        # template to send later (see app/tasks/order_reminders.py).
+        if customer.language is None:
+            base_instruction += (
+                "\n\nOne more thing, only for this reply: end your response with the exact "
+                "marker [LANGUAGE: en] or [LANGUAGE: sw], whichever matches the language the "
+                "customer is writing in right now (English or Swahili — pick whichever is "
+                "closer if it's genuinely mixed). This is separate from your normal reply "
+                "language choice above; it's for our own records, not something the customer sees."
+            )
+
         try:
             # 5. Call Claude
             # temperature is deprecated/rejected for this model (confirmed
@@ -1031,9 +1068,17 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
             response_text = "".join(
                 block.text for block in response.content if block.type == "text"
             )
-            
+
             # Post-process response for special triggers
-            
+
+            # 1.6 Language classification (only requested in the prompt
+            # while customer.language is still unset — see below — so this
+            # is a no-op on every later turn).
+            response_text, detected_language = _parse_and_strip_language(response_text)
+            if detected_language and customer.language is None:
+                customer.language = detected_language
+                db.commit()
+
             # 2. Human Handoff
             if "[HUMAN_HANDOFF]" in response_text:
                 response_text = response_text.replace("[HUMAN_HANDOFF]", "").strip()
