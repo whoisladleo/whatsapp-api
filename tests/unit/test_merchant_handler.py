@@ -1,15 +1,24 @@
+import json
+
+import httpx
 import pytest
+import respx
 
 from app.db.models import (
     ConversationContext,
     ConversationState,
     Customer,
+    InstagramAccount,
+    InstagramCustomer,
     Message,
     Product,
     User,
     WhatsAppAccount,
 )
 from app.services.merchant_handler import handle_merchant_message
+
+WHATSAPP_MESSAGES_URL_RE = r"https://graph\.facebook\.com/.+/messages$"
+INSTAGRAM_MESSAGES_URL_RE = r"https://graph\.instagram\.com/.+/messages$"
 
 
 @pytest.fixture
@@ -243,3 +252,165 @@ async def test_resume_success(db_session, merchant_account):
     assert context.state == ConversationState.NEGOTIATING
     assert context.handoff_at is None
     assert "resumed" in reply.lower()
+
+
+# --- /reply --------------------------------------------------------------
+
+
+async def test_reply_missing_args_shows_usage(db_session, merchant_account):
+    reply = await handle_merchant_message(db_session, merchant_account, "/reply", "255700000099")
+
+    assert "Usage" in reply
+
+
+async def test_reply_missing_message_shows_usage(db_session, merchant_account):
+    reply = await handle_merchant_message(
+        db_session, merchant_account, "/reply 255722223333", "255700000099"
+    )
+
+    assert "Usage" in reply
+
+
+@respx.mock
+async def test_reply_whatsapp_customer_no_history_is_rejected(db_session, merchant_account):
+    route = respx.post(url__regex=WHATSAPP_MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "wamid.1"}]})
+    )
+
+    reply = await handle_merchant_message(
+        db_session, merchant_account, "/reply 255722229999 Hello there", "255700000099"
+    )
+
+    assert "No conversation with 255722229999 found for this account" in reply
+    assert not route.called
+
+
+@respx.mock
+async def test_reply_whatsapp_customer_success(db_session, merchant_account):
+    customer, context = await _handed_off_customer(db_session, merchant_account)
+    route = respx.post(url__regex=WHATSAPP_MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "wamid.reply1"}]})
+    )
+
+    reply = await handle_merchant_message(
+        db_session, merchant_account, f"/reply {customer.phone_number} We'll ship it today.", "255700000099"
+    )
+
+    assert route.called
+    sent = json.loads(route.calls.last.request.content)
+    assert sent["to"] == customer.phone_number
+    assert sent["text"]["body"] == "We'll ship it today."
+    assert f"Sent to {customer.phone_number}" in reply
+
+    outbound = db_session.query(Message).filter(
+        Message.to_phone == customer.phone_number, Message.direction == "outbound"
+    ).first()
+    assert outbound is not None
+    assert outbound.body == "We'll ship it today."
+    assert outbound.whatsapp_message_id == "wamid.reply1"
+
+
+@respx.mock
+async def test_reply_whatsapp_customer_meta_error_is_reported(db_session, merchant_account):
+    customer, _ = await _handed_off_customer(db_session, merchant_account)
+    respx.post(url__regex=WHATSAPP_MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(400, json={"error": {"message": "recipient not on WhatsApp"}})
+    )
+
+    reply = await handle_merchant_message(
+        db_session, merchant_account, f"/reply {customer.phone_number} hi", "255700000099"
+    )
+
+    assert "Failed to send reply" in reply
+    assert "recipient not on WhatsApp" in reply
+
+
+async def test_reply_instagram_no_account_connected(db_session, merchant_account):
+    reply = await handle_merchant_message(
+        db_session, merchant_account, "/reply @some_customer hi there", "255700000099"
+    )
+
+    assert "No Instagram account connected" in reply
+
+
+async def test_reply_instagram_unknown_customer(db_session, merchant_account):
+    ig_account = InstagramAccount(
+        ig_business_id="ig_biz_1", access_token="ig-tok", username="shop",
+        user_id=merchant_account.user_id,
+    )
+    db_session.add(ig_account)
+    db_session.commit()
+
+    reply = await handle_merchant_message(
+        db_session, merchant_account, "/reply @nobody hi there", "255700000099"
+    )
+
+    assert "No Instagram conversation with @nobody found" in reply
+
+
+@respx.mock
+async def test_reply_instagram_customer_success(db_session, merchant_account):
+    ig_account = InstagramAccount(
+        ig_business_id="ig_biz_1", access_token="ig-tok", username="shop",
+        user_id=merchant_account.user_id,
+    )
+    db_session.add(ig_account)
+    db_session.commit()
+    db_session.refresh(ig_account)
+
+    ig_customer = InstagramCustomer(
+        ig_scoped_id="igsid_1", username="commenter1", account_id=ig_account.id,
+    )
+    db_session.add(ig_customer)
+    db_session.commit()
+
+    route = respx.post(url__regex=INSTAGRAM_MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(200, json={"recipient_id": "igsid_1", "message_id": "ig_msg_1"})
+    )
+
+    reply = await handle_merchant_message(
+        db_session, merchant_account, "/reply @commenter1 It's back in stock!", "255700000099"
+    )
+
+    assert route.called
+    sent = json.loads(route.calls.last.request.content)
+    assert sent["recipient"] == {"id": "igsid_1"}
+    assert sent["message"] == {"text": "It's back in stock!"}
+    assert "Sent to @commenter1" in reply
+
+    from app.db.models import InstagramDirectMessage
+
+    outbound = db_session.query(InstagramDirectMessage).filter(
+        InstagramDirectMessage.customer_id == ig_customer.id, InstagramDirectMessage.direction == "outbound"
+    ).first()
+    assert outbound is not None
+    assert outbound.body == "It's back in stock!"
+    assert outbound.ig_message_id == "ig_msg_1"
+
+
+@respx.mock
+async def test_reply_instagram_customer_meta_error_is_reported(db_session, merchant_account):
+    ig_account = InstagramAccount(
+        ig_business_id="ig_biz_1", access_token="ig-tok", username="shop",
+        user_id=merchant_account.user_id,
+    )
+    db_session.add(ig_account)
+    db_session.commit()
+    db_session.refresh(ig_account)
+
+    ig_customer = InstagramCustomer(
+        ig_scoped_id="igsid_1", username="commenter1", account_id=ig_account.id,
+    )
+    db_session.add(ig_customer)
+    db_session.commit()
+
+    respx.post(url__regex=INSTAGRAM_MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(400, json={"error": {"message": "user not reachable"}})
+    )
+
+    reply = await handle_merchant_message(
+        db_session, merchant_account, "/reply @commenter1 hi", "255700000099"
+    )
+
+    assert "Failed to send reply" in reply
+    assert "user not reachable" in reply
