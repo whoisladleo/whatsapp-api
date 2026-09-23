@@ -232,6 +232,10 @@ def test_request_otp_sends_authentication_template_with_code(client, db_session)
     payload = json.loads(route.calls[0].request.content)
     assert payload["type"] == "template"
     assert payload["template"]["name"] == settings.WHATSAPP_OTP_TEMPLATE_NAME
+    # Must match the template's actual registered locale, not just its
+    # display name ("English" is commonly "en", not "en_US") — a mismatch
+    # fails with Meta error 132001.
+    assert payload["template"]["language"]["code"] == settings.WHATSAPP_OTP_TEMPLATE_LANGUAGE
 
     user = db_session.query(User).filter(User.username == PHONE).first()
     components = payload["template"]["components"]
@@ -240,6 +244,29 @@ def test_request_otp_sends_authentication_template_with_code(client, db_session)
     assert components[1]["type"] == "button"
     assert components[1]["sub_type"] == "copy_code"
     assert components[1]["parameters"][0]["coupon_code"] == user.otp_code
+
+
+@respx.mock
+def test_request_otp_template_uses_configured_language_code(client, db_session, monkeypatch):
+    """
+    Regression test: Meta templates are keyed by (name, language) — a
+    template Meta's UI displays as "English" is commonly registered under
+    the bare "en" code, not "en_US". Sending the wrong one fails with
+    error 132001 ("template name does not exist in <language>") even
+    though the template exists and is approved. This must be configurable
+    per-deployment rather than hardcoded, since it depends on how the
+    template was actually created in WhatsApp Manager.
+    """
+    monkeypatch.setattr(settings, "WHATSAPP_OTP_TEMPLATE_LANGUAGE", "sw")
+    route = respx.post(url__regex=r"https://graph\.facebook\.com/.+/messages$").mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "wamid.otp"}]})
+    )
+
+    resp = client.post("/api/v1/auth/request-otp", json={"username": PHONE})
+
+    assert resp.status_code == 200
+    payload = json.loads(route.calls[0].request.content)
+    assert payload["template"]["language"]["code"] == "sw"
 
 
 @respx.mock

@@ -134,6 +134,15 @@ class Settings(BaseSettings):
     # approved in Meta Business Manager.
     WHATSAPP_OTP_TEMPLATE_NAME: Optional[str] = "taskflow_login"
 
+    # The template's registered locale code — NOT necessarily "en_US" just
+    # because Meta's UI labels it "English": templates created via the
+    # WhatsApp Manager UI commonly register under the bare "en" code, and
+    # sending with the wrong one fails with Meta error 132001 ("template
+    # name does not exist in <language>"). Check the template's actual
+    # code in WhatsApp Manager (not just its display name) before changing
+    # this — confirmed "en" for taskflow_login as of 2026-09.
+    WHATSAPP_OTP_TEMPLATE_LANGUAGE: str = "en"
+
     # Cloudflare R2
     R2_ACCOUNT_ID: Optional[str] = None
     R2_ACCESS_KEY_ID: Optional[str] = None

@@ -46,6 +46,7 @@ async def send_otp_message(phone_number: str, otp: str):
             response = await provider.send_template(
                 to=phone_number,
                 name=settings.WHATSAPP_OTP_TEMPLATE_NAME,
+                language_code=settings.WHATSAPP_OTP_TEMPLATE_LANGUAGE,
                 components=[
                     {"type": "body", "parameters": [{"type": "text", "text": otp}]},
                     {
