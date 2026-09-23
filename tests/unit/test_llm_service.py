@@ -1,3 +1,5 @@
+import json
+
 import httpx
 import pytest
 import respx
@@ -575,13 +577,18 @@ async def test_human_handoff_trigger_updates_state_and_alerts_merchant(
     assert context.handoff_at is not None
 
     assert alert_route.called
-    sent_body = alert_route.calls.last.request.content.decode()
-    assert "255711116666" in sent_body
+    sent_payload = json.loads(alert_route.calls.last.request.content)
+    assert sent_payload["type"] == "template"
+    assert sent_payload["template"]["name"] == "handoff_notification"
+    header_params = sent_payload["template"]["components"][0]["parameters"]
+    body_params = sent_payload["template"]["components"][1]["parameters"]
+    assert {"type": "text", "parameter_name": "customer", "text": "255711116666"} in header_params
+    assert {"type": "text", "parameter_name": "customer", "text": "255711116666"} in body_params
     # The alert must quote what the *customer* said, not Amara's own reply
     # — that's what the merchant actually has to respond to.
-    assert "I need a human" in sent_body
+    assert {"type": "text", "parameter_name": "message", "text": "I need a human"} in body_params
+    sent_body = alert_route.calls.last.request.content.decode()
     assert "Let me get a human." not in sent_body
-    assert "/reply 255711116666 your message" in sent_body
 
     # The alert itself is logged as an outbound Message, unlike before.
     alert_message = (
@@ -1098,10 +1105,10 @@ async def test_agreement_out_of_stock_ignored(db_session, shop_account, shoes):
 
 
 async def test_agreement_and_handoff_together_handoff_wins(db_session, shop_account, shoes, merchant, monkeypatch):
-    async def fake_alert(self, to, body, preview_url=False):
+    async def fake_alert(self, to, name, language_code="en_US", components=None):
         return {"messages": [{"id": "wamid.alert"}]}
 
-    monkeypatch.setattr("app.core.provider.WhatsAppProvider.send_text", fake_alert)
+    monkeypatch.setattr("app.core.provider.WhatsAppProvider.send_template", fake_alert)
 
     async def handler(**kwargs):
         return _FakeResponse(
@@ -1401,10 +1408,10 @@ async def test_quote_superseded_by_agreement_same_turn_not_tracked(db_session, s
 
 
 async def test_quote_superseded_by_handoff_same_turn_not_tracked(db_session, shop_account, shoes, monkeypatch):
-    async def fake_alert(self, to, body, preview_url=False):
+    async def fake_alert(self, to, name, language_code="en_US", components=None):
         return {"messages": [{"id": "wamid.alert"}]}
 
-    monkeypatch.setattr("app.core.provider.WhatsAppProvider.send_text", fake_alert)
+    monkeypatch.setattr("app.core.provider.WhatsAppProvider.send_template", fake_alert)
 
     async def handler(**kwargs):
         return _FakeResponse(

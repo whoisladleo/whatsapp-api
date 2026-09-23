@@ -147,6 +147,28 @@ class Settings(BaseSettings):
     # this — confirmed "en" for taskflow_login as of 2026-09.
     WHATSAPP_OTP_TEMPLATE_LANGUAGE: str = "en"
 
+    # Utility-category template for handoff alerts to a merchant's personal
+    # WhatsApp (see LLMService._send_platform_alert_to_merchant). Required,
+    # not optional like the OTP one: a merchant essentially never has an
+    # open 24h session with the platform's own number (they only ever
+    # *receive* from it), so a free-text alert gets accepted by the API
+    # (200 OK) and then silently dropped as an out-of-window re-engagement
+    # message — a real production incident where alerts never reached the
+    # merchant's phone despite every send looking successful in our logs.
+    WHATSAPP_HANDOFF_ALERT_TEMPLATE_NAME: str = "handoff_notification"
+
+    # Merchant-facing, not customer-facing — there's no per-merchant
+    # language field to key off (same limitation as
+    # WHATSAPP_OTP_TEMPLATE_LANGUAGE), so this is one global default.
+    # "en" confirmed as the registered code for handoff_notification as of
+    # 2026-09. The template has a header ("A customer {{customer}} needs
+    # your help right now.") and a body ("They said: \"{{message}}\" /
+    # Reply directly using: /reply {{customer}} \"your message\"") — note
+    # {{customer}} appears in BOTH, so a send must supply it in both the
+    # header and body components' parameters, not just once. See
+    # _send_platform_alert_to_merchant.
+    WHATSAPP_HANDOFF_ALERT_TEMPLATE_LANGUAGE: str = "en"
+
     # Cloudflare R2
     R2_ACCOUNT_ID: Optional[str] = None
     R2_ACCESS_KEY_ID: Optional[str] = None

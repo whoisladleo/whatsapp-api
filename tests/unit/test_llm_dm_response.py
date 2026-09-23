@@ -291,13 +291,17 @@ async def test_generate_dm_response_handoff_notifies_merchant_via_whatsapp(
     assert route.called
     sent = json.loads(route.calls.last.request.content)
     assert sent["to"] == whatsapp_account.owner.username
-    assert "HUMAN HANDOFF" in sent["text"]["body"]
-    assert "@commenter1" in sent["text"]["body"]
+    assert sent["type"] == "template"
+    assert sent["template"]["name"] == "handoff_notification"
+    header_params = sent["template"]["components"][0]["parameters"]
+    body_params = sent["template"]["components"][1]["parameters"]
+    assert {"type": "text", "parameter_name": "customer", "text": "@commenter1"} in header_params
+    assert {"type": "text", "parameter_name": "customer", "text": "@commenter1"} in body_params
     # The alert must quote what the *customer* said, not Amara's own reply
     # — that's what the merchant actually has to respond to.
-    assert "this is unreasonable" in sent["text"]["body"]
-    assert "Let me get a teammate to help with that." not in sent["text"]["body"]
-    assert "/reply @commenter1 your message" in sent["text"]["body"]
+    assert {"type": "text", "parameter_name": "message", "text": "this is unreasonable"} in body_params
+    sent_body = route.calls.last.request.content.decode()
+    assert "Let me get a teammate to help with that." not in sent_body
 
 
 @respx.mock

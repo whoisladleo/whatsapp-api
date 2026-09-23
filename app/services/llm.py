@@ -97,8 +97,8 @@ FAILED_CYCLES_HANDOFF_THRESHOLD = 3
 # Handoff alerts quote the customer's own message so the merchant has
 # something to actually respond to (see _trigger_human_handoff /
 # _notify_merchant_of_instagram_handoff) — bounded so an unusually long
-# customer message can't blow up the alert (or, once wired to
-# handoff_alert, a template variable's practical length).
+# customer message can't blow up the alert or exceed the handoff_notification
+# template's {{message}} variable's practical length.
 HANDOFF_ALERT_MESSAGE_MAX_CHARS = 200
 
 
@@ -390,7 +390,11 @@ class LLMService:
         turn's customer-facing response_text; callers decide what to send.
         customer_message is what the *customer* said, not Amara's own
         reply — without it the merchant has nothing to actually respond to
-        when they use /reply.
+        when they use /reply. Threaded through into the handoff_notification
+        template as its {{message}} variable (see _send_platform_alert_to_merchant)
+        — the template was updated in WhatsApp Manager specifically to add
+        this slot, rather than dropping the customer's message from the
+        alert once alerts moved off free text.
         """
         context.state = ConversationState.HUMAN_HANDOFF
         context.handoff_at = datetime.utcnow()
@@ -399,12 +403,7 @@ class LLMService:
         if is_platform_account or not account.owner:
             return
 
-        alert_message = (
-            f"🚨 *HUMAN HANDOFF REQUIRED* 🚨\nA customer at {from_phone} needs your help!\n\n"
-            f"*Customer says:* {_truncate_for_alert(customer_message)}\n\n"
-            f"Reply directly: `/reply {from_phone} your message`"
-        )
-        await self._send_platform_alert_to_merchant(db, account.owner, alert_message)
+        await self._send_platform_alert_to_merchant(db, account.owner, from_phone, customer_message)
 
         from app.tasks.handoff_reminders import (
             send_handoff_reminder,
@@ -448,26 +447,44 @@ class LLMService:
         # something the merchant can actually paste back in, even before
         # the display-name backfill has ever run for a brand-new customer.
         reply_identifier = customer.username or customer.ig_scoped_id
-        alert_message = (
-            f"🚨 *HUMAN HANDOFF REQUIRED* 🚨\n"
-            f"An Instagram customer (@{reply_identifier}) needs your help!\n\n"
-            f"*Customer says:* {_truncate_for_alert(customer_message)}\n\n"
-            f"Reply directly: `/reply @{reply_identifier} your message`"
-        )
-        await self._send_platform_alert_to_merchant(db, merchant, alert_message)
+        await self._send_platform_alert_to_merchant(db, merchant, f"@{reply_identifier}", customer_message)
 
-    async def _send_platform_alert_to_merchant(self, db: Session, merchant: User, alert_message: str) -> None:
+    async def _send_platform_alert_to_merchant(
+        self, db: Session, merchant: User, reply_identifier: str, customer_message: str
+    ) -> None:
         """
-        Sends an operational alert (handoff, etc.) to the merchant's own
-        personal WhatsApp number, using the platform's own default
-        credentials — the exact same ones send_otp_message uses — rather
-        than requiring the merchant to have their own business
-        WhatsAppAccount connected. The merchant's personal WhatsApp is how
-        they talk to Amara/Taskflow itself; their (optional) business
-        WhatsAppAccount and Instagram connection are separate, customer-
-        facing channels. Best-effort/silent if the merchant has no phone
-        on file at all (checks username, then the Facebook-login
-        self-reported phone_number — same resolution order
+        Sends a handoff alert to the merchant's own personal WhatsApp
+        number via the approved handoff_notification template
+        (WHATSAPP_HANDOFF_ALERT_TEMPLATE_NAME), using the platform's own
+        default credentials — the same ones send_otp_message uses — rather
+        than requiring the merchant's own business WhatsAppAccount.
+
+        A template send is required here, not free text: WhatsApp only
+        allows free-form messages to a recipient with an open 24h session
+        (i.e. someone who's messaged this number back recently), and a
+        merchant essentially never has — they only ever *receive* from the
+        platform's number. This was a real production incident: the old
+        free-text send got a 200 OK from Meta's API on every attempt, yet
+        never actually reached the merchant's phone, silently dropped as
+        an out-of-window re-engagement message. Templates are exempt from
+        that restriction.
+
+        handoff_notification has a header ("A customer {{customer}} needs
+        your help right now.") and a body ("They said: \"{{message}}\" /
+        Reply directly using: /reply {{customer}} \"your message\"") —
+        {{customer}} appears in BOTH, so it must be supplied in both the
+        header and body components' parameters, not just once (get this
+        wrong and Meta rejects the whole send, the same way the OTP
+        button sub_type mismatch did). reply_identifier is what the
+        merchant should paste into /reply — a bare phone number for a
+        WhatsApp-native handoff, or "@username"/"@ig_scoped_id" for an
+        Instagram one (see call sites). customer_message is truncated to
+        HANDOFF_ALERT_MESSAGE_MAX_CHARS for the template's {{message}}
+        variable.
+
+        Best-effort/silent if the merchant has no phone on file at all
+        (checks username, then the Facebook-login self-reported
+        phone_number — same resolution order
         subscription_access.find_platform_subscription uses).
         """
         merchant_phone = merchant.username or merchant.phone_number
@@ -477,9 +494,30 @@ class LLMService:
         from app.core.config import settings
         from app.core.provider import WhatsAppProvider
 
+        components = [
+            {
+                "type": "header",
+                "parameters": [
+                    {"type": "text", "parameter_name": "customer", "text": reply_identifier},
+                ],
+            },
+            {
+                "type": "body",
+                "parameters": [
+                    {"type": "text", "parameter_name": "message", "text": _truncate_for_alert(customer_message)},
+                    {"type": "text", "parameter_name": "customer", "text": reply_identifier},
+                ],
+            },
+        ]
+
         provider = WhatsAppProvider(settings.WHATSAPP_TOKEN, settings.PHONE_NUMBER_ID)
         try:
-            alert_resp = await provider.send_text(merchant_phone, alert_message)
+            alert_resp = await provider.send_template(
+                merchant_phone,
+                settings.WHATSAPP_HANDOFF_ALERT_TEMPLATE_NAME,
+                language_code=settings.WHATSAPP_HANDOFF_ALERT_TEMPLATE_LANGUAGE,
+                components=components,
+            )
         except Exception as alert_err:
             logger.error(f"Failed to send platform alert to merchant: {alert_err}")
             alert_resp = None
@@ -501,8 +539,8 @@ class LLMService:
             db,
             {
                 "to_phone": merchant_phone,
-                "type": "text",
-                "body": alert_message,
+                "type": "template",
+                "body": f"{settings.WHATSAPP_HANDOFF_ALERT_TEMPLATE_NAME}: {reply_identifier} — {_truncate_for_alert(customer_message)}",
                 "direction": "outbound",
                 "status": "sent" if alert_resp else "failed",
                 "raw": alert_resp or {},
