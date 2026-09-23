@@ -1,3 +1,5 @@
+import json
+
 import httpx
 import pytest
 import respx
@@ -14,12 +16,14 @@ from app.db.models import (
     PaymentType,
     Product,
     User,
+    WhatsAppAccount,
 )
 from app.services.llm import LLMService
 
 TOKEN_URL = "https://pay.tunzaa.co.tz/accounts/request/token"
 PAYMENT_URL = "https://pay.tunzaa.co.tz/payments/initiate-payment"
 INSTALLMENT_URL = "https://pay.tunzaa.co.tz/installments/create"
+MESSAGES_URL_RE = r"https://graph\.facebook\.com/.+/messages$"
 
 
 class _FakeMessages:
@@ -99,6 +103,18 @@ def ig_context(db_session, ig_customer):
     db_session.commit()
     db_session.refresh(ctx)
     return ctx
+
+
+@pytest.fixture
+def whatsapp_account(db_session, merchant):
+    acct = WhatsAppAccount(
+        name="Merchant Shop", phone_number_id="MPHONE1", access_token="wa-tok",
+        user_id=merchant.id,
+    )
+    db_session.add(acct)
+    db_session.commit()
+    db_session.refresh(acct)
+    return acct
 
 
 @pytest.fixture
@@ -242,6 +258,54 @@ async def test_generate_dm_response_handoff_only_marker_uses_fallback_text(db_se
     assert result
     db_session.refresh(ig_context)
     assert ig_context.state == ConversationState.HUMAN_HANDOFF
+
+
+@respx.mock
+async def test_generate_dm_response_handoff_notifies_merchant_via_whatsapp(
+    db_session, ig_account, ig_customer, ig_context, whatsapp_account
+):
+    """
+    Instagram has no API to message the account owner directly — only
+    customers who've messaged the connected account — so a handoff must be
+    surfaced cross-channel, via the merchant's own WhatsApp account.
+    """
+    route = respx.post(url__regex=MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "wamid.handoff"}]})
+    )
+    service = _service_with_fake_client(
+        reply_text="Let me get a teammate to help with that. [HUMAN_HANDOFF]"
+    )
+
+    await service.generate_dm_response(
+        "this is unreasonable", db=db_session, account=ig_account, customer=ig_customer, context=ig_context, conversation_history=[]
+    )
+
+    assert route.called
+    sent = json.loads(route.calls.last.request.content)
+    assert sent["to"] == whatsapp_account.owner.username
+    assert "HUMAN HANDOFF" in sent["text"]["body"]
+    assert "@commenter1" in sent["text"]["body"]
+    assert "Let me get a teammate to help with that." in sent["text"]["body"]
+
+
+@respx.mock
+async def test_generate_dm_response_handoff_no_merchant_whatsapp_account_does_not_crash(
+    db_session, ig_account, ig_customer, ig_context
+):
+    """Every merchant is expected to have a WhatsAppAccount, but this must
+    stay best-effort/silent if one somehow doesn't exist rather than
+    breaking the customer-facing handoff response."""
+    route = respx.post(url__regex=MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "wamid.handoff"}]})
+    )
+    service = _service_with_fake_client(reply_text="[HUMAN_HANDOFF]")
+
+    result = await service.generate_dm_response(
+        "??", db=db_session, account=ig_account, customer=ig_customer, context=ig_context, conversation_history=[]
+    )
+
+    assert result
+    assert not route.called
 
 
 async def test_generate_dm_response_returns_none_on_client_exception(db_session, ig_account, ig_customer, ig_context):

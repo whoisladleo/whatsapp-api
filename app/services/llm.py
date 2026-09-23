@@ -394,6 +394,58 @@ class LLMService:
         except Exception as sched_err:
             logger.error(f"Failed to schedule handoff reminder: {sched_err}")
 
+    async def _notify_merchant_of_instagram_handoff(
+        self, db: Session, ig_account: InstagramAccount, customer: InstagramCustomer, last_message: str
+    ) -> None:
+        """
+        Instagram has no way to message the account owner directly — only
+        customers who've messaged the connected account (see CLAUDE.md's
+        Instagram section on notify_merchant's identical limitation for
+        subscription-renewal alerts) — so a DM handoff is surfaced via the
+        merchant's own WhatsApp account instead, the same cross-channel
+        pattern app/services/product_subscription.py's notify_merchant
+        already uses. Best-effort/silent if the merchant has no
+        WhatsAppAccount or no phone on file, since every merchant is
+        otherwise expected to have one. Unlike _trigger_human_handoff's
+        WhatsApp-native equivalent, this doesn't also schedule a 15-minute
+        reminder nudge — that task resolves the account to alert from the
+        customer's last *WhatsApp* message, which has no equivalent for an
+        Instagram-originated handoff.
+        """
+        merchant = ig_account.owner
+        if not merchant or not merchant.username or not merchant.accounts:
+            return
+
+        whatsapp_account = merchant.accounts[0]
+        customer_label = f"@{customer.username}" if customer.username else customer.ig_scoped_id
+        alert_message = (
+            f"🚨 *HUMAN HANDOFF REQUIRED* 🚨\n"
+            f"An Instagram customer ({customer_label}) needs your help!\n\n"
+            f"*Last AI message:* {last_message}"
+        )
+
+        from app.core.provider import WhatsAppProvider
+        provider = WhatsAppProvider(whatsapp_account.access_token, whatsapp_account.phone_number_id)
+        try:
+            alert_resp = await provider.send_text(merchant.username, alert_message)
+        except Exception as alert_err:
+            logger.error(f"Failed to send Instagram handoff alert to merchant: {alert_err}")
+            alert_resp = None
+
+        from app.crud import message as crud_message
+        crud_message.create_message(
+            db,
+            {
+                "to_phone": merchant.username,
+                "type": "text",
+                "body": alert_message,
+                "direction": "outbound",
+                "status": "sent" if alert_resp else "failed",
+                "raw": alert_resp or {},
+            },
+            whatsapp_account.id,
+        )
+
     async def _track_quote(
         self,
         db: Session,
@@ -691,6 +743,7 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
             db.commit()
             if not response_text:
                 response_text = "I am transferring you to a member of our team who can help you further. Please hold."
+            await self._notify_merchant_of_instagram_handoff(db, account, customer, response_text)
             return response_text
 
         response_text, agreement = _parse_and_strip_agreement(response_text)
