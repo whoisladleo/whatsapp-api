@@ -176,6 +176,12 @@ async def _relay_to_instagram_customer(db: Session, account: WhatsAppAccount, ig
     InstagramAccount and an InstagramCustomer who has actually messaged it
     — InstagramCustomer.account_id already scopes ownership directly, no
     global-Customer ambiguity the way WhatsApp's ambiguity check needs.
+
+    `ig_username` also matches against ig_scoped_id as a fallback — the
+    handoff alert's own "/reply @..." instruction (llm.py's
+    _notify_merchant_of_instagram_handoff) uses whichever one it actually
+    has for that customer, which is the scoped id for a brand-new customer
+    whose display-name backfill hasn't run yet.
     """
     from app.core.instagram_provider import InstagramProvider
 
@@ -189,7 +195,10 @@ async def _relay_to_instagram_customer(db: Session, account: WhatsAppAccount, ig
 
     ig_customer = (
         db.query(InstagramCustomer)
-        .filter(InstagramCustomer.account_id == ig_account.id, InstagramCustomer.username == ig_username)
+        .filter(
+            InstagramCustomer.account_id == ig_account.id,
+            (InstagramCustomer.username == ig_username) | (InstagramCustomer.ig_scoped_id == ig_username),
+        )
         .first()
     )
     if not ig_customer:

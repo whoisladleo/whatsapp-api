@@ -17,7 +17,7 @@ from app.db.models import (
     User,
     WhatsAppAccount,
 )
-from app.services.llm import LLMService, _parse_and_strip_agreement, _parse_and_strip_quote
+from app.services.llm import LLMService, _parse_and_strip_agreement, _parse_and_strip_quote, _truncate_for_alert
 
 MESSAGES_URL_RE = r"https://graph\.facebook\.com/.+/messages$"
 TOKEN_URL = "https://pay.tunzaa.co.tz/accounts/request/token"
@@ -480,6 +480,11 @@ async def test_human_handoff_trigger_updates_state_and_alerts_merchant(
     assert alert_route.called
     sent_body = alert_route.calls.last.request.content.decode()
     assert "255711116666" in sent_body
+    # The alert must quote what the *customer* said, not Amara's own reply
+    # — that's what the merchant actually has to respond to.
+    assert "I need a human" in sent_body
+    assert "Let me get a human." not in sent_body
+    assert "/reply 255711116666 your message" in sent_body
 
     # The alert itself is logged as an outbound Message, unlike before.
     alert_message = (
@@ -1117,6 +1122,18 @@ async def test_agreement_ignored_on_platform_account(db_session, platform_accoun
 
     assert "AGREEMENT_REACHED" not in result
     assert db_session.query(Order).count() == 0
+
+
+def test_truncate_for_alert_leaves_short_text_unchanged():
+    assert _truncate_for_alert("Do you have this in size 42?") == "Do you have this in size 42?"
+
+
+def test_truncate_for_alert_truncates_long_text_with_ellipsis():
+    long_text = "a" * 250
+    result = _truncate_for_alert(long_text, max_chars=200)
+    assert len(result) == 201  # 200 chars + the ellipsis character
+    assert result.endswith("…")
+    assert result.startswith("a" * 200)
 
 
 def test_parse_and_strip_quote_extracts_and_strips_marker():

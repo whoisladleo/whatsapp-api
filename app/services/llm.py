@@ -71,6 +71,20 @@ def _parse_comment_reply(text: str):
 # this many force-escalates regardless of what the model itself judges.
 FAILED_CYCLES_HANDOFF_THRESHOLD = 3
 
+# Handoff alerts quote the customer's own message so the merchant has
+# something to actually respond to (see _trigger_human_handoff /
+# _notify_merchant_of_instagram_handoff) — bounded so an unusually long
+# customer message can't blow up the alert (or, once wired to
+# handoff_alert, a template variable's practical length).
+HANDOFF_ALERT_MESSAGE_MAX_CHARS = 200
+
+
+def _truncate_for_alert(text: str, max_chars: int = HANDOFF_ALERT_MESSAGE_MAX_CHARS) -> str:
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + "…"
+
 
 def _parse_and_strip_quote(text: str):
     """
@@ -342,7 +356,7 @@ class LLMService:
         account: WhatsAppAccount,
         context: ConversationContext,
         from_phone: str,
-        last_message: str,
+        customer_message: str,
         is_platform_account: bool,
     ) -> None:
         """
@@ -351,6 +365,9 @@ class LLMService:
         marker (tone-based judgment) and the hard failed_cycles counter
         (Rule 3 — see FAILED_CYCLES_HANDOFF_THRESHOLD). Does not touch this
         turn's customer-facing response_text; callers decide what to send.
+        customer_message is what the *customer* said, not Amara's own
+        reply — without it the merchant has nothing to actually respond to
+        when they use /reply.
         """
         context.state = ConversationState.HUMAN_HANDOFF
         context.handoff_at = datetime.utcnow()
@@ -360,7 +377,11 @@ class LLMService:
             return
 
         merchant_phone = account.owner.username
-        alert_message = f"🚨 *HUMAN HANDOFF REQUIRED* 🚨\nA customer at {from_phone} needs your help!\n\n*Last AI message:* {last_message}"
+        alert_message = (
+            f"🚨 *HUMAN HANDOFF REQUIRED* 🚨\nA customer at {from_phone} needs your help!\n\n"
+            f"*Customer says:* {_truncate_for_alert(customer_message)}\n\n"
+            f"Reply directly: `/reply {from_phone} your message`"
+        )
         from app.core.provider import WhatsAppProvider
         provider = WhatsAppProvider(account.access_token, account.phone_number_id)
         try:
@@ -395,7 +416,7 @@ class LLMService:
             logger.error(f"Failed to schedule handoff reminder: {sched_err}")
 
     async def _notify_merchant_of_instagram_handoff(
-        self, db: Session, ig_account: InstagramAccount, customer: InstagramCustomer, last_message: str
+        self, db: Session, ig_account: InstagramAccount, customer: InstagramCustomer, customer_message: str
     ) -> None:
         """
         Instagram has no way to message the account owner directly — only
@@ -410,18 +431,25 @@ class LLMService:
         WhatsApp-native equivalent, this doesn't also schedule a 15-minute
         reminder nudge — that task resolves the account to alert from the
         customer's last *WhatsApp* message, which has no equivalent for an
-        Instagram-originated handoff.
+        Instagram-originated handoff. customer_message is what the
+        *customer* said, not Amara's own reply — without it the merchant
+        has nothing to actually respond to when they use /reply.
         """
         merchant = ig_account.owner
         if not merchant or not merchant.username or not merchant.accounts:
             return
 
         whatsapp_account = merchant.accounts[0]
-        customer_label = f"@{customer.username}" if customer.username else customer.ig_scoped_id
+        # /reply's Instagram path matches on username OR ig_scoped_id (see
+        # _relay_to_instagram_customer), so this identifier is always
+        # something the merchant can actually paste back in, even before
+        # the display-name backfill has ever run for a brand-new customer.
+        reply_identifier = customer.username or customer.ig_scoped_id
         alert_message = (
             f"🚨 *HUMAN HANDOFF REQUIRED* 🚨\n"
-            f"An Instagram customer ({customer_label}) needs your help!\n\n"
-            f"*Last AI message:* {last_message}"
+            f"An Instagram customer (@{reply_identifier}) needs your help!\n\n"
+            f"*Customer says:* {_truncate_for_alert(customer_message)}\n\n"
+            f"Reply directly: `/reply @{reply_identifier} your message`"
         )
 
         from app.core.provider import WhatsAppProvider
@@ -453,7 +481,7 @@ class LLMService:
         context: ConversationContext,
         quote: dict,
         from_phone: str,
-        response_text: str,
+        message_body: str,
         is_platform_account: bool,
     ) -> None:
         """
@@ -494,7 +522,7 @@ class LLMService:
 
         if context.failed_cycles >= FAILED_CYCLES_HANDOFF_THRESHOLD:
             await self._trigger_human_handoff(
-                db, account, context, from_phone, response_text, is_platform_account
+                db, account, context, from_phone, message_body, is_platform_account
             )
             return
 
@@ -743,7 +771,7 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
             db.commit()
             if not response_text:
                 response_text = "I am transferring you to a member of our team who can help you further. Please hold."
-            await self._notify_merchant_of_instagram_handoff(db, account, customer, response_text)
+            await self._notify_merchant_of_instagram_handoff(db, account, customer, message_body)
             return response_text
 
         response_text, agreement = _parse_and_strip_agreement(response_text)
@@ -1010,7 +1038,7 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
             if "[HUMAN_HANDOFF]" in response_text:
                 response_text = response_text.replace("[HUMAN_HANDOFF]", "").strip()
                 await self._trigger_human_handoff(
-                    db, account, context, from_phone, response_text, is_platform_account
+                    db, account, context, from_phone, message_body, is_platform_account
                 )
 
                 if not response_text:
@@ -1049,7 +1077,7 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
             response_text, quote = _parse_and_strip_quote(response_text)
             if quote and not agreement and not is_platform_account and context.state != ConversationState.HUMAN_HANDOFF:
                 await self._track_quote(
-                    db, account, context, quote, from_phone, response_text, is_platform_account
+                    db, account, context, quote, from_phone, message_body, is_platform_account
                 )
 
             return response_text

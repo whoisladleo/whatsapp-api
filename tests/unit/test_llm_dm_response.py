@@ -285,7 +285,11 @@ async def test_generate_dm_response_handoff_notifies_merchant_via_whatsapp(
     assert sent["to"] == whatsapp_account.owner.username
     assert "HUMAN HANDOFF" in sent["text"]["body"]
     assert "@commenter1" in sent["text"]["body"]
-    assert "Let me get a teammate to help with that." in sent["text"]["body"]
+    # The alert must quote what the *customer* said, not Amara's own reply
+    # — that's what the merchant actually has to respond to.
+    assert "this is unreasonable" in sent["text"]["body"]
+    assert "Let me get a teammate to help with that." not in sent["text"]["body"]
+    assert "/reply @commenter1 your message" in sent["text"]["body"]
 
 
 @respx.mock
