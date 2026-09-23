@@ -92,8 +92,10 @@ def _mock_send_text(monkeypatch, ok=True):
     monkeypatch.setattr("app.core.provider.WhatsAppProvider.send_text", fake)
 
 
-def _mock_send_template(monkeypatch, ok=True):
+def _mock_send_template(monkeypatch, ok=True, calls=None):
     async def fake(self, to, name, language_code="en_US", components=None):
+        if calls is not None:
+            calls.append({"to": to, "name": name, "language_code": language_code, "components": components})
         if not ok:
             raise RuntimeError("network down")
         return {"messages": [{"id": "wamid.template"}]}
@@ -172,7 +174,8 @@ def test_send_scarcity_nudge_no_account(pending_order_no_account):
 
 
 def test_send_scarcity_nudge_sends_template(db_session, pending_order, monkeypatch):
-    _mock_send_template(monkeypatch)
+    calls = []
+    _mock_send_template(monkeypatch, calls=calls)
     from app.db.models import Message
 
     result = order_reminders.send_scarcity_nudge(pending_order.id)
@@ -181,6 +184,37 @@ def test_send_scarcity_nudge_sends_template(db_session, pending_order, monkeypat
     logged = db_session.query(Message).filter(Message.status == "sent").first()
     assert logged is not None
     assert "scarcity nudge" in logged.body
+
+    assert len(calls) == 1
+    from app.core.config import settings
+
+    assert calls[0]["name"] == settings.WHATSAPP_REMINDER_TEMPLATE_NAME
+    assert calls[0]["language_code"] == settings.WHATSAPP_REMINDER_TEMPLATE_LANGUAGE
+    body_params = calls[0]["components"][0]["parameters"]
+    assert body_params[0]["text"] == "Shoes"
+    assert body_params[1]["text"] == "45,000"
+
+
+def test_send_scarcity_nudge_falls_back_to_generic_name_when_no_product(db_session, customer, account, monkeypatch):
+    """order.product can be None (nullable product_id) — must not crash
+    building the template parameters."""
+    order = Order(
+        customer_id=customer.id, account_id=account.id,
+        quantity=1, status=OrderStatus.PENDING, agreed_price=20000, payment_type=PaymentType.FULL,
+    )
+    db_session.add(order)
+    db_session.commit()
+    db_session.refresh(order)
+
+    calls = []
+    _mock_send_template(monkeypatch, calls=calls)
+
+    result = order_reminders.send_scarcity_nudge(order.id)
+
+    assert result == "Success"
+    body_params = calls[0]["components"][0]["parameters"]
+    assert body_params[0]["text"] == "your order"
+    assert body_params[1]["text"] == "20,000"
 
 
 def test_send_scarcity_nudge_send_failure_still_logs(db_session, pending_order, monkeypatch):

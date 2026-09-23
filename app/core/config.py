@@ -122,10 +122,14 @@ class Settings(BaseSettings):
     TUNZAA_ENVIRONMENT: str = "sandbox"
 
     # Template used for order-reminder nudges sent outside the 24h WhatsApp
-    # customer-service window (see app/tasks/order_reminders.py). Defaults to
-    # Meta's always-approved sample template; production use requires a real
-    # template approved for this account in Meta Business Manager.
-    WHATSAPP_REMINDER_TEMPLATE_NAME: str = "hello_world"
+    # customer-service window (see app/tasks/order_reminders.py).
+    WHATSAPP_REMINDER_TEMPLATE_NAME: str = "order_reminder"
+
+    # Registered locale code, not just the Manager UI's display name — see
+    # WHATSAPP_OTP_TEMPLATE_LANGUAGE's note on why "English"/"Swahili" in
+    # the UI doesn't reliably mean "en_US"/"sw". "en"/"sw" confirmed as the
+    # standing convention for every template on this account going forward.
+    WHATSAPP_REMINDER_TEMPLATE_LANGUAGE: str = "en"
 
     # Authentication-category template for OTP login (Meta requires these
     # outside the 24h customer-service window, which is always the case for

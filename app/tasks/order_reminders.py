@@ -17,7 +17,7 @@ SCARCITY_NUDGE_DELAY_SECONDS = 24 * 60 * 60
 AUTO_CANCEL_DELAY_SECONDS = 48 * 60 * 60
 
 
-def _send_sync(provider, to, body=None, template_name=None):
+def _send_sync(provider, to, body=None, template_name=None, template_language=None, template_components=None):
     """
     Celery tasks run outside an event loop (a real worker has none in its
     thread), so a plain asyncio.run() is enough here — unlike
@@ -27,8 +27,26 @@ def _send_sync(provider, to, body=None, template_name=None):
     directly, synchronously, in a plain test function).
     """
     if template_name:
-        return asyncio.run(provider.send_template(to, template_name))
+        return asyncio.run(
+            provider.send_template(
+                to, template_name, language_code=template_language, components=template_components
+            )
+        )
     return asyncio.run(provider.send_text(to, body))
+
+
+def _order_reminder_components(order) -> list:
+    product_name = order.product.name if order.product else "your order"
+    formatted_price = f"{order.agreed_price:,.0f}" if order.agreed_price is not None else "0"
+    return [
+        {
+            "type": "body",
+            "parameters": [
+                {"type": "text", "text": product_name},
+                {"type": "text", "text": formatted_price},
+            ],
+        }
+    ]
 
 
 def _account_for_order(db, order) -> WhatsAppAccount:
@@ -118,7 +136,11 @@ def send_scarcity_nudge(order_id: str):
         provider = WhatsAppProvider(account.access_token, account.phone_number_id)
         try:
             resp = _send_sync(
-                provider, order.customer.phone_number, template_name=settings.WHATSAPP_REMINDER_TEMPLATE_NAME
+                provider,
+                order.customer.phone_number,
+                template_name=settings.WHATSAPP_REMINDER_TEMPLATE_NAME,
+                template_language=settings.WHATSAPP_REMINDER_TEMPLATE_LANGUAGE,
+                template_components=_order_reminder_components(order),
             )
         except Exception as e:
             logger.error(f"Scarcity nudge send failed for order {order_id}: {e}")
