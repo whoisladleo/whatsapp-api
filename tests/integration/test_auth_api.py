@@ -47,6 +47,46 @@ def test_request_otp_reuses_existing_user(client, db_session):
 
 
 @respx.mock
+def test_request_otp_promotes_phone_number_to_username_for_facebook_login_user(client, db_session):
+    """
+    A Facebook-login merchant (username=None) who's already self-reported
+    their phone (PATCH /auth/me, Pay Now) must not get a second, unlinked
+    User created just because they've never requested an OTP before — see
+    issue #7. Requesting an OTP for that phone number should promote it to
+    username on the existing account instead.
+    """
+    _mock_send_text()
+    facebook_user = User(facebook_id="fb_123", phone_number=PHONE)
+    db_session.add(facebook_user)
+    db_session.commit()
+    db_session.refresh(facebook_user)
+
+    resp = client.post("/api/v1/auth/request-otp", json={"username": PHONE})
+
+    assert resp.status_code == 200
+    assert db_session.query(User).count() == 1
+    db_session.refresh(facebook_user)
+    assert facebook_user.username == PHONE
+    assert facebook_user.otp_code is not None
+
+
+@respx.mock
+def test_request_otp_does_not_promote_a_different_users_phone_number(client, db_session):
+    """A phone_number match belonging to a user who already has their own
+    username is a real, separate account — not a promotion case."""
+    _mock_send_text()
+    already_has_username = User(username="255799999999", phone_number=PHONE)
+    db_session.add(already_has_username)
+    db_session.commit()
+
+    resp = client.post("/api/v1/auth/request-otp", json={"username": PHONE})
+
+    assert resp.status_code == 200
+    assert db_session.query(User).filter(User.username == PHONE).count() == 1
+    assert db_session.query(User).count() == 2
+
+
+@respx.mock
 def test_request_and_verify_otp_with_different_phone_formats_match_same_user(
     client, db_session
 ):

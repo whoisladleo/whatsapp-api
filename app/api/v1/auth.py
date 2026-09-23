@@ -85,10 +85,22 @@ async def request_otp(
             detail="Too many OTP requests. Please wait a few minutes and try again.",
         )
 
-    # Pre-onboarding: Create user if they don't exist
+    # Pre-onboarding: Create user if they don't exist. A phone number that
+    # doesn't match any User.username but does match User.phone_number
+    # belongs to a Facebook-login merchant who's already self-reported it
+    # (PATCH /auth/me, Pay Now) — promote it to username rather than
+    # creating a second, unlinked User for the same person (see issue #7).
     user = crud_user.get_user_by_username(db, phone_number)
     if not user:
-        user = crud_user.create_user(db, username=phone_number)
+        candidate = crud_user.get_user_by_phone_number(db, phone_number)
+        # Only promote a phone_number match that has no username of its own
+        # — a candidate that already has one is a distinct, already-formed
+        # account that just happens to share this phone_number value, not
+        # the same unlinked identity, and must never be silently hijacked.
+        if candidate and candidate.username is None:
+            user = crud_user.promote_phone_number_to_username(db, candidate, phone_number)
+        else:
+            user = crud_user.create_user(db, username=phone_number)
 
     # Generate OTP
     otp_code = security.generate_otp(6)

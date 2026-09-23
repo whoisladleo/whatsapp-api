@@ -65,3 +65,19 @@ def set_user_phone_number(db: Session, user: User, phone_number: Optional[str]) 
     db.commit()
     db.refresh(user)
     return user
+
+
+def promote_phone_number_to_username(db: Session, user: User, phone_number: str) -> User:
+    """
+    Called from /auth/request-otp when a phone number doesn't match any
+    User.username but does match a User.phone_number (a Facebook-login
+    merchant who's self-reported their phone via PATCH /auth/me or Pay
+    Now) — promotes it to username instead of creating a second, unlinked
+    User for the same person. Safe by construction: callers only reach
+    this after get_user_by_username(db, phone_number) already returned
+    None, so no other user currently holds this username.
+    """
+    user.username = phone_number
+    db.commit()
+    db.refresh(user)
+    return user
