@@ -38,6 +38,26 @@ router = APIRouter()
 # access logs, etc.
 FACEBOOK_LOGIN_CODE_EXPIRE_MINUTES = 2
 
+# Kept in sync with WHATSAPP_OTP_TEMPLATE_LANGUAGE so the plain-text
+# fallback (sent when the template send fails, or is unconfigured) is in
+# the same language as the template would have been — there's no per-user
+# language signal available this early (a login OTP request has no prior
+# conversation history to infer one from), so this is a single global
+# default, not per-customer. Falls back to English for any configured
+# language this dict doesn't have a translation for.
+_OTP_FALLBACK_MESSAGES = {
+    "sw": "OTP yako wa kuingia Taskflow OS ni: *{otp}*. Ni siri, usimpe mtu. Unaisha ndani ya dakika 5.",
+    "en": "Your Taskflow OS login OTP is: *{otp}*. Keep it secret. Expires in 5 minutes.",
+}
+
+
+def _otp_fallback_message(otp: str) -> str:
+    template = _OTP_FALLBACK_MESSAGES.get(
+        settings.WHATSAPP_OTP_TEMPLATE_LANGUAGE, _OTP_FALLBACK_MESSAGES["en"]
+    )
+    return template.format(otp=otp)
+
+
 async def send_otp_message(phone_number: str, otp: str):
     provider = WhatsAppProvider(settings.WHATSAPP_TOKEN, settings.PHONE_NUMBER_ID)
 
@@ -51,9 +71,9 @@ async def send_otp_message(phone_number: str, otp: str):
                     {"type": "body", "parameters": [{"type": "text", "text": otp}]},
                     {
                         "type": "button",
-                        "sub_type": "copy_code",
+                        "sub_type": "url",
                         "index": 0,
-                        "parameters": [{"type": "coupon_code", "coupon_code": otp}],
+                        "parameters": [{"type": "text", "text": otp}],
                     },
                 ],
             )
@@ -66,7 +86,7 @@ async def send_otp_message(phone_number: str, otp: str):
     # Fallback: a plain-text OTP only reaches the customer if they've
     # messaged us in the last 24h, but it's better than nothing while the
     # template is pending Meta's review (or if it ever gets rejected).
-    message = f"OTP yako wa kuingia Taskflow OS ni: *{otp}*. Ni siri, usimpe mtu. Unaisha ndani ya dakika 5."
+    message = _otp_fallback_message(otp)
     try:
         await provider.send_text(to=phone_number, body=message)
     except Exception as e:

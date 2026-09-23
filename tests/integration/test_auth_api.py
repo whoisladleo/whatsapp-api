@@ -242,8 +242,13 @@ def test_request_otp_sends_authentication_template_with_code(client, db_session)
     assert components[0]["type"] == "body"
     assert components[0]["parameters"][0]["text"] == user.otp_code
     assert components[1]["type"] == "button"
-    assert components[1]["sub_type"] == "copy_code"
-    assert components[1]["parameters"][0]["coupon_code"] == user.otp_code
+    # taskflow_login's OTP button is registered as a "url"-type button
+    # under the hood (Meta error 132018 confirmed this live — the Manager
+    # UI's "Copy code" label doesn't always mean sub_type=copy_code), so
+    # the code goes through as a plain text button parameter instead of
+    # coupon_code.
+    assert components[1]["sub_type"] == "url"
+    assert components[1]["parameters"][0]["text"] == user.otp_code
 
 
 @respx.mock
