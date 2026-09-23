@@ -399,33 +399,12 @@ class LLMService:
         if is_platform_account or not account.owner:
             return
 
-        merchant_phone = account.owner.username
         alert_message = (
             f"🚨 *HUMAN HANDOFF REQUIRED* 🚨\nA customer at {from_phone} needs your help!\n\n"
             f"*Customer says:* {_truncate_for_alert(customer_message)}\n\n"
             f"Reply directly: `/reply {from_phone} your message`"
         )
-        from app.core.provider import WhatsAppProvider
-        provider = WhatsAppProvider(account.access_token, account.phone_number_id)
-        try:
-            alert_resp = await provider.send_text(merchant_phone, alert_message)
-        except Exception as alert_err:
-            logger.error(f"Failed to send handoff alert to merchant: {alert_err}")
-            alert_resp = None
-
-        from app.crud import message as crud_message
-        crud_message.create_message(
-            db,
-            {
-                "to_phone": merchant_phone,
-                "type": "text",
-                "body": alert_message,
-                "direction": "outbound",
-                "status": "sent" if alert_resp else "failed",
-                "raw": alert_resp or {},
-            },
-            account.id,
-        )
+        await self._send_platform_alert_to_merchant(db, account.owner, alert_message)
 
         from app.tasks.handoff_reminders import (
             send_handoff_reminder,
@@ -445,24 +424,25 @@ class LLMService:
         Instagram has no way to message the account owner directly — only
         customers who've messaged the connected account (see CLAUDE.md's
         Instagram section on notify_merchant's identical limitation for
-        subscription-renewal alerts) — so a DM handoff is surfaced via the
-        merchant's own WhatsApp account instead, the same cross-channel
-        pattern app/services/product_subscription.py's notify_merchant
-        already uses. Best-effort/silent if the merchant has no
-        WhatsAppAccount or no phone on file, since every merchant is
-        otherwise expected to have one. Unlike _trigger_human_handoff's
-        WhatsApp-native equivalent, this doesn't also schedule a 15-minute
-        reminder nudge — that task resolves the account to alert from the
-        customer's last *WhatsApp* message, which has no equivalent for an
-        Instagram-originated handoff. customer_message is what the
-        *customer* said, not Amara's own reply — without it the merchant
-        has nothing to actually respond to when they use /reply.
+        subscription-renewal alerts) — so a DM handoff is surfaced via
+        WhatsApp instead, the same cross-channel pattern
+        app/services/product_subscription.py's notify_merchant already
+        uses. Sent via the platform's own default WhatsApp credentials
+        (see _send_platform_alert_to_merchant) — the merchant's personal
+        number is how they talk to Amara/Taskflow itself, independent of
+        whether they've connected their own business WhatsAppAccount.
+        Unlike _trigger_human_handoff's WhatsApp-native equivalent, this
+        doesn't also schedule a 15-minute reminder nudge — that task
+        resolves the account to alert from the customer's last *WhatsApp*
+        message, which has no equivalent for an Instagram-originated
+        handoff. customer_message is what the *customer* said, not
+        Amara's own reply — without it the merchant has nothing to
+        actually respond to when they use /reply.
         """
         merchant = ig_account.owner
-        if not merchant or not merchant.username or not merchant.accounts:
+        if not merchant:
             return
 
-        whatsapp_account = merchant.accounts[0]
         # /reply's Instagram path matches on username OR ig_scoped_id (see
         # _relay_to_instagram_customer), so this identifier is always
         # something the merchant can actually paste back in, even before
@@ -474,27 +454,60 @@ class LLMService:
             f"*Customer says:* {_truncate_for_alert(customer_message)}\n\n"
             f"Reply directly: `/reply @{reply_identifier} your message`"
         )
+        await self._send_platform_alert_to_merchant(db, merchant, alert_message)
 
+    async def _send_platform_alert_to_merchant(self, db: Session, merchant: User, alert_message: str) -> None:
+        """
+        Sends an operational alert (handoff, etc.) to the merchant's own
+        personal WhatsApp number, using the platform's own default
+        credentials — the exact same ones send_otp_message uses — rather
+        than requiring the merchant to have their own business
+        WhatsAppAccount connected. The merchant's personal WhatsApp is how
+        they talk to Amara/Taskflow itself; their (optional) business
+        WhatsAppAccount and Instagram connection are separate, customer-
+        facing channels. Best-effort/silent if the merchant has no phone
+        on file at all (checks username, then the Facebook-login
+        self-reported phone_number — same resolution order
+        subscription_access.find_platform_subscription uses).
+        """
+        merchant_phone = merchant.username or merchant.phone_number
+        if not merchant_phone:
+            return
+
+        from app.core.config import settings
         from app.core.provider import WhatsAppProvider
-        provider = WhatsAppProvider(whatsapp_account.access_token, whatsapp_account.phone_number_id)
+
+        provider = WhatsAppProvider(settings.WHATSAPP_TOKEN, settings.PHONE_NUMBER_ID)
         try:
-            alert_resp = await provider.send_text(merchant.username, alert_message)
+            alert_resp = await provider.send_text(merchant_phone, alert_message)
         except Exception as alert_err:
-            logger.error(f"Failed to send Instagram handoff alert to merchant: {alert_err}")
+            logger.error(f"Failed to send platform alert to merchant: {alert_err}")
             alert_resp = None
+
+        # Only log this as a Message if the platform's own number is
+        # actually connected as a real WhatsAppAccount (see CLAUDE.md) —
+        # until then there's no account row to attach it to, and the send
+        # itself still succeeds/fails independent of that being logged.
+        platform_account = (
+            db.query(WhatsAppAccount)
+            .filter(WhatsAppAccount.phone_number_id == settings.PHONE_NUMBER_ID)
+            .first()
+        )
+        if not platform_account:
+            return
 
         from app.crud import message as crud_message
         crud_message.create_message(
             db,
             {
-                "to_phone": merchant.username,
+                "to_phone": merchant_phone,
                 "type": "text",
                 "body": alert_message,
                 "direction": "outbound",
                 "status": "sent" if alert_resp else "failed",
                 "raw": alert_resp or {},
             },
-            whatsapp_account.id,
+            platform_account.id,
         )
 
     async def _track_quote(

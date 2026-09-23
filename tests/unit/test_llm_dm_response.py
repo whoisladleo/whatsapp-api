@@ -271,7 +271,11 @@ async def test_generate_dm_response_handoff_notifies_merchant_via_whatsapp(
     """
     Instagram has no API to message the account owner directly — only
     customers who've messaged the connected account — so a handoff must be
-    surfaced cross-channel, via the merchant's own WhatsApp account.
+    surfaced cross-channel, via WhatsApp (the platform's own default
+    credentials, sent to the merchant's personal number). whatsapp_account
+    here is unrelated to how the alert gets sent — it only confirms the
+    alert still reaches the right recipient (merchant.username) even when
+    they happen to also have a business WhatsAppAccount connected.
     """
     route = respx.post(url__regex=MESSAGES_URL_RE).mock(
         return_value=httpx.Response(200, json={"messages": [{"id": "wamid.handoff"}]})
@@ -297,12 +301,38 @@ async def test_generate_dm_response_handoff_notifies_merchant_via_whatsapp(
 
 
 @respx.mock
-async def test_generate_dm_response_handoff_no_merchant_whatsapp_account_does_not_crash(
+async def test_generate_dm_response_handoff_sent_without_a_whatsapp_account_row(
     db_session, ig_account, ig_customer, ig_context
 ):
-    """Every merchant is expected to have a WhatsAppAccount, but this must
-    stay best-effort/silent if one somehow doesn't exist rather than
-    breaking the customer-facing handoff response."""
+    """
+    Regression test for a real production gap: alerts used to require
+    merchant.accounts (a connected business WhatsAppAccount) and silently
+    no-op'd when it didn't exist. The alert is sent via the platform's own
+    default WhatsApp credentials instead — the merchant's personal number
+    is how they talk to Amara/Taskflow, independent of whether they've
+    connected a business WhatsAppAccount at all (no fixture here has one).
+    """
+    route = respx.post(url__regex=MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "wamid.handoff"}]})
+    )
+    service = _service_with_fake_client(reply_text="[HUMAN_HANDOFF]")
+
+    result = await service.generate_dm_response(
+        "??", db=db_session, account=ig_account, customer=ig_customer, context=ig_context, conversation_history=[]
+    )
+
+    assert result
+    assert route.called
+
+
+async def test_generate_dm_response_handoff_no_merchant_username_does_not_crash(
+    db_session, ig_account, ig_customer, ig_context
+):
+    """Best-effort/silent if the merchant genuinely has no phone on file
+    at all (neither username nor phone_number) — nothing to send to."""
+    ig_account.owner.username = None
+    db_session.commit()
+
     route = respx.post(url__regex=MESSAGES_URL_RE).mock(
         return_value=httpx.Response(200, json={"messages": [{"id": "wamid.handoff"}]})
     )

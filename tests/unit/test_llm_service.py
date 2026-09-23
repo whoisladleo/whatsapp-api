@@ -528,6 +528,22 @@ async def test_chat_history_included_and_empty_bodies_skipped(db_session, shop_a
 async def test_human_handoff_trigger_updates_state_and_alerts_merchant(
     db_session, shop_account, merchant, monkeypatch
 ):
+    """
+    Alert is sent via the platform's own default WhatsApp credentials
+    (same ones send_otp_message uses), not the merchant's own business
+    WhatsAppAccount (shop_account here) — that's a separate, customer-
+    facing channel the merchant may or may not have connected at all.
+    """
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "PHONE_NUMBER_ID", "PLATFORM_PHONE_TEST")
+    platform_account = WhatsAppAccount(
+        name="Taskflow", phone_number_id="PLATFORM_PHONE_TEST", access_token="platform-tok",
+        user_id=merchant.id,
+    )
+    db_session.add(platform_account)
+    db_session.commit()
+
     alert_route = respx.post(url__regex=MESSAGES_URL_RE).mock(
         return_value=httpx.Response(200, json={"messages": [{"id": "wamid.alert"}]})
     )
@@ -582,7 +598,55 @@ async def test_human_handoff_trigger_updates_state_and_alerts_merchant(
 
 
 @respx.mock
-async def test_human_handoff_alert_send_failure_is_logged_as_failed(db_session, shop_account, merchant):
+async def test_human_handoff_alert_still_sent_without_a_platform_whatsapp_account(
+    db_session, shop_account, merchant, monkeypatch
+):
+    """
+    Regression test for a real production gap: no WhatsAppAccount row
+    existed anywhere in the database (not the merchant's own business
+    account, not the platform's own number either), and the handoff alert
+    silently never arrived. The alert must still be SENT via the
+    platform's default credentials regardless of whether that number is
+    also connected as a real WhatsAppAccount row — only the Message-log
+    entry (used for the dashboard's own history view) depends on that row
+    existing.
+    """
+    alert_route = respx.post(url__regex=MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "wamid.alert"}]})
+    )
+
+    async def handoff_handler(**kwargs):
+        return _FakeResponse("Let me get a human. [HUMAN_HANDOFF]")
+
+    service = _service_with_fake_client(handler=handoff_handler)
+    monkeypatch.setattr(
+        "app.tasks.handoff_reminders.send_handoff_reminder.apply_async", lambda *a, **kw: None
+    )
+
+    await service.generate_response(
+        message_body="I need a human",
+        from_phone="255711116667",
+        db=db_session,
+        account=shop_account,
+    )
+
+    assert alert_route.called
+    assert db_session.query(Message).filter(
+        Message.to_phone == merchant.username, Message.direction == "outbound"
+    ).count() == 0
+
+
+@respx.mock
+async def test_human_handoff_alert_send_failure_is_logged_as_failed(db_session, shop_account, merchant, monkeypatch):
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "PHONE_NUMBER_ID", "PLATFORM_PHONE_TEST")
+    db_session.add(WhatsAppAccount(
+        name="Taskflow", phone_number_id="PLATFORM_PHONE_TEST", access_token="platform-tok",
+        user_id=merchant.id,
+    ))
+    db_session.commit()
+
     respx.post(url__regex=MESSAGES_URL_RE).mock(return_value=httpx.Response(500))
 
     async def handoff_handler(**kwargs):
