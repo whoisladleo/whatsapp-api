@@ -90,11 +90,20 @@ def upsert_account(
         if account is None or other.id != account.id:
             db.delete(other)
 
-    if not account:
-        # This exact Instagram account may already be connected under a
-        # different Taskflow user — the most recent OAuth consent is proof
-        # of current control, so it takes over the row rather than erroring.
-        account = get_account_by_ig_business_id(db, ig_business_id)
+    # This exact Instagram account may already be connected under a
+    # different Taskflow user — or, separately, this user's own fallback
+    # row above (existing_for_user[0]) might carry a stale ig_business_id
+    # that collides with someone else's row once we try to repoint it. The
+    # most recent OAuth consent is proof of current control either way, so
+    # that other row is taken over (and any stale row of this user's own
+    # discarded) rather than left to hit ig_business_id's unique constraint.
+    # This check has to run unconditionally, not just when `account` is
+    # still None — a truthy fallback account above must not skip it.
+    elsewhere = get_account_by_ig_business_id(db, ig_business_id)
+    if elsewhere and (account is None or elsewhere.id != account.id):
+        if account is not None:
+            db.delete(account)
+        account = elsewhere
 
     if account:
         account.ig_business_id = ig_business_id

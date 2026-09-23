@@ -165,6 +165,33 @@ def test_upsert_reassigns_account_already_connected_by_a_different_user(
     ).count() == 0
 
 
+def test_upsert_reassigns_account_owned_elsewhere_even_when_connecting_user_has_a_stale_row(
+    db_session, user, other_user
+):
+    """
+    Regression test: a real IntegrityError this produced in production —
+    other_user already holds ig_shared, and `user` separately has their own
+    unrelated stale row (e.g. from connecting under a different login
+    method that resolves to a different User). Previously, `user`'s own
+    stale row became the fallback `account` before the "does someone else
+    already own this ig_business_id" check ever ran, so the code tried to
+    repoint that stale row's ig_business_id onto a value the DB's unique
+    constraint said was already taken.
+    """
+    crud_instagram.upsert_account(db_session, other_user.id, "ig_shared", "tok_1", "shared_shop")
+    crud_instagram.upsert_account(db_session, user.id, "ig_stale", "tok_stale", "old_handle")
+
+    result = crud_instagram.upsert_account(db_session, user.id, "ig_shared", "tok_2", "shared_shop")
+
+    assert result.ig_business_id == "ig_shared"
+    assert result.user_id == user.id
+    assert result.access_token == "tok_2"
+    assert db_session.query(InstagramAccount).count() == 1
+    assert db_session.query(InstagramAccount).filter(
+        InstagramAccount.ig_business_id == "ig_stale"
+    ).count() == 0
+
+
 @pytest.fixture
 def account(db_session, user):
     return crud_instagram.upsert_account(db_session, user.id, "ig_1", "tok_1", "shop_one")
