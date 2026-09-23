@@ -153,8 +153,12 @@ async def test_generate_dm_response_success(db_session, ig_account, ig_customer,
 
     assert result == "It's 45000 TZS."
     assert "Shoe Shop" in captured["system"]
-    assert "Shoes: Max Price 45000" in captured["system"]
+    assert "Shoes: Max Price TZS 45,000" in captured["system"]
     assert "how much for the shoes?" in captured["messages"][0]["content"]
+    # Regression: this exact path (Instagram DM) was observed live quoting
+    # a TZS price as USD ("$100,000") — see llm.py's currency RULES.
+    assert "Tanzanian Shillings" in captured["system"]
+    assert '"$"' in captured["system"]
 
 
 async def test_generate_dm_response_includes_conversation_history(db_session, ig_account, ig_customer, ig_context, shoes):

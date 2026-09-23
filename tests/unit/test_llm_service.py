@@ -324,6 +324,11 @@ async def test_regular_account_catalog_uses_account_owner_products(db_session, s
     assert "Shoes" in instruction
     assert "Available Products" in instruction
     assert "Test Shop" in instruction
+    # Regression: catalog prices had no currency label at all — observed
+    # live quoting a TZS price as USD ("$100,000") to a real customer.
+    assert "TZS 50,000" in instruction
+    assert "Tanzanian Shillings" in instruction
+    assert '"$"' in instruction
 
 
 async def test_regular_account_catalog_includes_product_description(db_session, shop_account, merchant):
@@ -416,6 +421,11 @@ async def test_platform_account_subsequent_message_uses_assistance_rules(db_sess
     instruction = captured["system"]
     assert "Welcome Message" not in instruction
     assert "You CANNOT add products" in instruction
+    # Regression: the platform pitch already stated "100,000 TZS" but had
+    # no explicit guardrail against also saying "$"/USD — observed live
+    # quoting this exact price as "$100,000" to a real prospect.
+    assert "Tanzanian Shillings" in instruction
+    assert '"$"' in instruction
 
 
 async def test_knowledge_content_and_system_prompt_included(db_session, shop_account):

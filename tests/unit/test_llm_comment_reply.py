@@ -98,7 +98,12 @@ async def test_generate_comment_reply_success(db_session, merchant, shoes):
     }
     assert "Shoe Shop" in captured["system"]
     assert "how much for the shoes?" in captured["system"]
-    assert "Shoes: Price 45000" in captured["system"]
+    assert "Shoes: Price TZS 45,000" in captured["system"]
+    # Regression: catalog prices had no currency label at all, and the
+    # model was observed live quoting a TZS price as USD ("$100,000")
+    # instead — see llm.py's currency RULES additions.
+    assert "Tanzanian Shillings" in captured["system"]
+    assert '"$"' in captured["system"]
 
 
 async def test_generate_comment_reply_includes_product_description_in_catalog(db_session, merchant):

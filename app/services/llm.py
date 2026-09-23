@@ -585,7 +585,7 @@ class LLMService:
         else:
             catalog_str = "Available Products:\n"
             for p in products:
-                catalog_str += f"- {p.name}: Price {p.max_price}, Stock: {p.quantity}\n"
+                catalog_str += f"- {p.name}: Price TZS {p.max_price:,.0f}, Stock: {p.quantity}\n"
                 if p.description:
                     catalog_str += f"  {p.description}\n"
 
@@ -602,6 +602,8 @@ class LLMService:
 Reply with EXACTLY two lines, nothing else, in this format:
 PUBLIC: <a short, friendly public reply visible to everyone — never state a price or personal details, just acknowledge them and say you've sent more info to their DMs>
 PRIVATE: <a short direct message with the actual details they're asking about, using only the catalog/knowledge above — never invent a product, price, stock level, or feature/detail that isn't there>
+
+All prices are in Tanzanian Shillings (TZS) — always state them exactly as given, including the TZS label. Never say "$", "USD", "dollars", or imply any other currency, and never convert the number into another currency.
 
 Match the customer's language (Swahili or English). Keep both lines to one sentence each.
 """
@@ -740,7 +742,7 @@ Match the customer's language (Swahili or English). Keep both lines to one sente
         else:
             catalog_str = "Available Products:\n"
             for p in products:
-                catalog_str += f"- {p.name}: Max Price {p.max_price}, Min Price (SECRET FLOOR) {p.min_price}, Stock: {p.quantity}\n"
+                catalog_str += f"- {p.name}: Max Price TZS {p.max_price:,.0f}, Min Price (SECRET FLOOR) TZS {p.min_price:,.0f}, Stock: {p.quantity}\n"
                 if p.description:
                     catalog_str += f"  {p.description}\n"
 
@@ -764,6 +766,7 @@ RULES:
 4. Payment: describe it accurately — a payment request gets sent directly to the given phone number for them to approve, not a menu of payment apps to choose from. Don't name specific mobile money providers.
 5. Human Handoff: if the customer is unreasonable, has complex questions you can't answer from the catalog/knowledge above, or explicitly asks for a human, include the exact marker [HUMAN_HANDOFF]. Don't include this for a normal close — that's handled by AGREEMENT_REACHED instead.
 6. Keep replies SHORT and natural, like a real Instagram DM — usually 1-3 sentences. Match the customer's language (Swahili or English).
+7. Currency: all prices are in Tanzanian Shillings (TZS) — always state them exactly as given, including the TZS label. Never say "$", "USD", "dollars", or imply any other currency, and never convert the number into another currency.
 
 Reply with ONLY the message text (plus whichever marker applies, if any) — no other formatting.
 """
@@ -893,7 +896,7 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
         else:
             catalog_str = "Available Products:\n"
             for p in products:
-                catalog_str += f"- {p.name}: Max Price {p.max_price}, Min Price (SECRET FLOOR) {p.min_price}, Stock: {p.quantity}\n"
+                catalog_str += f"- {p.name}: Max Price TZS {p.max_price:,.0f}, Min Price (SECRET FLOOR) TZS {p.min_price:,.0f}, Stock: {p.quantity}\n"
                 if p.description:
                     catalog_str += f"  {p.description}\n"
 
@@ -987,6 +990,7 @@ OPERATIONAL RULES:
 3. How payment actually works — this is real and automatic, state it confidently, never say you have no payment process of your own: once a customer agrees to buy something, a payment request is sent automatically straight to their phone via mobile money for them to approve — no manual bank transfer, cash negotiation, or collection work for the shop owner. Installment plans (Lipa kwa Awamu) are also available if the shop wants to offer them. This is a fixed platform capability, the same for every shop, not something the shop configures.
 4. Delivery — this is genuinely NOT automatic, unlike payment: it depends entirely on how the shop already handles delivery. Only state a delivery cost, timeframe, or process the shop has actually told you; otherwise say it follows however the shop currently does it and you'll confirm the details.
 5. Human Handoff: If the customer is unreasonable, has complex technical questions, or explicitly asks for a human, you must include the exact phrase [HUMAN_HANDOFF] in your response.
+6. Currency: the 100,000 TZS above is Tanzanian Shillings, never any other currency. Never say "$", "USD", "dollars", or imply this price is in another currency, and never convert it.
 """
         else:
             base_instruction = f"""You are Amara, the 24/7 AI Sales Agent for {account.name}.
@@ -1007,8 +1011,9 @@ RULES:
 5. Delivery: if they want delivery, ask where and roughly when. After the order is confirmed you'll separately ask them to share their exact location via WhatsApp's location-sharing feature — you don't need to collect a written address yourself. Only quote a delivery cost or timeframe if it's actually in your knowledge/instructions below; otherwise say the shop will confirm it.
 6. Quoting: whenever you state a specific price to the customer during negotiation but haven't closed the deal yet, end your response with the marker [QUOTE: product=<product name> price=<price>] (e.g. [QUOTE: product=Shoes price=45000]). Don't include this once you've already emitted [AGREEMENT_REACHED] for the same deal.
 7. Human Handoff: If the customer is unreasonable, has complex technical questions, or explicitly asks for a human, you must include the exact phrase [HUMAN_HANDOFF] in your response.
+8. Currency: all prices are in Tanzanian Shillings (TZS) — always state them exactly as given, including the TZS label. Never say "$", "USD", "dollars", or imply any other currency, and never convert the number into another currency.
 """
-        
+
         base_instruction += """
 Current State:
 You are chatting with a customer. Be polite, persuasive, and use Swahili or English depending on their language.
