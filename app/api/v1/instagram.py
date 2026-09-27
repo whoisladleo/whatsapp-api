@@ -349,7 +349,15 @@ async def send_message(
         account.ig_business_id, customer.ig_scoped_id, payload.message
     )
     if "error" in response:
-        raise HTTPException(status_code=502, detail="Failed to send Instagram message")
+        # Surface Meta's actual error (e.g. outside the messaging window,
+        # invalid/expired token) instead of a generic message — the
+        # dashboard's sendInstagramReply action already renders
+        # errorData?.detail directly to the merchant, so this flows
+        # straight through. Discarding it here was a real gap: neither the
+        # dashboard nor logs showed why a send failed, and a failed attempt
+        # is never persisted (InstagramDirectMessage has no status column).
+        meta_detail = response.get("error", {}).get("message") or "Failed to send Instagram message"
+        raise HTTPException(status_code=502, detail=meta_detail)
 
     message = crud_instagram.create_direct_message(
         db,

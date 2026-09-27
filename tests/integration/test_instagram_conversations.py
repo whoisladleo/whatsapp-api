@@ -196,6 +196,28 @@ def test_send_failure_returns_502(client, auth_user, account, customer, monkeypa
     )
 
     assert resp.status_code == 502
+    # Regression: used to always return a generic message, discarding
+    # Meta's actual reason (e.g. outside the messaging window, invalid
+    # token) — the dashboard renders this detail directly to the merchant.
+    assert resp.json()["detail"] == "rate limited"
+
+
+def test_send_failure_falls_back_to_generic_message_without_meta_detail(
+    client, auth_user, account, customer, monkeypatch
+):
+    _, headers = auth_user
+
+    async def fake_send_direct_message(self, ig_business_id, recipient_id, message):
+        return {"error": {}}
+
+    monkeypatch.setattr(InstagramProvider, "send_direct_message", fake_send_direct_message)
+
+    resp = client.post(
+        SEND_URL, json={"customer_id": str(customer.id), "message": "hi"}, headers=headers
+    )
+
+    assert resp.status_code == 502
+    assert resp.json()["detail"] == "Failed to send Instagram message"
 
 
 def test_send_404_for_unknown_customer(client, auth_user, account):
