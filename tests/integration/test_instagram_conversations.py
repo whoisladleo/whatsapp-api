@@ -183,7 +183,7 @@ def test_send_success_creates_outbound_message(client, db_session, auth_user, ac
     assert outbound.ig_message_id == "mid_sent_1"
 
 
-def test_send_failure_returns_502(client, auth_user, account, customer, monkeypatch):
+def test_send_failure_returns_422(client, auth_user, account, customer, monkeypatch):
     _, headers = auth_user
 
     async def fake_send_direct_message(self, ig_business_id, recipient_id, message):
@@ -195,7 +195,10 @@ def test_send_failure_returns_502(client, auth_user, account, customer, monkeypa
         SEND_URL, json={"customer_id": str(customer.id), "message": "hi"}, headers=headers
     )
 
-    assert resp.status_code == 502
+    # 422, not 502: this is Meta rejecting a well-formed request, not a
+    # gateway failure — 502 was found live to get its JSON body swallowed
+    # and replaced by the reverse proxy in front of this API.
+    assert resp.status_code == 422
     # Regression: used to always return a generic message, discarding
     # Meta's actual reason (e.g. outside the messaging window, invalid
     # token) — the dashboard renders this detail directly to the merchant.
@@ -216,7 +219,7 @@ def test_send_failure_falls_back_to_generic_message_without_meta_detail(
         SEND_URL, json={"customer_id": str(customer.id), "message": "hi"}, headers=headers
     )
 
-    assert resp.status_code == 502
+    assert resp.status_code == 422
     assert resp.json()["detail"] == "Failed to send Instagram message"
 
 

@@ -299,4 +299,9 @@ async def send_message(
         response.get("error", {}).get("message", "Failed to send message")
         if response else "Failed to send message"
     )
-    raise HTTPException(status_code=502, detail=error_detail)
+    # 422, not 502: this is Meta's API rejecting a well-formed request, not
+    # a gateway/infra failure — confirmed live (see Instagram's identical
+    # send_message) that 502 gets its body swallowed and replaced by
+    # whatever reverse proxy sits in front of this API, so error_detail
+    # above never actually reaches the dashboard despite being set here.
+    raise HTTPException(status_code=422, detail=error_detail)

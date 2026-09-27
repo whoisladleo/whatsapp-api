@@ -356,8 +356,15 @@ async def send_message(
         # straight through. Discarding it here was a real gap: neither the
         # dashboard nor logs showed why a send failed, and a failed attempt
         # is never persisted (InstagramDirectMessage has no status column).
+        #
+        # 422, not 502: this is Meta's API rejecting a well-formed request,
+        # not a gateway/infra failure — confirmed live that 502 gets its
+        # body swallowed and replaced by whatever reverse proxy sits in
+        # front of this API (Coolify/nginx/Cloudflare all commonly rewrite
+        # 502/503/504 with their own generic error page), so the detail
+        # above never actually reached the dashboard despite being set.
         meta_detail = response.get("error", {}).get("message") or "Failed to send Instagram message"
-        raise HTTPException(status_code=502, detail=meta_detail)
+        raise HTTPException(status_code=422, detail=meta_detail)
 
     message = crud_instagram.create_direct_message(
         db,

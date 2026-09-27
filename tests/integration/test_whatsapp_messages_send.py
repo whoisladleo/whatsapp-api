@@ -77,7 +77,7 @@ def test_send_text_message_with_context_includes_quoted_reply(
 
 
 @respx.mock
-def test_send_text_message_meta_error_returns_502_and_does_not_log(
+def test_send_text_message_meta_error_returns_422_and_does_not_log(
     client, db_session, owner_and_headers, account
 ):
     _, headers = owner_and_headers
@@ -94,7 +94,10 @@ def test_send_text_message_meta_error_returns_502_and_does_not_log(
         json={"to": "255711119999", "type": "text", "text_body": "Hello there"},
     )
 
-    assert resp.status_code == 502
+    # 422, not 502: this is Meta rejecting a well-formed request, not a
+    # gateway failure — 502 was found live to get its JSON body swallowed
+    # and replaced by the reverse proxy in front of this API.
+    assert resp.status_code == 422
     assert "display name approval" in resp.json()["detail"]
     assert db_session.query(Message).filter(Message.direction == "outbound").first() is None
 
