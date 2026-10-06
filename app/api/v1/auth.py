@@ -1,10 +1,4 @@
-import secrets
-import uuid
-from typing import Optional
-
-import jwt
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
-from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 from datetime import timedelta, datetime
 
@@ -19,7 +13,6 @@ from app.schemas.auth import (
     Token,
     OTPRequest,
     OTPVerify,
-    FacebookExchangeRequest,
     UserProfile,
     UserProfileUpdate,
     MySubscriptionRead,
@@ -28,15 +21,9 @@ from app.schemas.auth import (
 )
 from app.crud import user as crud_user
 from app.core.provider import WhatsAppProvider
-from app.services import facebook_oauth, self_service_billing
+from app.services import self_service_billing
 
 router = APIRouter()
-
-# The /callback redirect only carries a short-lived login code (exchanged
-# for the real session token by /exchange) rather than the token itself, so
-# a long-lived credential never ends up in a URL — browser history, server
-# access logs, etc.
-FACEBOOK_LOGIN_CODE_EXPIRE_MINUTES = 2
 
 # Kept in sync with WHATSAPP_OTP_TEMPLATE_LANGUAGE so the plain-text
 # fallback (sent when the template send fails, or is unconfigured) is in
@@ -108,9 +95,9 @@ async def request_otp(
 
     # Pre-onboarding: Create user if they don't exist. A phone number that
     # doesn't match any User.username but does match User.phone_number
-    # belongs to a Facebook-login merchant who's already self-reported it
-    # (PATCH /auth/me, Pay Now) — promote it to username rather than
-    # creating a second, unlinked User for the same person (see issue #7).
+    # belongs to a merchant who already self-reported it (PATCH /auth/me,
+    # Pay Now) — promote it to username rather than creating a second,
+    # unlinked User for the same person (see issue #7).
     user = crud_user.get_user_by_username(db, phone_number)
     if not user:
         candidate = crud_user.get_user_by_phone_number(db, phone_number)
@@ -182,69 +169,6 @@ def verify_otp(
     }
 
 
-@router.get("/facebook/start")
-async def start_facebook_login():
-    """
-    An independent alternative to WhatsApp OTP login (not account linking —
-    see app/db/models.py's User.facebook_id), added because OTP delivery
-    has been unreliable. No current_user dependency: unlike Instagram's
-    oauth/start, this endpoint IS the login mechanism, so there's no
-    existing session to require yet.
-    """
-    state = secrets.token_urlsafe(16)
-    return {"authorize_url": facebook_oauth.build_authorize_url(state)}
-
-
-@router.get("/facebook/callback")
-async def facebook_login_callback(
-    db: Session = Depends(get_db),
-    code: Optional[str] = None,
-    state: Optional[str] = None,
-    error: Optional[str] = None,
-):
-    login_url = f"{settings.DASHBOARD_URL}/login"
-
-    if error or not code:
-        return RedirectResponse(f"{login_url}?fb_error=1")
-
-    try:
-        access_token = await facebook_oauth.exchange_code_for_token(code)
-        facebook_id, name, email = await facebook_oauth.fetch_profile(access_token)
-    except facebook_oauth.FacebookOAuthError:
-        return RedirectResponse(f"{login_url}?fb_error=1")
-
-    user = crud_user.get_user_by_facebook_id(db, facebook_id)
-    if not user:
-        user = crud_user.create_facebook_user(db, facebook_id, name, email)
-
-    login_code = security.create_access_token(
-        user.id, expires_delta=timedelta(minutes=FACEBOOK_LOGIN_CODE_EXPIRE_MINUTES)
-    )
-    return RedirectResponse(f"{login_url}?fb_code={login_code}")
-
-
-@router.post("/facebook/exchange", response_model=Token)
-def exchange_facebook_login_code(payload: FacebookExchangeRequest, db: Session = Depends(get_db)):
-    """Trades the short-lived code from /facebook/callback for a real session token."""
-    try:
-        decoded = jwt.decode(payload.code, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        user_id = uuid.UUID(decoded["sub"])
-    except (jwt.InvalidTokenError, KeyError, TypeError, ValueError):
-        raise HTTPException(status_code=401, detail="Invalid or expired login code")
-
-    user = crud_user.get_user(db, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    return {
-        "access_token": security.create_access_token(
-            user.id, expires_delta=access_token_expires
-        ),
-        "token_type": "bearer",
-    }
-
-
 @router.get("/me", response_model=UserProfile)
 def get_my_profile(current_user: User = Depends(get_current_user)):
     return current_user
@@ -258,9 +182,9 @@ def update_my_profile(
 ):
     """
     Currently only phone_number is settable — self-reported billing contact
-    for a Facebook-login merchant (who has no phone tied to their account
-    any other way), matched against the Customer who paid for the platform
-    subscription. See app/services/subscription_access.py.
+    for a merchant whose account has no phone tied to it (no username),
+    matched against the Customer who paid for the platform subscription.
+    See app/services/subscription_access.py.
     """
     if payload.phone_number is not None:
         normalized = normalize_phone(payload.phone_number)

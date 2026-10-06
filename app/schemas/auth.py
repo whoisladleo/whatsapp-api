@@ -25,17 +25,14 @@ class Token(BaseModel):
 class TokenPayload(BaseModel):
     sub: Optional[str] = None
 
-class FacebookExchangeRequest(BaseModel):
-    code: str
-
 class UserProfile(BaseModel):
     id: uuid.UUID
     username: Optional[str] = None
     email: Optional[str] = None
     name: Optional[str] = None
-    # Self-reported, only meaningful for a Facebook-login user (no phone
-    # otherwise) — see app/services/subscription_access.py, which matches
-    # this against the Customer who paid for the platform subscription.
+    # Self-reported, only meaningful when the account has no phone tied to
+    # it (no username) — see app/services/subscription_access.py, which
+    # matches this against the Customer who paid for the platform subscription.
     phone_number: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
