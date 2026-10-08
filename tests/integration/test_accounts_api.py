@@ -6,7 +6,9 @@ import respx
 
 from app.core.config import settings
 from app.core.security import create_access_token
-from app.db.models import NumberSubscription, NumberSubscriptionStatus, PhoneNumberPool, User
+from app.db.models import (
+    NumberSubscription, NumberSubscriptionStatus, PhoneNumberPool, PhoneNumberStatus, User,
+)
 
 BASE = "/api/v1/accounts"
 VALIDATE_URL_RE = r"https://graph\.facebook\.com/.+/PHONE1$"
@@ -140,88 +142,6 @@ def test_update_account_revalidates_when_token_changes(client, auth_user):
     assert revalidate_route.called
 
 
-@respx.mock
-def test_update_account_reassign_from_pool_success(client, auth_user, db_session, monkeypatch):
-    _, headers = auth_user
-    respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
-    created = client.post(BASE, json=_account_payload(), headers=headers).json()
-
-    monkeypatch.setattr(settings, "WHATSAPP_POOL_ACCESS_TOKEN", "platform-token")
-    db_session.add(PhoneNumberPool(phone_number_id="POOL_REASSIGN_1"))
-    db_session.commit()
-    # request_display_name_change (best-effort, swallows failures) fires
-    # against this new number afterward — no route registered for it is
-    # fine, same pattern test_create_account_auto_assigns_from_pool... relies
-    # on: respx's unmocked-request error gets caught right there and ignored.
-
-    resp = client.put(
-        f"{BASE}/{created['id']}", json={"reassign_from_pool": True}, headers=headers
-    )
-
-    assert resp.status_code == 200
-    assert resp.json()["phone_number_id"] == "POOL_REASSIGN_1"
-
-
-def test_update_account_reassign_from_pool_exhausted_returns_409(client, auth_user, monkeypatch):
-    # Free pool numbers are ops-provisioned only — exhaustion no longer
-    # falls back to a live (unpaid) Twilio purchase, since that's now
-    # gated behind the paid purchase_number endpoint instead.
-    _, headers = auth_user
-    with respx.mock:
-        respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
-        created = client.post(BASE, json=_account_payload(), headers=headers).json()
-
-    monkeypatch.setattr(settings, "WHATSAPP_POOL_ACCESS_TOKEN", "platform-token")
-
-    resp = client.put(
-        f"{BASE}/{created['id']}", json={"reassign_from_pool": True}, headers=headers
-    )
-
-    assert resp.status_code == 409
-    assert "Purchase a WhatsApp Number" in resp.json()["detail"]
-
-
-def test_update_account_reassign_from_pool_not_configured_returns_503(client, auth_user, monkeypatch):
-    _, headers = auth_user
-    with respx.mock:
-        respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
-        created = client.post(BASE, json=_account_payload(), headers=headers).json()
-
-    monkeypatch.setattr(settings, "WHATSAPP_POOL_ACCESS_TOKEN", None)
-
-    resp = client.put(
-        f"{BASE}/{created['id']}", json={"reassign_from_pool": True}, headers=headers
-    )
-
-    assert resp.status_code == 503
-
-
-def test_create_account_auto_assigns_from_pool_when_credentials_omitted(
-    client, auth_user, db_session, monkeypatch
-):
-    _, headers = auth_user
-    monkeypatch.setattr(settings, "WHATSAPP_POOL_ACCESS_TOKEN", "platform-token")
-    db_session.add(PhoneNumberPool(phone_number_id="POOL_ACC_1"))
-    db_session.commit()
-
-    # No respx route registered at all — a pool assignment must not attempt
-    # any Meta validation call, or this test would fail with a connection error.
-    resp = client.post(BASE, json={"name": "Auto Shop"}, headers=headers)
-
-    assert resp.status_code == 201
-    body = resp.json()
-    assert body["phone_number_id"] == "POOL_ACC_1"
-
-
-def test_create_account_pool_exhausted_returns_409(client, auth_user, monkeypatch):
-    _, headers = auth_user
-    monkeypatch.setattr(settings, "WHATSAPP_POOL_ACCESS_TOKEN", "platform-token")
-
-    resp = client.post(BASE, json={"name": "No Pool Shop"}, headers=headers)
-
-    assert resp.status_code == 409
-
-
 def test_create_account_partial_credentials_returns_400(client, auth_user):
     _, headers = auth_user
 
@@ -230,6 +150,16 @@ def test_create_account_partial_credentials_returns_400(client, auth_user):
         json={"name": "Half Creds Shop", "phone_number_id": "ONLY_PHONE"},
         headers=headers,
     )
+
+    assert resp.status_code == 400
+
+
+def test_create_account_both_credentials_omitted_returns_400(client, auth_user):
+    # Numbers are connected manually for now (see #16) — no more silent
+    # pool auto-assign when both fields are omitted.
+    _, headers = auth_user
+
+    resp = client.post(BASE, json={"name": "No Creds Shop"}, headers=headers)
 
     assert resp.status_code == 400
 
@@ -246,12 +176,23 @@ def test_create_account_duplicate_phone_number_id_returns_clean_400(client, auth
     assert "already exists" in resp.json()["detail"]
 
 
-def test_delete_account_releases_pool_number(client, auth_user, db_session, monkeypatch):
+@respx.mock
+def test_delete_account_releases_pool_number(client, auth_user, db_session):
+    # An account can still end up linked to a PhoneNumberPool row via the
+    # paid purchase flow or ops-driven manual assignment (see #16) — not
+    # exercised here, just the resulting linked state delete must release.
     _, headers = auth_user
-    monkeypatch.setattr(settings, "WHATSAPP_POOL_ACCESS_TOKEN", "platform-token")
-    db_session.add(PhoneNumberPool(phone_number_id="POOL_ACC_2"))
+    respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
+    created = client.post(BASE, json=_account_payload(), headers=headers).json()
+
+    db_session.add(
+        PhoneNumberPool(
+            phone_number_id="POOL_ACC_2",
+            status=PhoneNumberStatus.ASSIGNED,
+            whatsapp_account_id=uuid.UUID(created["id"]),
+        )
+    )
     db_session.commit()
-    created = client.post(BASE, json={"name": "Auto Shop 2"}, headers=headers).json()
 
     resp = client.delete(f"{BASE}/{created['id']}", headers=headers)
 

@@ -12,10 +12,7 @@ from app.schemas.account import (
 )
 from app.crud.account import (
     create_account, get_account_by_id, get_accounts_by_user,
-    update_account, delete_account, get_pool_two_step_pin,
-    reassign_account_to_pool_number,
-    PartialWhatsAppCredentialsError, PhonePoolExhaustedError,
-    PoolAccessTokenNotConfiguredError,
+    update_account, delete_account,
 )
 from app.api.deps import get_current_user
 from app.core.config import settings
@@ -78,51 +75,27 @@ async def create_new_account(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    # Only validate against Meta when the merchant supplied BOTH of their own
-    # credentials (bring-your-own-number). Omitting both fields means
-    # auto-assign from the pool — there's nothing to validate yet, the pool
-    # number is Taskflow's own, already-verified number. Supplying exactly
-    # one is an incomplete/invalid combination handled below by
-    # create_account raising PartialWhatsAppCredentialsError, which gives a
-    # clearer message than a Meta-validation call against a half-empty pair
-    # ever could.
-    if account_in.phone_number_id and account_in.access_token:
-        is_valid = await validate_whatsapp_credentials(account_in.phone_number_id, account_in.access_token)
-        if not is_valid:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid Meta Phone Number ID or Access Token."
-            )
-
-    try:
-        account = create_account(db=db, account_in=account_in, user_id=current_user.id)
-    except PartialWhatsAppCredentialsError:
+    # Numbers are connected manually for now (see #16) — both fields are
+    # required, no more silent pool auto-assign when both are omitted.
+    if not account_in.phone_number_id or not account_in.access_token:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Provide both phone_number_id and access_token, or omit both to auto-assign a number from the pool.",
+            detail="Provide both phone_number_id and access_token.",
         )
-    except PhonePoolExhaustedError:
+
+    is_valid = await validate_whatsapp_credentials(account_in.phone_number_id, account_in.access_token)
+    if not is_valid:
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="No WhatsApp numbers are currently available in the pool. Try again shortly, or provide your own phone_number_id/access_token.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid Meta Phone Number ID or Access Token."
         )
-    except PoolAccessTokenNotConfiguredError:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Auto-assign is temporarily unavailable (pool credentials not configured). Provide your own phone_number_id/access_token instead.",
-        )
+
+    account = create_account(db=db, account_in=account_in, user_id=current_user.id)
     if not account:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="WhatsApp account with this ID already exists",
         )
-
-    was_auto_assigned = not (account_in.phone_number_id and account_in.access_token)
-    if was_auto_assigned:
-        await request_display_name_change(account.phone_number_id, account.access_token, account.name)
-        pin = get_pool_two_step_pin(db, account.id)
-        if pin:
-            await register_phone_number(account.phone_number_id, account.access_token, pin)
 
     return account
 
@@ -179,36 +152,6 @@ async def update_existing_account(
     if not db_account:
         raise HTTPException(status_code=404, detail="Account not found")
 
-    if account_in.reassign_from_pool:
-        try:
-            db_account = reassign_account_to_pool_number(db, db_account)
-        except PoolAccessTokenNotConfiguredError:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Auto-assign is temporarily unavailable (pool credentials not configured). Provide your own phone_number_id/access_token instead.",
-            )
-        except PhonePoolExhaustedError:
-            # Free pool numbers are for ops-driven replenishment only — a
-            # live Twilio purchase costs real, recurring money, so it's
-            # gated behind POST /{account_id}/purchase-number's paid flow
-            # instead of happening for free here.
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    "No WhatsApp numbers are currently available in the free pool. "
-                    "Use \"Purchase a WhatsApp Number\" to buy one directly, or provide your own "
-                    "phone_number_id/access_token instead."
-                ),
-            )
-        await request_display_name_change(db_account.phone_number_id, db_account.access_token, db_account.name)
-        pin = get_pool_two_step_pin(db, db_account.id)
-        if pin:
-            await register_phone_number(db_account.phone_number_id, db_account.access_token, pin)
-        # Any other fields in this same request (name, ai_enabled, system_prompt,
-        # etc.) still apply normally — just never phone_number_id/access_token,
-        # which the frontend never sends alongside reassign_from_pool anyway.
-        return update_account(db=db, db_account=db_account, account_in=account_in)
-
     # If they are updating credentials, validate them
     phone_id_to_check = account_in.phone_number_id or db_account.phone_number_id
     token_to_check = account_in.access_token or db_account.access_token
@@ -243,10 +186,10 @@ async def purchase_number(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Starts a paid, on-demand number purchase (10,000 TZS/month) — the
-    explicit, monetized counterpart to the free (but ops-dependent)
-    reassign_from_pool path above. Only pushes the Tunzaa payment request
-    here; the actual Twilio/Meta purchase runs later, once
+    Starts a paid, on-demand number purchase (10,000 TZS/month) — numbers
+    are otherwise connected manually now (see #16), so this is the one
+    remaining self-serve way to get one. Only pushes the Tunzaa payment
+    request here; the actual Twilio/Meta purchase runs later, once
     app/api/v1/tunzaa_webhook.py confirms payment (see
     app/services/number_billing.py).
     """

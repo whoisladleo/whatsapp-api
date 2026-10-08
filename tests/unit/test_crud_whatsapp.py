@@ -1,6 +1,5 @@
 import pytest
 
-from app.core.config import settings
 from app.crud import whatsapp as crud_whatsapp
 from app.db.models import PhoneNumberPool, PhoneNumberStatus, User, WhatsAppAccount
 from app.schemas.whatsapp import WhatsAppAccountCreate, WhatsAppAccountUpdate
@@ -180,71 +179,6 @@ def test_claim_available_pool_number_skips_assigned_and_released_rows(db_session
     assert claimed.id == fresh.id
 
 
-def test_create_whatsapp_account_auto_assigns_from_pool(db_session, monkeypatch):
-    monkeypatch.setattr(settings, "WHATSAPP_POOL_ACCESS_TOKEN", "platform-token")
-    user = _user(db_session, "255700000307")
-    _pool_number(db_session, "POOL_AUTO")
-
-    account = crud_whatsapp.create_whatsapp_account(
-        db_session, WhatsAppAccountCreate(name="Shop"), user.id
-    )
-
-    assert account.phone_number_id == "POOL_AUTO"
-    assert account.access_token == "platform-token"
-    pool_row = (
-        db_session.query(PhoneNumberPool)
-        .filter(PhoneNumberPool.phone_number_id == "POOL_AUTO")
-        .first()
-    )
-    assert pool_row.status == PhoneNumberStatus.ASSIGNED
-    assert pool_row.whatsapp_account_id == account.id
-
-
-def test_create_whatsapp_account_pool_exhausted_raises(db_session, monkeypatch):
-    user = _user(db_session, "255700000308")
-    monkeypatch.setattr(settings, "WHATSAPP_POOL_ACCESS_TOKEN", "platform-token")
-
-    with pytest.raises(crud_whatsapp.PhonePoolExhaustedError):
-        crud_whatsapp.create_whatsapp_account(
-            db_session, WhatsAppAccountCreate(name="Shop"), user.id
-        )
-
-
-def test_create_whatsapp_account_pool_token_not_configured_raises_before_claiming(
-    db_session, monkeypatch
-):
-    monkeypatch.setattr(settings, "WHATSAPP_POOL_ACCESS_TOKEN", None)
-    user = _user(db_session, "255700000308b")
-    pool_entry = _pool_number(db_session, "POOL_NO_TOKEN")
-
-    with pytest.raises(crud_whatsapp.PoolAccessTokenNotConfiguredError):
-        crud_whatsapp.create_whatsapp_account(
-            db_session, WhatsAppAccountCreate(name="Shop"), user.id
-        )
-
-    db_session.refresh(pool_entry)
-    assert pool_entry.status == PhoneNumberStatus.AVAILABLE
-
-
-def test_create_whatsapp_account_releases_pool_claim_on_commit_failure(
-    db_session, monkeypatch
-):
-    monkeypatch.setattr(settings, "WHATSAPP_POOL_ACCESS_TOKEN", "platform-token")
-    user = _user(db_session, "255700000308c")
-    pool_entry = _pool_number(db_session, "POOL_COMMIT_FAILS")
-
-    account_in = WhatsAppAccountCreate(name="Shop")
-    account_in.name = None  # violates WhatsAppAccount.name's NOT NULL constraint
-
-    with pytest.raises(Exception):
-        crud_whatsapp.create_whatsapp_account(db_session, account_in, user.id)
-
-    db_session.rollback()
-    db_session.refresh(pool_entry)
-    assert pool_entry.status == PhoneNumberStatus.AVAILABLE
-    assert pool_entry.whatsapp_account_id is None
-
-
 def test_create_whatsapp_account_partial_credentials_raises(db_session):
     user = _user(db_session, "255700000309")
 
@@ -253,6 +187,17 @@ def test_create_whatsapp_account_partial_credentials_raises(db_session):
             db_session,
             WhatsAppAccountCreate(name="Shop", phone_number_id="ONLY_ONE"),
             user.id,
+        )
+
+
+def test_create_whatsapp_account_both_omitted_raises(db_session):
+    # Numbers are connected manually for now (see #16) — no more silent
+    # pool auto-assign when both fields are omitted.
+    user = _user(db_session, "255700000309b")
+
+    with pytest.raises(crud_whatsapp.PartialWhatsAppCredentialsError):
+        crud_whatsapp.create_whatsapp_account(
+            db_session, WhatsAppAccountCreate(name="Shop"), user.id
         )
 
 
@@ -275,43 +220,20 @@ def test_create_whatsapp_account_byon_path_ignores_pool(db_session):
     assert pool_row.status == PhoneNumberStatus.AVAILABLE
 
 
-def test_create_whatsapp_account_reverts_pool_claim_on_phone_collision(db_session, monkeypatch):
-    monkeypatch.setattr(settings, "WHATSAPP_POOL_ACCESS_TOKEN", "platform-token")
-    user = _user(db_session, "255700000311")
-    # A stale/duplicate WhatsAppAccount row already occupies the exact
-    # phone_number_id the pool is about to hand out.
-    db_session.add(
-        WhatsAppAccount(
-            name="Stale",
-            phone_number_id="POOL_COLLIDE",
-            access_token="x",
-            user_id=user.id,
-        )
-    )
-    db_session.commit()
-    _pool_number(db_session, "POOL_COLLIDE")
-
-    result = crud_whatsapp.create_whatsapp_account(
-        db_session, WhatsAppAccountCreate(name="Shop"), user.id
-    )
-
-    assert result is None
-    pool_row = (
-        db_session.query(PhoneNumberPool)
-        .filter(PhoneNumberPool.phone_number_id == "POOL_COLLIDE")
-        .first()
-    )
-    assert pool_row.status == PhoneNumberStatus.AVAILABLE
-    assert pool_row.assigned_at is None
-
-
-def test_delete_whatsapp_account_releases_pool_number(db_session, monkeypatch):
-    monkeypatch.setattr(settings, "WHATSAPP_POOL_ACCESS_TOKEN", "platform-token")
+def test_delete_whatsapp_account_releases_pool_number(db_session):
+    # An account can still end up linked to a PhoneNumberPool row via the
+    # paid purchase flow or ops-driven manual assignment (see #16) — not
+    # exercised here, just the resulting linked state delete must release.
     user = _user(db_session, "255700000312")
-    _pool_number(db_session, "POOL_RELEASE")
     account = crud_whatsapp.create_whatsapp_account(
-        db_session, WhatsAppAccountCreate(name="Shop"), user.id
+        db_session,
+        WhatsAppAccountCreate(name="Shop", phone_number_id="OWN_RELEASE", access_token="own-tok"),
+        user.id,
     )
+    pool_entry = _pool_number(db_session, "POOL_RELEASE")
+    pool_entry.status = PhoneNumberStatus.ASSIGNED
+    pool_entry.whatsapp_account_id = account.id
+    db_session.commit()
 
     crud_whatsapp.delete_whatsapp_account(db_session, account)
 

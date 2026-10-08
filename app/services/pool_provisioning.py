@@ -82,8 +82,8 @@ async def provision_pool_number(
     replenishment, where the real merchant isn't known yet (the real name
     gets requested later, at assignment time, via the existing
     request_display_name_change in app/api/v1/accounts.py). Callers doing
-    an on-demand purchase for a specific merchant right now (the
-    reassign_from_pool fallback in app/api/v1/accounts.py) should pass that
+    an on-demand purchase for a specific merchant right now (the paid
+    purchase flow in app/tasks/number_billing.py) should pass that
     merchant's actual account name instead, so it's correct from the start.
     """
     country_code = country_code or settings.TWILIO_COUNTRY_CODE

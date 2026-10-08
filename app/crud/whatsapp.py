@@ -10,15 +10,18 @@ from app.schemas.whatsapp import WhatsAppAccountCreate, WhatsAppAccountUpdate
 
 
 class PartialWhatsAppCredentialsError(Exception):
-    """Raised when exactly one of phone_number_id/access_token is supplied."""
+    """Raised when phone_number_id/access_token aren't both supplied."""
 
 
 class PhonePoolExhaustedError(Exception):
-    """Raised when no credentials were supplied and the pool has no AVAILABLE numbers."""
+    """Raised when claiming a pool number finds no AVAILABLE rows. Used by
+    the paid number-purchase flow (app/tasks/number_billing.py), which
+    provisions a fresh pool row before claiming it — this should only fire
+    if that provisioning step itself failed to leave an AVAILABLE row."""
 
 
 class PoolAccessTokenNotConfiguredError(Exception):
-    """Raised when an auto-assign is requested but WHATSAPP_POOL_ACCESS_TOKEN isn't set."""
+    """Raised when a pool claim is attempted but WHATSAPP_POOL_ACCESS_TOKEN isn't set."""
 
 
 def claim_available_pool_number(db: Session) -> Optional[PhoneNumberPool]:
@@ -81,13 +84,12 @@ def release_pool_number_for_account(db: Session, account_id: uuid.UUID) -> None:
 
 def reassign_account_to_pool_number(db: Session, db_account: WhatsAppAccount) -> WhatsAppAccount:
     """
-    Switches an existing account (BYON, a Meta test number, or already
-    pool-assigned) onto a freshly claimed pool number, replacing its current
-    phone_number_id/access_token. Unlike create_whatsapp_account's pool path,
-    this account already exists, so there's no "leaked claim with nothing to
-    attach it to" case to guard — release-then-claim just needs to happen
-    before the swap, in that order, so an account is never left pointing at
-    neither.
+    Switches an existing account onto a freshly claimed pool number,
+    replacing its current phone_number_id/access_token. No longer reachable
+    from the free self-serve API (see create_whatsapp_account) — the only
+    caller now is app/tasks/number_billing.py's paid purchase flow, which
+    provisions a brand-new pool row (pool_provisioning.provision_pool_number)
+    immediately before calling this to claim it for the paying account.
     """
     if not settings.WHATSAPP_POOL_ACCESS_TOKEN:
         raise PoolAccessTokenNotConfiguredError()
@@ -114,18 +116,10 @@ def create_whatsapp_account(
     phone_number_id = account_in.phone_number_id
     access_token = account_in.access_token
 
-    pool_number = None
-    if not phone_number_id and not access_token:
-        if not settings.WHATSAPP_POOL_ACCESS_TOKEN:
-            # Fail before claiming a pool row — otherwise the claim commits
-            # independently and there's nothing to link it to.
-            raise PoolAccessTokenNotConfiguredError()
-        pool_number = claim_available_pool_number(db)
-        if not pool_number:
-            raise PhonePoolExhaustedError()
-        phone_number_id = pool_number.phone_number_id
-        access_token = settings.WHATSAPP_POOL_ACCESS_TOKEN
-    elif not phone_number_id or not access_token:
+    # Both are required — numbers are connected manually for now (see
+    # claim_available_pool_number/the /pool endpoints for the ops-driven
+    # tooling this used to trigger automatically from here).
+    if not phone_number_id or not access_token:
         raise PartialWhatsAppCredentialsError()
 
     # Check if this phone_number_id is already registered
@@ -135,13 +129,6 @@ def create_whatsapp_account(
         .first()
     )
     if existing_account:
-        if pool_number:
-            # Shouldn't happen in normal operation (pool numbers are unique
-            # and only claimed once before being released), but don't leave
-            # a claimed pool row stuck with no account attached.
-            pool_number.status = PhoneNumberStatus.AVAILABLE
-            pool_number.assigned_at = None
-            db.commit()
         return None
 
     account_data = account_in.model_dump()
@@ -150,24 +137,8 @@ def create_whatsapp_account(
 
     db_account = WhatsAppAccount(**account_data, user_id=user_id)
     db.add(db_account)
-    try:
-        db.commit()
-    except Exception:
-        db.rollback()
-        if pool_number:
-            # The pool claim already committed independently (see
-            # claim_available_pool_number) so a failure here would
-            # otherwise leak the row as permanently ASSIGNED with no
-            # linked account. Release it back to AVAILABLE.
-            pool_number.status = PhoneNumberStatus.AVAILABLE
-            pool_number.assigned_at = None
-            db.commit()
-        raise
+    db.commit()
     db.refresh(db_account)
-
-    if pool_number:
-        pool_number.whatsapp_account_id = db_account.id
-        db.commit()
 
     from app.services.subscription_access import sync_ai_access_for_merchant
 

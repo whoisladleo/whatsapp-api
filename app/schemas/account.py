@@ -13,9 +13,11 @@ class AccountBase(BaseModel):
     system_prompt: Optional[str] = None
 
 class AccountCreate(AccountBase):
-    # Optional here (unlike AccountBase): omit both phone_number_id and
-    # access_token to auto-assign a number from the pool, or supply both to
-    # bring your own Meta credentials. Mirrors WhatsAppAccountCreate.
+    # Optional at the type level only so a missing field gives the clearer
+    # "both are required" error from the endpoint/crud layer rather than a
+    # generic Pydantic validation error. Both are required in practice —
+    # numbers are connected manually for now (see #16), no more pool
+    # auto-assign when both are omitted. Mirrors WhatsAppAccountCreate.
     phone_number_id: Optional[str] = None
     access_token: Optional[str] = None
 
@@ -28,12 +30,6 @@ class AccountUpdate(BaseModel):
     product_slug: Optional[str] = None
     ai_enabled: Optional[bool] = None
     system_prompt: Optional[str] = None
-    # True releases the account's current number (if pool-assigned) and
-    # claims a fresh one from the pool, replacing phone_number_id/
-    # access_token — see reassign_account_to_pool_number. Mutually
-    # exclusive with supplying phone_number_id/access_token; the endpoint
-    # handles that combination before touching either.
-    reassign_from_pool: bool = False
 
 class AccountResponse(AccountBase):
     id: uuid.UUID
