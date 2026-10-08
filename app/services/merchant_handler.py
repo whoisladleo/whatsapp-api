@@ -11,7 +11,7 @@ async def handle_merchant_message(db: Session, account: WhatsAppAccount, message
     /stock [Product_Name] +[Qty]
     /out_of_stock [Product_Name]
     /price [Product_Name] max:[Price] min:[Price]
-    /resume [Phone]
+    /resume [Phone|@instagram_username]
     /reply [Phone|@instagram_username] [Message]
     """
     body = message_body.strip()
@@ -24,16 +24,23 @@ async def handle_merchant_message(db: Session, account: WhatsAppAccount, message
             "- To update stock: `/stock Shoes +10`\n"
             "- To set out of stock: `/out_of_stock Shoes`\n"
             "- To update price: `/price Shoes max:50000 min:40000`\n"
-            "- To hand a conversation back to the AI: `/resume 2557XXXXXXXX`\n"
+            "- To hand a conversation back to the AI: `/resume 2557XXXXXXXX` or "
+            "`/resume @their_instagram_username`\n"
             "- To reply to a customer yourself: `/reply 2557XXXXXXXX Your message` or "
             "`/reply @their_instagram_username Your message`"
         )
 
     if body.lower() == "/resume" or body.lower().startswith("/resume "):
-        phone = body[len("/resume"):].strip()
-        if not phone:
-            return "Usage: `/resume 2557XXXXXXXX`"
+        identifier = body[len("/resume"):].strip()
+        if not identifier:
+            return "Usage: `/resume 2557XXXXXXXX` (WhatsApp customer) or `/resume @their_instagram_username` (Instagram customer)"
 
+        # Same @ disambiguation /reply uses below — a real phone number
+        # never starts with @, so this is unambiguous.
+        if identifier.startswith("@"):
+            return await _resume_instagram_conversation(db, account, identifier[1:])
+
+        phone = identifier
         try:
             crud_message.resume_conversation_for_account(db, account.id, phone)
         except crud_message.ConversationNotFoundError as e:
@@ -222,3 +229,42 @@ async def _relay_to_instagram_customer(db: Session, account: WhatsAppAccount, ig
         ig_message_id=resp.get("message_id"),
     )
     return f"Sent to @{ig_username}."
+
+
+async def _resume_instagram_conversation(db: Session, account: WhatsAppAccount, ig_username: str) -> str:
+    """
+    `/resume @username` — the Instagram counterpart to the WhatsApp phone
+    path above, and to `/reply`'s own @ handling. Scoped the same way
+    `_relay_to_instagram_customer` is (this merchant's connected
+    InstagramAccount, matching on username or ig_scoped_id as a fallback
+    for a customer whose display-name backfill hasn't run yet) — no
+    global-Customer ambiguity to guard against here, since
+    InstagramCustomer.account_id already scopes ownership directly.
+    """
+    ig_account = (
+        db.query(InstagramAccount)
+        .filter(InstagramAccount.user_id == account.user_id, InstagramAccount.access_token != "")
+        .first()
+    )
+    if not ig_account:
+        return "No Instagram account connected."
+
+    ig_customer = (
+        db.query(InstagramCustomer)
+        .filter(
+            InstagramCustomer.account_id == ig_account.id,
+            (InstagramCustomer.username == ig_username) | (InstagramCustomer.ig_scoped_id == ig_username),
+        )
+        .first()
+    )
+    if not ig_customer:
+        return f"No Instagram conversation with @{ig_username} found."
+
+    try:
+        crud_instagram.resume_conversation(db, ig_customer.id)
+    except crud_instagram.ConversationNotInHandoffError:
+        # resume_conversation's own error message is keyed by the opaque
+        # customer UUID, not something to show the merchant — build our
+        # own using what they actually typed instead.
+        return f"@{ig_username} is not currently in a human handoff state."
+    return f"Conversation with @{ig_username} resumed. Amara will respond to their next message."

@@ -9,6 +9,7 @@ from app.db.models import (
     ConversationState,
     Customer,
     InstagramAccount,
+    InstagramConversationContext,
     InstagramCustomer,
     Message,
     Product,
@@ -252,6 +253,91 @@ async def test_resume_success(db_session, merchant_account):
     assert context.state == ConversationState.NEGOTIATING
     assert context.handoff_at is None
     assert "resumed" in reply.lower()
+
+
+async def test_resume_instagram_no_account_connected(db_session, merchant_account):
+    reply = await handle_merchant_message(
+        db_session, merchant_account, "/resume @some_customer", "255700000099"
+    )
+
+    assert "No Instagram account connected" in reply
+
+
+async def test_resume_instagram_unknown_customer(db_session, merchant_account):
+    ig_account = InstagramAccount(
+        ig_business_id="ig_biz_1", access_token="ig-tok", username="shop",
+        user_id=merchant_account.user_id,
+    )
+    db_session.add(ig_account)
+    db_session.commit()
+
+    reply = await handle_merchant_message(
+        db_session, merchant_account, "/resume @nobody", "255700000099"
+    )
+
+    assert "No Instagram conversation with @nobody found" in reply
+
+
+async def test_resume_instagram_customer_not_in_handoff(db_session, merchant_account):
+    ig_account = InstagramAccount(
+        ig_business_id="ig_biz_1", access_token="ig-tok", username="shop",
+        user_id=merchant_account.user_id,
+    )
+    db_session.add(ig_account)
+    db_session.commit()
+    db_session.refresh(ig_account)
+
+    ig_customer = InstagramCustomer(
+        ig_scoped_id="igsid_2", username="commenter2", account_id=ig_account.id,
+    )
+    db_session.add(ig_customer)
+    db_session.commit()
+    db_session.refresh(ig_customer)
+    db_session.add(
+        InstagramConversationContext(customer_id=ig_customer.id, state=ConversationState.NEGOTIATING)
+    )
+    db_session.commit()
+
+    reply = await handle_merchant_message(
+        db_session, merchant_account, "/resume @commenter2", "255700000099"
+    )
+
+    assert "@commenter2 is not currently in a human handoff state" in reply
+
+
+async def test_resume_instagram_success(db_session, merchant_account):
+    ig_account = InstagramAccount(
+        ig_business_id="ig_biz_1", access_token="ig-tok", username="shop",
+        user_id=merchant_account.user_id,
+    )
+    db_session.add(ig_account)
+    db_session.commit()
+    db_session.refresh(ig_account)
+
+    ig_customer = InstagramCustomer(
+        ig_scoped_id="igsid_3", username="commenter3", account_id=ig_account.id,
+    )
+    db_session.add(ig_customer)
+    db_session.commit()
+    db_session.refresh(ig_customer)
+
+    from datetime import datetime
+
+    context = InstagramConversationContext(
+        customer_id=ig_customer.id, state=ConversationState.HUMAN_HANDOFF, handoff_at=datetime.utcnow(),
+    )
+    db_session.add(context)
+    db_session.commit()
+    db_session.refresh(context)
+
+    reply = await handle_merchant_message(
+        db_session, merchant_account, "/resume @commenter3", "255700000099"
+    )
+
+    db_session.refresh(context)
+    assert context.state == ConversationState.NEGOTIATING
+    assert context.handoff_at is None
+    assert "Conversation with @commenter3 resumed" in reply
 
 
 # --- /reply --------------------------------------------------------------
