@@ -119,6 +119,12 @@ class WhatsAppAccount(Base):
     kyc_status = Column(Enum(KYCStatus), default=KYCStatus.DRAFT)
     user_id = Column(UUIDType, ForeignKey("users.id"))
     created_at = Column(DateTime, default=datetime.utcnow)
+    # Marks Taskflow's own onboarding account, where llm.py treats the
+    # merchant themselves as the counterparty instead of a customer.
+    # Explicit flag rather than matching account.name == "taskflow" — a
+    # plain Account Name edit (e.g. from the dashboard settings form)
+    # silently broke that in production once already. See #21.
+    is_platform_account = Column(Boolean, default=False, nullable=False)
 
     owner = relationship("User", back_populates="accounts")
     media = relationship("MediaEntry", back_populates="account")

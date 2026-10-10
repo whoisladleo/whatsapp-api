@@ -116,6 +116,7 @@ def platform_account(db_session, merchant):
         phone_number_id="PLATFORM_PHONE",
         access_token="tok",
         user_id=merchant.id,
+        is_platform_account=True,
     )
     db_session.add(account)
     db_session.commit()
@@ -541,7 +542,7 @@ async def test_human_handoff_trigger_updates_state_and_alerts_merchant(
     monkeypatch.setattr(settings, "PHONE_NUMBER_ID", "PLATFORM_PHONE_TEST")
     platform_account = WhatsAppAccount(
         name="Taskflow", phone_number_id="PLATFORM_PHONE_TEST", access_token="platform-tok",
-        user_id=merchant.id,
+        user_id=merchant.id, is_platform_account=True,
     )
     db_session.add(platform_account)
     db_session.commit()
@@ -650,7 +651,7 @@ async def test_human_handoff_alert_send_failure_is_logged_as_failed(db_session, 
     monkeypatch.setattr(settings, "PHONE_NUMBER_ID", "PLATFORM_PHONE_TEST")
     db_session.add(WhatsAppAccount(
         name="Taskflow", phone_number_id="PLATFORM_PHONE_TEST", access_token="platform-tok",
-        user_id=merchant.id,
+        user_id=merchant.id, is_platform_account=True,
     ))
     db_session.commit()
 
