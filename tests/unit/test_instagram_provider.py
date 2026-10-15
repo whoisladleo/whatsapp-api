@@ -78,6 +78,29 @@ async def test_send_direct_message_payload(provider):
 
 
 @respx.mock
+async def test_send_direct_message_with_tag_payload(provider):
+    route = respx.post(url__regex=MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(
+            200, json={"recipient_id": "ig-scoped-1", "message_id": "msg_3"}
+        )
+    )
+
+    result = await provider.send_direct_message(
+        "ig_business_1", "igsid_1", "Still there?", tag="HUMAN_AGENT"
+    )
+
+    assert route.called
+    sent = json.loads(route.calls.last.request.content)
+    assert sent == {
+        "recipient": {"id": "igsid_1"},
+        "message": {"text": "Still there?"},
+        "messaging_type": "MESSAGE_TAG",
+        "tag": "HUMAN_AGENT",
+    }
+    assert result["message_id"] == "msg_3"
+
+
+@respx.mock
 async def test_get_user_profile_returns_name_and_username(provider):
     route = respx.get(url__regex=PROFILE_URL_RE).mock(
         return_value=httpx.Response(200, json={"id": "igsid_1", "name": "Jane Doe", "username": "janedoe"})

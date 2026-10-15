@@ -462,6 +462,8 @@ async def test_reply_instagram_customer_success(db_session, merchant_account):
     sent = json.loads(route.calls.last.request.content)
     assert sent["recipient"] == {"id": "igsid_1"}
     assert sent["message"] == {"text": "It's back in stock!"}
+    # A merchant's /reply is a genuine human agent response — see #13.
+    assert sent["tag"] == "HUMAN_AGENT"
     assert "Sent to @commenter1" in reply
 
     from app.db.models import InstagramDirectMessage
