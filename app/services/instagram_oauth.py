@@ -18,8 +18,7 @@ def build_authorize_url(state: str) -> str:
         "scope": (
             "instagram_business_basic,"
             "instagram_business_manage_comments,"
-            "instagram_business_manage_messages,"
-            "human_agent"
+            "instagram_business_manage_messages"
         ),
         "state": state,
     }
