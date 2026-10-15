@@ -354,6 +354,14 @@ class InstagramDirectMessage(Base):
     direction = Column(String, nullable=False)  # inbound, outbound
     body = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    # Only ever set on an inbound row, by process_inbound_dm's atomic claim
+    # (app/tasks/instagram_dm_processing.py) before it does any
+    # side-effecting work (LLM call, send, order creation) — guards against
+    # two concurrent/duplicate executions of the same inbound message both
+    # running fully, whether from webhook redelivery or Celery's own
+    # at-least-once task redelivery. Confirmed live: without this, a single
+    # inbound message produced two separate PAID orders. See #33.
+    processed_at = Column(DateTime, nullable=True)
 
     account = relationship("InstagramAccount")
     customer = relationship("InstagramCustomer")
