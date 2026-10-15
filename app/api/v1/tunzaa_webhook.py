@@ -13,6 +13,7 @@ from app.db.models import (
     NumberSubscription,
     Order,
     OrderStatus,
+    PaymentType,
     Product,
     ProductSubscription,
     WhatsAppAccount,
@@ -158,6 +159,7 @@ async def handle_tunzaa_webhook(
         # confirm to the customer.
         await _notify_customer(db, order, "payment_complete")
         await _activate_subscription_if_linked(db, order)
+        await _notify_merchant_of_payment(db, order)
 
         return {"status": "success", "message": f"Order status: {order.status.value}"}
 
@@ -281,6 +283,108 @@ def _fail_subscription_if_linked(db: Session, order: Order) -> None:
     )
     if subscription and subscription.status == ProductSubscriptionStatus.PENDING_PAYMENT:
         product_subscription.mark_first_payment_failed(db, subscription)
+
+
+def _merchant_for_order(order: Order):
+    if order.account_id:
+        return order.account.owner if order.account else None
+    if order.instagram_account_id:
+        return order.instagram_account.owner if order.instagram_account else None
+    return None
+
+
+def _payment_alert_summary_and_reference(order: Order) -> tuple[str, str]:
+    """
+    Builds the {{summary}} and {{reference}} values for the payment_received
+    template — one variable per template line, each wrapped by that line's
+    own static text, since a newline embedded inside a single variable's
+    value doesn't render as a line break (found live while designing this).
+    """
+    amount = f"{order.agreed_price:,.0f} TZS" if order.agreed_price is not None else "an unknown amount"
+
+    # Keyed off tunzaa_plan_id (same signal the main handler above uses to
+    # decide whether to reconcile against the plan) rather than
+    # payment_type — this is what actually determines whether this
+    # callback is one leg of a tracked multi-installment plan.
+    is_installment_plan = bool(order.tunzaa_plan_id)
+    if is_installment_plan:
+        if order.status == OrderStatus.PAID:
+            payment_desc = "final installment — fully paid"
+        else:
+            payment_desc = "installment payment"
+        if order.paid_amount is not None and order.remaining_balance is not None:
+            status_text = (
+                f"Total paid: {order.paid_amount:,.0f} TZS. "
+                f"Remaining: {order.remaining_balance:,.0f} TZS."
+            )
+        else:
+            status_text = "Paid in full." if order.status == OrderStatus.PAID else "Partial payment received."
+    else:
+        payment_desc = "installment payment" if order.payment_type == PaymentType.INSTALLMENT else "full payment"
+        status_text = "Paid in full."
+
+    summary = f"{amount} ({payment_desc})"
+
+    if order.account_id and order.customer:
+        customer_ref, channel = order.customer.phone_number, "WhatsApp"
+    elif order.instagram_account_id and order.instagram_customer:
+        handle = order.instagram_customer.username or order.instagram_customer.ig_scoped_id
+        customer_ref, channel = f"@{handle}", "Instagram"
+    elif order.customer:
+        customer_ref, channel = order.customer.phone_number, "an unknown channel"
+    else:
+        customer_ref, channel = "an unknown customer", "an unknown channel"
+
+    txn = order.tunzaa_transaction_id or "unknown"
+    reference = f"From {customer_ref} via {channel} · {status_text} · Txn {txn}"
+
+    return summary, reference
+
+
+async def _notify_merchant_of_payment(db: Session, order: Order) -> None:
+    """
+    Alerts the merchant of any successful payment — full, an installment
+    leg (including a mid-plan one), or whatever activates/completes a
+    subscription — via the platform's own default WhatsApp credentials, the
+    same channel OTP and the handoff alert use. Not the merchant's own
+    connected account: a merchant essentially never has an open 24h session
+    with either number, so this needs the approved payment_received
+    template regardless of which number sends it. Best-effort/silent if the
+    merchant has no phone on file. See #35.
+    """
+    merchant = _merchant_for_order(order)
+    merchant_phone = (merchant.username or merchant.phone_number) if merchant else None
+    if not merchant_phone:
+        logger.info(f"No merchant phone on file for order {order.id}; skipping payment alert.")
+        return
+
+    product_name = order.product.name if order.product else "your order"
+    summary, reference = _payment_alert_summary_and_reference(order)
+
+    components = [
+        {
+            "type": "header",
+            "parameters": [{"type": "text", "parameter_name": "product", "text": product_name}],
+        },
+        {
+            "type": "body",
+            "parameters": [
+                {"type": "text", "parameter_name": "summary", "text": summary},
+                {"type": "text", "parameter_name": "reference", "text": reference},
+            ],
+        },
+    ]
+
+    provider = WhatsAppProvider(settings.WHATSAPP_TOKEN, settings.PHONE_NUMBER_ID)
+    try:
+        await provider.send_template(
+            merchant_phone,
+            settings.WHATSAPP_PAYMENT_ALERT_TEMPLATE_NAME,
+            language_code=settings.WHATSAPP_PAYMENT_ALERT_TEMPLATE_LANGUAGE,
+            components=components,
+        )
+    except Exception as e:
+        logger.error(f"Failed to send merchant payment alert for order {order.id}: {e}")
 
 
 def _mark_single_installment_paid(db: Session, order: Order, installment_id) -> None:

@@ -154,6 +154,18 @@ class Settings(BaseSettings):
     # _send_platform_alert_to_merchant.
     WHATSAPP_HANDOFF_ALERT_TEMPLATE_LANGUAGE: str = "en"
 
+    # Utility-category template for a merchant payment alert (any successful
+    # payment — full, an installment leg, or whatever activates/completes a
+    # subscription), sent the same way as the handoff alert above (platform
+    # credentials, not the merchant's own account — same 24h-session
+    # limitation applies). Header has a {{product}} variable; body has
+    # {{summary}} and {{reference}} on their own template lines (newlines
+    # inside a single variable's value don't render as line breaks — found
+    # live while designing this). "en" confirmed as the registered code for
+    # payment_received as of 2026-10. See _notify_merchant_of_payment.
+    WHATSAPP_PAYMENT_ALERT_TEMPLATE_NAME: str = "payment_received"
+    WHATSAPP_PAYMENT_ALERT_TEMPLATE_LANGUAGE: str = "en"
+
     # Cloudflare R2
     R2_ACCOUNT_ID: Optional[str] = None
     R2_ACCESS_KEY_ID: Optional[str] = None
