@@ -916,7 +916,7 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
             return None # Don't send an automated message
 
         # 1.5 Determine merchant context
-        is_platform_account = (account.name.lower() == 'taskflow')
+        is_platform_account = account.is_platform_account
         
         merchant_user = None
         if is_platform_account:
