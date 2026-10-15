@@ -363,6 +363,48 @@ async def test_regular_account_catalog_includes_product_description(db_session, 
     assert "AI sales assistant for WhatsApp & Instagram" in captured["system"]
 
 
+async def test_catalog_marks_full_payment_only_product(db_session, shop_account, merchant):
+    db_session.add(
+        Product(
+            slug="cash-only", name="Cash Only Item", max_price=20000, min_price=15000,
+            quantity=5, merchant_id=merchant.id, allow_installments=False,
+        )
+    )
+    db_session.commit()
+
+    captured = {}
+    service = _service_with_fake_client(captured=captured)
+
+    await service.generate_response(
+        message_body="what do you sell?",
+        from_phone="255711111114",
+        db=db_session,
+        account=shop_account,
+    )
+
+    assert "Cash Only Item" in captured["system"]
+    assert "(full payment only — installments not offered)" in captured["system"]
+
+
+async def test_catalog_omits_full_payment_only_note_when_installments_allowed(db_session, shop_account, merchant):
+    db_session.add(
+        Product(slug="shoes-2", name="Shoes 2", max_price=50000, min_price=40000, quantity=3, merchant_id=merchant.id)
+    )
+    db_session.commit()
+
+    captured = {}
+    service = _service_with_fake_client(captured=captured)
+
+    await service.generate_response(
+        message_body="what do you sell?",
+        from_phone="255711111115",
+        db=db_session,
+        account=shop_account,
+    )
+
+    assert "(full payment only — installments not offered)" not in captured["system"]
+
+
 async def test_regular_account_no_products_shows_placeholder(db_session, shop_account):
     captured = {}
     service = _service_with_fake_client(captured=captured)

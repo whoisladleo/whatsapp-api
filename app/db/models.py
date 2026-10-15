@@ -34,6 +34,15 @@ class PaymentType(enum.Enum):
     FULL = "FULL"
     INSTALLMENT = "INSTALLMENT"
 
+class InstallmentMode(enum.Enum):
+    # Only meaningful for a subscription product (Product.is_subscription)
+    # with Product.allow_installments — governs when
+    # _activate_subscription_if_linked actually activates the
+    # subscription, not anything about regular one-time orders (those have
+    # no fulfillment-gating concept in this system; delivery is manual).
+    BNPL = "BNPL"  # activates on the first installment payment (default, matches pre-existing behavior)
+    SNPL = "SNPL"  # waits until the full installment plan is paid off
+
 class ConversationState(enum.Enum):
     NEGOTIATING = "NEGOTIATING"
     HUMAN_HANDOFF = "HUMAN_HANDOFF"
@@ -374,6 +383,15 @@ class Product(Base):
     # tells _close_deal/_close_instagram_deal to also create the
     # ProductSubscription that drives billing from month 2 onward.
     is_subscription = Column(Boolean, default=False, nullable=False)
+    # Whether Amara is allowed to offer installments for this product at
+    # all — when False, she never brings it up, only full payment. Default
+    # True preserves the pre-existing behavior (every product could always
+    # be paid in installments).
+    allow_installments = Column(Boolean, default=True, nullable=False)
+    # See InstallmentMode — only has any effect when allow_installments and
+    # is_subscription are both true. Default BNPL matches the pre-existing
+    # behavior (subscription activates on the first installment payment).
+    installment_mode = Column(Enum(InstallmentMode), default=InstallmentMode.BNPL, nullable=False)
     merchant_id = Column(UUIDType, ForeignKey("users.id"))
     created_at = Column(DateTime, default=datetime.utcnow)
 

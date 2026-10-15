@@ -208,6 +208,25 @@ async def test_generate_dm_response_includes_product_description_in_catalog(db_s
     assert "AI sales assistant for WhatsApp & Instagram" in captured["system"]
 
 
+async def test_generate_dm_response_catalog_marks_full_payment_only_product(db_session, ig_account, ig_customer, ig_context):
+    p = Product(
+        slug="ig-dm-cash-only", name="Cash Only Item", max_price=20000, min_price=15000,
+        quantity=5, merchant_id=ig_account.user_id, allow_installments=False,
+    )
+    db_session.add(p)
+    db_session.commit()
+
+    captured = {}
+    service = _service_with_fake_client(captured=captured)
+
+    await service.generate_dm_response(
+        "what do you sell?", db=db_session, account=ig_account, customer=ig_customer, context=ig_context, conversation_history=[]
+    )
+
+    assert "Cash Only Item" in captured["system"]
+    assert "(full payment only — installments not offered)" in captured["system"]
+
+
 async def test_generate_dm_response_no_products_says_so_in_catalog(db_session, ig_account, ig_customer, ig_context):
     captured = {}
     service = _service_with_fake_client(captured=captured)

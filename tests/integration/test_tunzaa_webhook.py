@@ -9,6 +9,7 @@ from app.core.config import settings
 from app.db.models import (
     Customer,
     Installment,
+    InstallmentMode,
     InstallmentStatus,
     Message,
     Order,
@@ -537,6 +538,135 @@ def test_first_payment_completed_activates_linked_subscription(
     db_session.refresh(pending_subscription)
     assert pending_subscription.status == ProductSubscriptionStatus.ACTIVE
     assert pending_subscription.next_billing_at is not None
+
+
+# --- ProductSubscription: BNPL vs SNPL installment activation ---------------
+
+
+@pytest.fixture
+def snpl_subscription_product(db_session, owner):
+    p = Product(
+        slug="tunzaa-sub-snpl", name="Taskflow OS Subscription (SNPL)", max_price=100000, min_price=100000,
+        quantity=999999, merchant_id=owner.id, is_subscription=True, installment_mode=InstallmentMode.SNPL,
+    )
+    db_session.add(p)
+    db_session.commit()
+    db_session.refresh(p)
+    return p
+
+
+@pytest.fixture
+def snpl_subscription_order(db_session, customer, account, snpl_subscription_product):
+    o = Order(
+        customer_id=customer.id, account_id=account.id, product_id=snpl_subscription_product.id,
+        quantity=1, agreed_price=100000, status=OrderStatus.PENDING, tunzaa_plan_id="2001",
+    )
+    db_session.add(o)
+    db_session.commit()
+    db_session.add(
+        Installment(
+            order_id=o.id, tunzaa_installment_id="20000", amount_due=50000,
+            due_date=o.created_at, status=InstallmentStatus.PENDING,
+        )
+    )
+    db_session.commit()
+    db_session.refresh(o)
+    return o
+
+
+@pytest.fixture
+def snpl_pending_subscription(db_session, snpl_subscription_order, customer):
+    sub = ProductSubscription(
+        order_id=snpl_subscription_order.id, customer_id=customer.id,
+        product_id=snpl_subscription_order.product_id, monthly_amount=100000,
+    )
+    db_session.add(sub)
+    db_session.commit()
+    db_session.refresh(sub)
+    return sub
+
+
+def test_snpl_first_installment_does_not_activate_subscription(
+    client, db_session, snpl_subscription_order, snpl_pending_subscription, monkeypatch
+):
+    # Partial payment — plan still has a balance outstanding.
+    _mock_get_installment_plan(
+        monkeypatch,
+        response={
+            "plan": {"plan_id": 2001, "remaining_balance": "50000.00"},
+            "installments": [{"installment_id": 20000, "status": "PAID"}],
+        },
+    )
+
+    resp = _post(
+        client,
+        {"status": "COMPLETED", "reference_id": f"order-{snpl_subscription_order.id}", "installment_id": "20000"},
+    )
+
+    assert resp.status_code == 200
+    db_session.refresh(snpl_subscription_order)
+    assert snpl_subscription_order.status == OrderStatus.PENDING
+    db_session.refresh(snpl_pending_subscription)
+    assert snpl_pending_subscription.status == ProductSubscriptionStatus.PENDING_PAYMENT
+
+
+def test_snpl_final_installment_activates_subscription(
+    client, db_session, snpl_subscription_order, snpl_pending_subscription, monkeypatch
+):
+    # Plan fully paid off — remaining_balance reaches zero.
+    _mock_get_installment_plan(
+        monkeypatch,
+        response={
+            "plan": {"plan_id": 2001, "remaining_balance": "0.00"},
+            "installments": [{"installment_id": 20000, "status": "PAID"}],
+        },
+    )
+
+    resp = _post(
+        client,
+        {"status": "COMPLETED", "reference_id": f"order-{snpl_subscription_order.id}", "installment_id": "20000"},
+    )
+
+    assert resp.status_code == 200
+    db_session.refresh(snpl_subscription_order)
+    assert snpl_subscription_order.status == OrderStatus.PAID
+    db_session.refresh(snpl_pending_subscription)
+    assert snpl_pending_subscription.status == ProductSubscriptionStatus.ACTIVE
+
+
+def test_bnpl_first_installment_activates_subscription_immediately(
+    client, db_session, subscription_order, pending_subscription, monkeypatch
+):
+    # subscription_product defaults to BNPL — a partial installment payment
+    # (order stays PENDING) should still activate right away, same as
+    # pre-existing behavior.
+    subscription_order.tunzaa_plan_id = "3001"
+    db_session.add(
+        Installment(
+            order_id=subscription_order.id, tunzaa_installment_id="30000", amount_due=50000,
+            due_date=subscription_order.created_at, status=InstallmentStatus.PENDING,
+        )
+    )
+    db_session.commit()
+
+    _mock_get_installment_plan(
+        monkeypatch,
+        response={
+            "plan": {"plan_id": 3001, "remaining_balance": "50000.00"},
+            "installments": [{"installment_id": 30000, "status": "PAID"}],
+        },
+    )
+
+    resp = _post(
+        client,
+        {"status": "COMPLETED", "reference_id": f"order-{subscription_order.id}", "installment_id": "30000"},
+    )
+
+    assert resp.status_code == 200
+    db_session.refresh(subscription_order)
+    assert subscription_order.status == OrderStatus.PENDING
+    db_session.refresh(pending_subscription)
+    assert pending_subscription.status == ProductSubscriptionStatus.ACTIVE
 
 
 def test_first_payment_failed_marks_subscription_payment_failed(

@@ -2,6 +2,7 @@ import uuid
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
+from app.db.models import InstallmentMode
 
 class ProductBase(BaseModel):
     name: str
@@ -19,6 +20,11 @@ class ProductBase(BaseModel):
     # Opts this product into recurring billing — see
     # app/services/product_subscription.py.
     is_subscription: bool = False
+    # Whether Amara may offer installments for this product at all — see
+    # Product.allow_installments. installment_mode only has any effect
+    # when this and is_subscription are both true (see InstallmentMode).
+    allow_installments: bool = True
+    installment_mode: InstallmentMode = InstallmentMode.BNPL
 
 class ProductCreate(ProductBase):
     pass
@@ -38,6 +44,8 @@ class ProductUpdate(BaseModel):
     weight: Optional[float] = None
     is_active: Optional[bool] = None
     is_subscription: Optional[bool] = None
+    allow_installments: Optional[bool] = None
+    installment_mode: Optional[InstallmentMode] = None
 
 class ProductResponse(ProductBase):
     id: uuid.UUID
