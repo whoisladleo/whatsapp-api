@@ -930,3 +930,161 @@ def test_renewal_malformed_reference_is_ignored(client):
 
     assert resp.status_code == 200
     assert resp.json() == {"status": "ignored", "reason": "Malformed reference_id"}
+
+
+# --- merchant payment alert (#35) ---------------------------------------------
+
+
+def _mock_send_template(monkeypatch, ok=True, calls=None):
+    async def fake(self, to, name, language_code="en_US", components=None):
+        if calls is not None:
+            calls.append({"to": to, "name": name, "language_code": language_code, "components": components})
+        if not ok:
+            raise RuntimeError("network down")
+        return {"messages": [{"id": "wamid.payment_alert"}]}
+
+    monkeypatch.setattr("app.core.provider.WhatsAppProvider.send_template", fake)
+
+
+def _alert_values(call):
+    """Pulls {{product}}, {{summary}}, {{reference}} back out of a captured send_template call."""
+    header_params = call["components"][0]["parameters"]
+    body_params = call["components"][1]["parameters"]
+    by_name = {p["parameter_name"]: p["text"] for p in header_params + body_params}
+    return by_name["product"], by_name["summary"], by_name["reference"]
+
+
+def test_full_payment_sends_merchant_alert(client, db_session, order, monkeypatch):
+    _mock_send_text(monkeypatch)
+    calls = []
+    _mock_send_template(monkeypatch, calls=calls)
+
+    resp = _post(client, {"status": "COMPLETED", "reference_id": f"order-{order.id}", "transaction_id": "T-ALERT-1"})
+
+    assert resp.status_code == 200
+    assert len(calls) == 1
+    assert calls[0]["to"] == "255700000900"  # owner.username
+    assert calls[0]["name"] == settings.WHATSAPP_PAYMENT_ALERT_TEMPLATE_NAME
+    product, summary, reference = _alert_values(calls[0])
+    assert product == "Shoes"
+    assert "full payment" in summary
+    assert "45,000 TZS" in summary or f"{order.agreed_price:,.0f} TZS" in summary
+    assert "255711112222" in reference
+    assert "WhatsApp" in reference
+    assert "Paid in full" in reference
+    assert "T-ALERT-1" in reference
+
+
+def test_installment_leg_with_remaining_balance_sends_merchant_alert(
+    client, db_session, plan_order, monkeypatch
+):
+    _mock_get_installment_plan(
+        monkeypatch,
+        response={
+            "plan": {"plan_id": 1001, "paid_amount": "15000.00", "remaining_balance": "15000.00"},
+            "installments": [{"installment_id": 10000, "status": "PAID"}],
+        },
+    )
+    calls = []
+    _mock_send_template(monkeypatch, calls=calls)
+
+    resp = _post(
+        client,
+        {
+            "status": "COMPLETED", "reference_id": f"order-{plan_order.id}",
+            "installment_id": "10000", "transaction_id": "T-LEG-1",
+        },
+    )
+
+    assert resp.status_code == 200
+    assert len(calls) == 1
+    _, summary, reference = _alert_values(calls[0])
+    assert "installment payment" in summary
+    assert "final" not in summary
+    assert "Total paid: 15,000 TZS" in reference
+    assert "Remaining: 15,000 TZS" in reference
+    assert "T-LEG-1" in reference
+
+
+def test_final_installment_leg_sends_merchant_alert_as_fully_paid(
+    client, db_session, plan_order, monkeypatch
+):
+    _mock_get_installment_plan(
+        monkeypatch,
+        response={
+            "plan": {"plan_id": 1001, "remaining_balance": "0.00"},
+            "installments": [{"installment_id": 10000, "status": "PAID"}],
+        },
+    )
+    calls = []
+    _mock_send_template(monkeypatch, calls=calls)
+
+    resp = _post(
+        client,
+        {"status": "COMPLETED", "reference_id": f"order-{plan_order.id}", "installment_id": "10000"},
+    )
+
+    assert resp.status_code == 200
+    assert len(calls) == 1
+    _, summary, reference = _alert_values(calls[0])
+    assert "final installment" in summary
+    assert "fully paid" in summary
+
+
+def test_instagram_order_merchant_alert_uses_instagram_handle_and_channel(
+    client, db_session, ig_order, monkeypatch
+):
+    _mock_send_direct_message(monkeypatch)
+    calls = []
+    _mock_send_template(monkeypatch, calls=calls)
+
+    resp = _post(client, {"status": "COMPLETED", "reference_id": f"order-{ig_order.id}", "transaction_id": "T-ALERT-IG"})
+
+    assert resp.status_code == 200
+    assert len(calls) == 1
+    assert calls[0]["to"] == "255700000900"  # owner.username — merchant's own number, not the customer's
+    _, _, reference = _alert_values(calls[0])
+    assert "@buyer_ig" in reference
+    assert "Instagram" in reference
+
+
+def test_merchant_with_no_phone_on_file_skips_payment_alert(client, db_session, customer, product, monkeypatch):
+    phoneless_owner = User(username=None)
+    db_session.add(phoneless_owner)
+    db_session.commit()
+    db_session.refresh(phoneless_owner)
+
+    account = WhatsAppAccount(
+        name="No Phone Shop", phone_number_id="NO_PHONE_PHONE", access_token="tok", user_id=phoneless_owner.id,
+    )
+    db_session.add(account)
+    db_session.commit()
+    db_session.refresh(account)
+
+    o = Order(
+        customer_id=customer.id, account_id=account.id, product_id=product.id,
+        quantity=1, agreed_price=45000, status=OrderStatus.PENDING,
+    )
+    db_session.add(o)
+    db_session.commit()
+    db_session.refresh(o)
+
+    _mock_send_text(monkeypatch)
+    calls = []
+    _mock_send_template(monkeypatch, calls=calls)
+
+    resp = _post(client, {"status": "COMPLETED", "reference_id": f"order-{o.id}", "transaction_id": "T-NO-PHONE"})
+
+    assert resp.status_code == 200
+    assert calls == []
+
+
+def test_merchant_alert_send_failure_does_not_crash(client, db_session, order, monkeypatch):
+    _mock_send_text(monkeypatch)
+    _mock_send_template(monkeypatch, ok=False)
+
+    resp = _post(client, {"status": "COMPLETED", "reference_id": f"order-{order.id}", "transaction_id": "T-ALERT-FAIL"})
+
+    assert resp.status_code == 200
+    db_session.refresh(order)
+    assert order.status == OrderStatus.PAID
