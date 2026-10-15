@@ -64,7 +64,22 @@ class InstagramProvider:
             payload["tag"] = tag
         async with httpx.AsyncClient() as client:
             response = await client.post(url, json=payload, headers=self.headers)
-            return response.json()
+            result = response.json()
+
+        if tag and "reviewed and approved" in result.get("error", {}).get("message", ""):
+            # The HUMAN_AGENT tag itself is gated by Meta until the feature
+            # is approved via App Review (see #14) — this rejects the send
+            # regardless of whether the conversation is actually within or
+            # past the 24h window. Until approved, fall back to an untagged
+            # send: this fixes the (common) within-window case immediately,
+            # and the past-24h case keeps failing exactly as it did before
+            # #13, with no code change needed once Meta approves it (see #26).
+            untagged_payload = {k: v for k, v in payload.items() if k not in ("messaging_type", "tag")}
+            async with httpx.AsyncClient() as client:
+                response = await client.post(url, json=untagged_payload, headers=self.headers)
+                return response.json()
+
+        return result
 
     async def get_user_profile(self, igsid: str) -> Dict[str, Any]:
         """
