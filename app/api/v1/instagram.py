@@ -346,7 +346,7 @@ async def send_message(
 
     provider = InstagramProvider(account.access_token)
     response = await provider.send_direct_message(
-        account.ig_business_id, customer.ig_scoped_id, payload.message
+        account.ig_business_id, customer.ig_scoped_id, payload.message, tag="HUMAN_AGENT"
     )
     if "error" in response:
         # Surface Meta's actual error (e.g. outside the messaging window,

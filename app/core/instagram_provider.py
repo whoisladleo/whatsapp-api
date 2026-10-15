@@ -42,7 +42,7 @@ class InstagramProvider:
             return response.json()
 
     async def send_direct_message(
-        self, ig_business_id: str, recipient_id: str, message: str
+        self, ig_business_id: str, recipient_id: str, message: str, tag: str | None = None
     ) -> Dict[str, Any]:
         # Ongoing DM sends (not tied to a specific comment) address the
         # recipient by their IGSID instead of a comment_id.
@@ -51,6 +51,17 @@ class InstagramProvider:
             "recipient": {"id": recipient_id},
             "message": {"text": message},
         }
+        if tag:
+            # Meta only allows an untagged reply within 24h of the
+            # customer's last message. A genuine human agent reply (manual
+            # merchant sends, not Amara's own automated DM flow) can arrive
+            # well after that, so these pass tag="HUMAN_AGENT" to stay valid
+            # up to 7 days out (see #13) — applied unconditionally rather
+            # than only once the window has actually lapsed, since it's
+            # still valid usage either way and avoids a last-message-
+            # timestamp lookup at send time for no real benefit.
+            payload["messaging_type"] = "MESSAGE_TAG"
+            payload["tag"] = tag
         async with httpx.AsyncClient() as client:
             response = await client.post(url, json=payload, headers=self.headers)
             return response.json()

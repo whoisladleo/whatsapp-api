@@ -213,7 +213,9 @@ async def _relay_to_instagram_customer(db: Session, account: WhatsAppAccount, ig
 
     provider = InstagramProvider(ig_account.access_token)
     try:
-        resp = await provider.send_direct_message(ig_account.ig_business_id, ig_customer.ig_scoped_id, reply_text)
+        resp = await provider.send_direct_message(
+            ig_account.ig_business_id, ig_customer.ig_scoped_id, reply_text, tag="HUMAN_AGENT"
+        )
     except Exception as e:
         return f"Failed to send reply to @{ig_username}: {e}"
 

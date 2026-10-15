@@ -158,10 +158,12 @@ def test_send_requires_auth(client, customer):
 def test_send_success_creates_outbound_message(client, db_session, auth_user, account, customer, monkeypatch):
     _, headers = auth_user
 
-    async def fake_send_direct_message(self, ig_business_id, recipient_id, message):
+    async def fake_send_direct_message(self, ig_business_id, recipient_id, message, tag=None):
         assert ig_business_id == "ig_conv_1"
         assert recipient_id == "igsid_1"
         assert message == "We'll follow up shortly!"
+        # A manual dashboard reply is a genuine human agent response — see #13.
+        assert tag == "HUMAN_AGENT"
         return {"message_id": "mid_sent_1"}
 
     monkeypatch.setattr(InstagramProvider, "send_direct_message", fake_send_direct_message)
@@ -186,7 +188,7 @@ def test_send_success_creates_outbound_message(client, db_session, auth_user, ac
 def test_send_failure_returns_422(client, auth_user, account, customer, monkeypatch):
     _, headers = auth_user
 
-    async def fake_send_direct_message(self, ig_business_id, recipient_id, message):
+    async def fake_send_direct_message(self, ig_business_id, recipient_id, message, tag=None):
         return {"error": {"message": "rate limited"}}
 
     monkeypatch.setattr(InstagramProvider, "send_direct_message", fake_send_direct_message)
@@ -210,7 +212,7 @@ def test_send_failure_falls_back_to_generic_message_without_meta_detail(
 ):
     _, headers = auth_user
 
-    async def fake_send_direct_message(self, ig_business_id, recipient_id, message):
+    async def fake_send_direct_message(self, ig_business_id, recipient_id, message, tag=None):
         return {"error": {}}
 
     monkeypatch.setattr(InstagramProvider, "send_direct_message", fake_send_direct_message)
