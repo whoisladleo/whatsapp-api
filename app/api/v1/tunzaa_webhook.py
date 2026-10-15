@@ -114,6 +114,26 @@ async def handle_tunzaa_webhook(
 
         installment_id = data.get("installment_id")
         if installment_id and order.tunzaa_plan_id:
+            # Per-leg idempotency: Tunzaa retries a callback up to 5 times
+            # per their docs. The order-level check above only catches a
+            # retry once order.status leaves PENDING, which never happens
+            # for a non-final leg of a multi-installment plan (the order
+            # correctly stays PENDING until the whole plan is paid off) —
+            # without this, a retried callback for an already-processed leg
+            # would re-send the customer's (and merchant's) payment
+            # notification for the same real payment. See #31.
+            already_processed_leg = (
+                db.query(Installment)
+                .filter(
+                    Installment.order_id == order.id,
+                    Installment.tunzaa_installment_id == installment_id,
+                    Installment.status == InstallmentStatus.PAID,
+                )
+                .first()
+            )
+            if already_processed_leg:
+                return {"status": "ignored", "reason": "Installment already processed"}
+
             # One leg of a multi-installment plan. Tunzaa tracks cumulative
             # payment at the plan level (paid_amount/remaining_balance), not
             # just a binary paid/unpaid per installment — reconcile against
@@ -342,24 +362,43 @@ def _release_reservation(db: Session, order: Order) -> None:
         product.quantity += order.quantity or 1
 
 
+def _payment_notification_body(kind: str) -> str:
+    if kind == "payment_complete":
+        return (
+            "🎉 Payment confirmed! Thank you for your order. "
+            "We'll be in touch shortly about delivery."
+        )
+    return (
+        "Your payment could not be completed, so this order has been "
+        "cancelled and the item released. Message us again if you'd "
+        "like to try again."
+    )
+
+
 async def _notify_customer(db: Session, order: Order, kind: str) -> None:
-    if not order.account_id or not order.customer:
+    """
+    Routes by whichever channel the order actually closed on. An
+    Instagram-originated order has no account_id (instagram_account_id is
+    set instead — see Order.instagram_customer_id) — this used to only
+    check account_id and silently never reach an Instagram customer at
+    all, confirmed live: a real customer was never told their payment
+    succeeded. See #31.
+    """
+    if order.account_id:
+        await _notify_customer_whatsapp(db, order, kind)
+    elif order.instagram_account_id:
+        await _notify_customer_instagram(db, order, kind)
+    # else: no channel on file for this order — nothing to notify.
+
+
+async def _notify_customer_whatsapp(db: Session, order: Order, kind: str) -> None:
+    if not order.customer:
         return
     account = db.query(WhatsAppAccount).filter(WhatsAppAccount.id == order.account_id).first()
     if not account:
         return
 
-    if kind == "payment_complete":
-        body = (
-            "🎉 Payment confirmed! Thank you for your order. "
-            "We'll be in touch shortly about delivery."
-        )
-    else:
-        body = (
-            "Your payment could not be completed, so this order has been "
-            "cancelled and the item released. Message us again if you'd "
-            "like to try again."
-        )
+    body = _payment_notification_body(kind)
 
     provider = WhatsAppProvider(account.access_token, account.phone_number_id)
     try:
@@ -379,4 +418,36 @@ async def _notify_customer(db: Session, order: Order, kind: str) -> None:
             "raw": resp or {},
         },
         account.id,
+    )
+
+
+async def _notify_customer_instagram(db: Session, order: Order, kind: str) -> None:
+    from app.core.instagram_provider import InstagramProvider
+    from app.crud import instagram as crud_instagram
+
+    ig_customer = order.instagram_customer
+    account = order.instagram_account
+    if not ig_customer or not account:
+        return
+
+    body = _payment_notification_body(kind)
+
+    provider = InstagramProvider(account.access_token)
+    try:
+        resp = await provider.send_direct_message(account.ig_business_id, ig_customer.ig_scoped_id, body)
+    except Exception as e:
+        logger.error(f"Failed to send Tunzaa payment notification (Instagram) to customer: {e}")
+        return
+
+    if "error" in resp:
+        logger.error(f"Instagram payment notification failed for order {order.id}: {resp}")
+        return
+
+    crud_instagram.create_direct_message(
+        db,
+        account_id=account.id,
+        customer_id=ig_customer.id,
+        direction="outbound",
+        body=body,
+        ig_message_id=resp.get("message_id"),
     )

@@ -745,6 +745,10 @@ Match the customer's language (Swahili or English). Keep both lines to one sente
             customer_id=customer.id,
             product_id=product.id,
             instagram_account_id=account.id,
+            # Lets _notify_customer (tunzaa_webhook.py) find the right DM
+            # thread for a payment confirmation/failure notice — the
+            # phone-keyed Customer above has no link back to this. See #(31).
+            instagram_customer_id=ig_customer.id,
             quantity=1,
             agreed_price=price,
             payment_type=payment_type,

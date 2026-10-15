@@ -434,6 +434,16 @@ class Order(Base):
     # too but has no WhatsAppAccount to hang off (a merchant can be
     # Instagram-only). Never both set on the same order.
     instagram_account_id = Column(UUIDType, ForeignKey("instagram_accounts.id"), nullable=True)
+    # Set alongside instagram_account_id (see _close_instagram_deal) — the
+    # phone-keyed Customer above has no link to the InstagramCustomer that
+    # actually messaged Amara, so without this, nothing can find the right
+    # DM thread to send a payment confirmation/failure notice to. Mirrors
+    # ProductSubscription.instagram_customer_id, which already solved this
+    # same problem for renewal notices. Before this field existed,
+    # _notify_customer (tunzaa_webhook.py) silently never reached an
+    # Instagram customer at all — confirmed live, a real customer was never
+    # told their payment succeeded.
+    instagram_customer_id = Column(UUIDType, ForeignKey("instagram_customers.id"), nullable=True)
     quantity = Column(Integer, default=1)
     payment_type = Column(Enum(PaymentType), nullable=True)
     tunzaa_transaction_id = Column(String, nullable=True)
@@ -455,6 +465,7 @@ class Order(Base):
     product = relationship("Product")
     account = relationship("WhatsAppAccount")
     instagram_account = relationship("InstagramAccount")
+    instagram_customer = relationship("InstagramCustomer")
     subscription = relationship("ProductSubscription", back_populates="order", uselist=False)
 
 
