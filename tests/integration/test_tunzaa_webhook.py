@@ -11,6 +11,9 @@ from app.db.models import (
     Installment,
     InstallmentMode,
     InstallmentStatus,
+    InstagramAccount,
+    InstagramCustomer,
+    InstagramDirectMessage,
     Message,
     Order,
     OrderStatus,
@@ -388,6 +391,42 @@ def test_installment_reconciliation_ignores_unmatched_installment_ids(
     assert installment.status == InstallmentStatus.PENDING
 
 
+def test_installment_retry_for_already_processed_leg_is_ignored(
+    client, db_session, plan_order, monkeypatch
+):
+    """
+    Regression guard: Tunzaa retries a callback up to 5 times per their
+    docs. A non-final leg leaves order.status PENDING, so the order-level
+    idempotency check alone doesn't catch a retry of that same leg — this
+    would otherwise re-send the customer's payment-confirmation message on
+    every retry. See #31.
+    """
+    _mock_get_installment_plan(
+        monkeypatch,
+        response={
+            "plan": {"plan_id": 1001, "remaining_balance": "30000.00"},
+            "installments": [{"installment_id": 10000, "status": "PAID"}],
+        },
+    )
+    first = _post(
+        client,
+        {"status": "COMPLETED", "reference_id": f"order-{plan_order.id}", "installment_id": "10000"},
+    )
+    assert first.status_code == 200
+    messages_after_first = db_session.query(Message).filter(Message.direction == "outbound").count()
+
+    # Tunzaa retries the exact same callback for the same leg.
+    retry = _post(
+        client,
+        {"status": "COMPLETED", "reference_id": f"order-{plan_order.id}", "installment_id": "10000"},
+    )
+
+    assert retry.status_code == 200
+    assert retry.json() == {"status": "ignored", "reason": "Installment already processed"}
+    messages_after_retry = db_session.query(Message).filter(Message.direction == "outbound").count()
+    assert messages_after_retry == messages_after_first
+
+
 def test_payment_completed_notify_failure_still_logs_failed_message(client, db_session, order, monkeypatch):
     _mock_send_text(monkeypatch, ok=False)
 
@@ -409,6 +448,103 @@ def test_payment_completed_without_account_does_not_crash(client, db_session, cu
     assert resp.status_code == 200
     db_session.refresh(o)
     assert o.status == OrderStatus.PAID
+
+
+# --- Instagram-originated orders ---------------------------------------------
+
+
+@pytest.fixture
+def ig_account(db_session, owner):
+    a = InstagramAccount(
+        ig_business_id="ig_biz_tunzaa_1", access_token="ig-tok", username="shop_ig", user_id=owner.id,
+    )
+    db_session.add(a)
+    db_session.commit()
+    db_session.refresh(a)
+    return a
+
+
+@pytest.fixture
+def ig_customer(db_session, ig_account):
+    c = InstagramCustomer(ig_scoped_id="igsid_tunzaa_1", username="buyer_ig", account_id=ig_account.id)
+    db_session.add(c)
+    db_session.commit()
+    db_session.refresh(c)
+    return c
+
+
+@pytest.fixture
+def ig_order(db_session, customer, ig_account, ig_customer, product):
+    o = Order(
+        customer_id=customer.id, product_id=product.id, instagram_account_id=ig_account.id,
+        instagram_customer_id=ig_customer.id, quantity=1, agreed_price=45000, status=OrderStatus.PENDING,
+    )
+    db_session.add(o)
+    db_session.commit()
+    db_session.refresh(o)
+    return o
+
+
+def _mock_send_direct_message(monkeypatch, ok=True):
+    async def fake(self, ig_business_id, recipient_id, message, tag=None):
+        if ok:
+            return {"recipient_id": recipient_id, "message_id": "ig_msg_notify_1"}
+        return {"error": {"message": "rate limited"}}
+
+    monkeypatch.setattr("app.core.instagram_provider.InstagramProvider.send_direct_message", fake)
+
+
+def test_payment_completed_notifies_instagram_customer(client, db_session, ig_order, monkeypatch):
+    """
+    Regression test: _notify_customer used to only check order.account_id,
+    which is always None for an Instagram-originated order — confirmed
+    live, a real customer was never told their payment succeeded. See #31.
+    """
+    _mock_send_direct_message(monkeypatch)
+
+    resp = _post(client, {"status": "COMPLETED", "reference_id": f"order-{ig_order.id}", "transaction_id": "T-IG-1"})
+
+    assert resp.status_code == 200
+    db_session.refresh(ig_order)
+    assert ig_order.status == OrderStatus.PAID
+
+    confirm = (
+        db_session.query(InstagramDirectMessage)
+        .filter(InstagramDirectMessage.direction == "outbound")
+        .first()
+    )
+    assert confirm is not None
+    assert "confirmed" in confirm.body.lower()
+    assert confirm.ig_message_id == "ig_msg_notify_1"
+
+
+def test_payment_failed_notifies_instagram_customer(client, db_session, ig_order, monkeypatch):
+    _mock_send_direct_message(monkeypatch)
+
+    resp = _post(client, {"status": "FAILED", "reference_id": f"order-{ig_order.id}", "transaction_id": "T-IG-2"})
+
+    assert resp.status_code == 200
+    confirm = (
+        db_session.query(InstagramDirectMessage)
+        .filter(InstagramDirectMessage.direction == "outbound")
+        .first()
+    )
+    assert confirm is not None
+    assert "could not be completed" in confirm.body.lower()
+
+
+def test_payment_completed_instagram_send_failure_does_not_crash(client, db_session, ig_order, monkeypatch):
+    _mock_send_direct_message(monkeypatch, ok=False)
+
+    resp = _post(client, {"status": "COMPLETED", "reference_id": f"order-{ig_order.id}"})
+
+    assert resp.status_code == 200
+    assert (
+        db_session.query(InstagramDirectMessage)
+        .filter(InstagramDirectMessage.direction == "outbound")
+        .count()
+        == 0
+    )
 
 
 # --- FAILED / CANCELLED -------------------------------------------------------
