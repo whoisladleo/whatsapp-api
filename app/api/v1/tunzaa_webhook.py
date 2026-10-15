@@ -225,14 +225,31 @@ async def _handle_product_subscription_renewal_webhook(
 
 
 async def _activate_subscription_if_linked(db: Session, order: Order) -> None:
-    from app.db.models import ProductSubscriptionStatus
+    from app.db.models import InstallmentMode, ProductSubscriptionStatus
     from app.services import product_subscription
 
     subscription = (
         db.query(ProductSubscription).filter(ProductSubscription.order_id == order.id).first()
     )
-    if subscription and subscription.status == ProductSubscriptionStatus.PENDING_PAYMENT:
-        product_subscription.activate_after_first_payment(db, subscription)
+    if not subscription or subscription.status != ProductSubscriptionStatus.PENDING_PAYMENT:
+        return
+
+    # SNPL withholds activation until the installment plan is fully paid
+    # off (order.status only reaches PAID once remaining_balance <= 0 —
+    # see _reconcile_installment_plan). BNPL (the default, matching
+    # pre-existing behavior) activates on this first successful payment
+    # regardless of the order's own status, same as a FULL payment always
+    # has. A FULL payment's order.status is already PAID by the time this
+    # runs either way, so this check is a no-op for it.
+    product = order.product
+    if (
+        product
+        and product.installment_mode == InstallmentMode.SNPL
+        and order.status != OrderStatus.PAID
+    ):
+        return
+
+    product_subscription.activate_after_first_payment(db, subscription)
 
 
 def _fail_subscription_if_linked(db: Session, order: Order) -> None:
