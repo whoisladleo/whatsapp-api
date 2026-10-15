@@ -101,6 +101,56 @@ async def test_send_direct_message_with_tag_payload(provider):
 
 
 @respx.mock
+async def test_send_direct_message_falls_back_to_untagged_when_human_agent_unapproved(provider):
+    # Meta gates the HUMAN_AGENT tag itself until App Review approves it
+    # (see #26) — this rejects a tagged send regardless of whether the
+    # conversation is actually within or past the 24h window.
+    route = respx.post(url__regex=MESSAGES_URL_RE)
+    route.side_effect = [
+        httpx.Response(
+            200,
+            json={
+                "error": {
+                    "message": "To use 'Human Agent', your use of this endpoint "
+                    "must be reviewed and approved by Facebook."
+                }
+            },
+        ),
+        httpx.Response(200, json={"recipient_id": "ig-scoped-1", "message_id": "msg_4"}),
+    ]
+
+    result = await provider.send_direct_message(
+        "ig_business_1", "igsid_1", "Still there?", tag="HUMAN_AGENT"
+    )
+
+    assert route.call_count == 2
+    first_sent = json.loads(route.calls[0].request.content)
+    assert first_sent["tag"] == "HUMAN_AGENT"
+    retry_sent = json.loads(route.calls[1].request.content)
+    assert retry_sent == {
+        "recipient": {"id": "igsid_1"},
+        "message": {"text": "Still there?"},
+    }
+    assert result["message_id"] == "msg_4"
+
+
+@respx.mock
+async def test_send_direct_message_with_tag_surfaces_other_errors(provider):
+    # A rejection unrelated to Human Agent approval (e.g. invalid token)
+    # must not trigger the untagged fallback or retry.
+    route = respx.post(url__regex=MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(400, json={"error": {"message": "Invalid OAuth access token."}})
+    )
+
+    result = await provider.send_direct_message(
+        "ig_business_1", "igsid_1", "Still there?", tag="HUMAN_AGENT"
+    )
+
+    assert route.call_count == 1
+    assert result["error"]["message"] == "Invalid OAuth access token."
+
+
+@respx.mock
 async def test_get_user_profile_returns_name_and_username(provider):
     route = respx.get(url__regex=PROFILE_URL_RE).mock(
         return_value=httpx.Response(200, json={"id": "igsid_1", "name": "Jane Doe", "username": "janedoe"})
