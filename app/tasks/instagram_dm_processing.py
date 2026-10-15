@@ -1,10 +1,11 @@
 import logging
+from datetime import datetime
 
 from app.core.celery_app import celery_app
 from app.core.ids import coerce_uuid
 from app.core.instagram_provider import InstagramProvider
 from app.crud import instagram as crud_instagram
-from app.db.models import ConversationState, InstagramAccount, InstagramCustomer
+from app.db.models import ConversationState, InstagramAccount, InstagramCustomer, InstagramDirectMessage
 from app.db.session import SessionLocal
 from app.services.llm import llm_service
 from app.tasks.webhook_processing import _run_async
@@ -30,8 +31,27 @@ async def _process(db, account_id: str, customer_id: str, dm_row_id: str) -> str
     account_uuid = coerce_uuid(account_id)
     customer_uuid = coerce_uuid(customer_id)
     dm_row_uuid = coerce_uuid(dm_row_id)
-    if account_uuid is None or customer_uuid is None:
+    if account_uuid is None or customer_uuid is None or dm_row_uuid is None:
         return "Account or customer not found."
+
+    # Atomic claim: guards against two concurrent/duplicate executions of
+    # this same inbound message both running the full LLM/send/order flow —
+    # whether from webhook redelivery racing past handle_webhook's own
+    # dm_already_processed check, or Celery's own at-least-once task
+    # redelivery. Same conditional-UPDATE pattern as
+    # claim_available_pool_number: the affected-row count tells us whether
+    # we won the race, correct on both SQLite tests and Postgres prod.
+    # Confirmed live: without this, a single inbound message produced two
+    # separate PAID orders. See #33.
+    claimed = (
+        db.query(InstagramDirectMessage)
+        .filter(InstagramDirectMessage.id == dm_row_uuid, InstagramDirectMessage.processed_at.is_(None))
+        .update({"processed_at": datetime.utcnow()})
+    )
+    db.commit()
+    if claimed == 0:
+        return "Already processed; skipping duplicate dispatch."
+
     account = db.query(InstagramAccount).filter(InstagramAccount.id == account_uuid).first()
     customer = db.query(InstagramCustomer).filter(InstagramCustomer.id == customer_uuid).first()
     if not account or not customer:

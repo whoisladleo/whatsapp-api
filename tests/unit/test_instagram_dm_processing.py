@@ -150,6 +150,39 @@ def test_sends_dm_reply_on_success(
     assert fake_llm_reply.called_with["conversation_history"] == []
 
 
+def test_second_dispatch_for_same_inbound_message_is_a_no_op(
+    db_session, account, customer, inbound_dm, fake_llm_reply, monkeypatch
+):
+    """
+    Regression test: a single inbound message used to be processed twice
+    end-to-end (two LLM calls, two sends, two orders for the same deal) if
+    process_inbound_dm got dispatched more than once for the same dm_row_id
+    — whether from webhook redelivery racing past handle_webhook's own
+    dedup check, or Celery's own at-least-once task redelivery. See #33.
+    """
+    fake_provider = _FakeProvider("ig-tok")
+    monkeypatch.setattr(task_module, "InstagramProvider", lambda access_token: fake_provider)
+
+    # Captured before either call — the task's own `finally: db.close()`
+    # closes this shared test session after the first call (see
+    # _use_test_session), which would otherwise expire these ORM objects.
+    account_id, customer_id, dm_id = account.id, customer.id, inbound_dm.id
+
+    first = task_module.process_inbound_dm(account_id, customer_id, dm_id)
+    second = task_module.process_inbound_dm(account_id, customer_id, dm_id)
+
+    assert first == "Processed."
+    assert second == "Already processed; skipping duplicate dispatch."
+    assert len(fake_provider.calls) == 1
+
+    outbound_count = (
+        db_session.query(InstagramDirectMessage)
+        .filter(InstagramDirectMessage.direction == "outbound")
+        .count()
+    )
+    assert outbound_count == 1
+
+
 def test_no_reply_generated_sends_nothing(db_session, account, customer, inbound_dm, monkeypatch):
     async def fake_generate_dm_response(**kwargs):
         return None
