@@ -16,6 +16,7 @@ from app.crud import message as crud_message
 from app.db.models import WhatsAppAccount
 from app.db.session import SessionLocal
 from app.services.llm import LLMUnavailable, llm_service
+from app.services import usage
 from app.services.merchant_handler import handle_merchant_message
 
 logger = logging.getLogger(__name__)
@@ -225,6 +226,8 @@ async def _process(db, account, from_phone, message_body, llm_attempt: int = 0) 
         if resp and "messages" in resp:
             msg_id = resp["messages"][0].get("id")
             status = "sent"
+            if not is_merchant:
+                usage.record_reply(db, account.user_id, "whatsapp", account_id=account.id)
         else:
             msg_id = f"failed_{uuid.uuid4().hex[:8]}"
             status = "failed"

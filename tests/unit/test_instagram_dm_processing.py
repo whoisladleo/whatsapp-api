@@ -341,3 +341,43 @@ def test_send_failure_alerts_merchant(db_session, account, customer, inbound_dm,
 
 async def _no_retry_send(send):
     return await send()
+
+
+def test_delivered_dm_reply_is_metered(db_session, account, customer, inbound_dm, fake_llm_reply, monkeypatch):
+    from app.db.models import AmaraEvent, AmaraEventKind
+
+    monkeypatch.setattr(task_module, "InstagramProvider", lambda access_token: _FakeProvider("ig-tok"))
+    merchant_id, account_id = account.user_id, account.id
+
+    task_module.process_inbound_dm(account_id, customer.id, inbound_dm.id)
+
+    replies = db_session.query(AmaraEvent).filter_by(kind=AmaraEventKind.REPLY).all()
+    assert [(r.merchant_id, r.channel, r.instagram_account_id) for r in replies] == [
+        (merchant_id, "instagram_dm", account_id)
+    ]
+
+
+def test_undelivered_dm_reply_is_not_metered(db_session, account, customer, inbound_dm, monkeypatch):
+    from app.db.models import AmaraEvent
+
+    monkeypatch.setattr(task_module, "_send_with_retries", _no_retry_send)
+
+    async def reply(**kwargs):
+        return "It's 45000 TZS."
+
+    async def no_alert(*a, **kw):
+        return None
+
+    class FakeLLMService:
+        generate_dm_response = staticmethod(reply)
+        _notify_merchant_of_instagram_handoff = staticmethod(no_alert)
+
+    monkeypatch.setattr(task_module, "llm_service", FakeLLMService())
+    monkeypatch.setattr(
+        task_module, "InstagramProvider",
+        lambda access_token: _FakeProvider("ig-tok", response={"error": {"message": "outside window"}}),
+    )
+
+    task_module.process_inbound_dm(account.id, customer.id, inbound_dm.id)
+
+    assert db_session.query(AmaraEvent).count() == 0

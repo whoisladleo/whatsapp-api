@@ -18,6 +18,7 @@ celery_app = Celery(
         "app.tasks.quote_nudges",
         "app.tasks.number_billing",
         "app.tasks.product_subscription_billing",
+        "app.tasks.usage_alerts",
     ]
 )
 

@@ -6,6 +6,7 @@ from typing import Optional
 from sqlalchemy.orm import Session
 
 from app.db.models import Order, Product, ProductSubscription, ProductSubscriptionStatus, User
+from app.services import usage
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +142,23 @@ def mark_first_payment_failed(db: Session, subscription: ProductSubscription) ->
     sync_access_if_platform_subscription(db, subscription)
 
 
+def _record_renewal_payment(db: Session, subscription: ProductSubscription) -> None:
+    """TZS collected from a renewal charge, for GET /stats (#41)."""
+    from app.db.models import AmaraEventKind
+
+    order = subscription.order
+    account = (order.account or order.instagram_account) if order else None
+    owner = account.owner if account else None
+    usage.record_event(
+        db, owner.id if owner else None, AmaraEventKind.PAYMENT,
+        channel="whatsapp" if order and order.account_id else "instagram_dm",
+        account_id=order.account_id if order else None,
+        instagram_account_id=order.instagram_account_id if order else None,
+        product_name=order.product.name if order and order.product else None,
+        amount=subscription.monthly_amount,
+    )
+
+
 async def handle_renewal_payment_result(
     db: Session, subscription: ProductSubscription, status_value: Optional[str], transaction_id: Optional[str]
 ) -> None:
@@ -156,6 +174,7 @@ async def handle_renewal_payment_result(
         subscription.past_due_since = None
         subscription.next_billing_at = datetime.utcnow() + timedelta(days=RENEWAL_PERIOD_DAYS)
         db.commit()
+        _record_renewal_payment(db, subscription)
         try:
             charge_renewal.apply_async(
                 args=[str(subscription.id)], countdown=RENEWAL_PERIOD_DAYS * 86400
@@ -257,6 +276,8 @@ async def _notify_customer_whatsapp(db: Session, subscription: ProductSubscripti
     except Exception as e:
         logger.error(f"Failed to send WhatsApp renewal notice for subscription {subscription.id}: {e}")
         resp = None
+    if usage.whatsapp_send_succeeded(resp):
+        usage.record_reply(db, account.user_id, "whatsapp", account_id=account.id)
 
     crud_message.create_message(
         db,
@@ -300,6 +321,7 @@ async def _notify_customer_instagram(db: Session, subscription: ProductSubscript
         body=body,
         ig_message_id=resp.get("message_id"),
     )
+    usage.record_reply(db, account.user_id, "instagram_dm", instagram_account_id=account.id)
 
 
 async def notify_merchant(db: Session, subscription: ProductSubscription, body: str) -> None:

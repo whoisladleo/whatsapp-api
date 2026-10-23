@@ -1088,3 +1088,37 @@ def test_merchant_alert_send_failure_does_not_crash(client, db_session, order, m
     assert resp.status_code == 200
     db_session.refresh(order)
     assert order.status == OrderStatus.PAID
+
+
+# --- Usage ledger (#41) -----------------------------------------------------------
+
+
+def test_full_payment_records_payment_and_metered_buyer_notice(client, db_session, order, owner, monkeypatch):
+    from app.db.models import AmaraEvent, AmaraEventKind
+
+    _mock_send_text(monkeypatch)
+    _mock_send_template(monkeypatch)
+    payload = {"status": "COMPLETED", "reference_id": f"order-{order.id}", "transaction_id": "T-LEDGER-1"}
+
+    _post(client, payload)
+    _post(client, payload)  # Tunzaa retry: must not double-count
+
+    payments = db_session.query(AmaraEvent).filter_by(kind=AmaraEventKind.PAYMENT).all()
+    assert [(p.merchant_id, p.amount, p.product_name) for p in payments] == [(owner.id, 45000, "Shoes")]
+    # The buyer's "payment received" text is an automated send, so billable;
+    # the merchant's payment_received alert is not.
+    replies = db_session.query(AmaraEvent).filter_by(kind=AmaraEventKind.REPLY).all()
+    assert [(r.merchant_id, r.channel) for r in replies] == [(owner.id, "whatsapp")]
+
+
+def test_payment_event_uses_tunzaa_amount_when_given(client, db_session, order, monkeypatch):
+    from app.db.models import AmaraEvent, AmaraEventKind
+
+    _mock_send_text(monkeypatch)
+    _mock_send_template(monkeypatch)
+
+    _post(client, {
+        "status": "COMPLETED", "reference_id": f"order-{order.id}", "transaction_id": "T-LEDGER-2", "amount": "44000",
+    })
+
+    assert db_session.query(AmaraEvent).filter_by(kind=AmaraEventKind.PAYMENT).one().amount == 44000

@@ -627,3 +627,47 @@ async def test_dm_catalog_never_exposes_real_floor(db_session, ig_account, ig_cu
     assert "Lowest Price You May Offer TZS 38,500" in captured["system"]
     assert "35,000" not in captured["system"]
     assert "SECRET FLOOR" not in captured["system"]
+
+
+# --- Usage ledger (#41) ------------------------------------------------------------
+
+
+async def test_dm_quote_is_stripped_and_recorded(db_session, ig_account, ig_customer, ig_context, shoes):
+    from app.db.models import AmaraEvent, AmaraEventKind
+
+    service = _service_with_fake_client(reply_text="I can do TZS 42,000. [QUOTE: product=Shoes price=42000]")
+
+    result = await service.generate_dm_response(
+        "how much?", db=db_session, account=ig_account, customer=ig_customer, context=ig_context, conversation_history=[]
+    )
+
+    assert result == "I can do TZS 42,000."
+    quote = db_session.query(AmaraEvent).filter_by(kind=AmaraEventKind.QUOTE).one()
+    assert (quote.product_name, quote.amount, quote.channel) == ("Shoes", 42000, "instagram_dm")
+
+
+async def test_dm_quote_marker_never_leaks_through_handoff(db_session, ig_account, ig_customer, ig_context, shoes):
+    from app.db.models import AmaraEvent, AmaraEventKind
+
+    service = _service_with_fake_client(
+        reply_text="Let me check with the shop. [QUOTE: product=Shoes price=42000] [HUMAN_HANDOFF]"
+    )
+
+    result = await service.generate_dm_response(
+        "hmm", db=db_session, account=ig_account, customer=ig_customer, context=ig_context, conversation_history=[]
+    )
+
+    assert "QUOTE" not in result and "HUMAN_HANDOFF" not in result
+    assert db_session.query(AmaraEvent).filter_by(kind=AmaraEventKind.HANDOFF).count() == 1
+    assert db_session.query(AmaraEvent).filter_by(kind=AmaraEventKind.QUOTE).count() == 0
+
+
+async def test_dm_prompt_asks_for_quote_marker(db_session, ig_account, ig_customer, ig_context, shoes):
+    captured = {}
+    service = _service_with_fake_client(captured=captured)
+
+    await service.generate_dm_response(
+        "price?", db=db_session, account=ig_account, customer=ig_customer, context=ig_context, conversation_history=[]
+    )
+
+    assert "[QUOTE: product=<product name> price=<price>]" in captured["system"]

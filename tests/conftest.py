@@ -103,6 +103,8 @@ def _no_real_celery_broker(monkeypatch):
     monkeypatch.setattr(check_past_due_grace_expired, "apply_async", lambda *a, **kw: None)
     monkeypatch.setattr(send_quote_nudge, "apply_async", lambda *a, **kw: None)
     monkeypatch.setattr(charge_product_subscription_renewal, "apply_async", lambda *a, **kw: None)
+    from app.tasks.usage_alerts import send_usage_warning
+    monkeypatch.setattr(send_usage_warning, "apply_async", lambda *a, **kw: None)
 
 
 @pytest.fixture

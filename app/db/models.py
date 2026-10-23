@@ -1,6 +1,6 @@
 import enum
 import uuid
-from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, JSON, Boolean, Float, Enum, Uuid
+from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, JSON, Boolean, Float, Enum, Index, Uuid
 from sqlalchemy.orm import relationship, DeclarativeBase
 from datetime import datetime
 
@@ -47,6 +47,13 @@ class ConversationState(enum.Enum):
     NEGOTIATING = "NEGOTIATING"
     HUMAN_HANDOFF = "HUMAN_HANDOFF"
     MANAGEMENT = "MANAGEMENT"
+
+class AmaraEventKind(enum.Enum):
+    REPLY = "REPLY"  # billable automated send to a buyer (#41)
+    QUOTE = "QUOTE"
+    HANDOFF = "HANDOFF"
+    PAYMENT = "PAYMENT"
+    USAGE_WARNING = "USAGE_WARNING"
 
 class PhoneNumberStatus(enum.Enum):
     AVAILABLE = "AVAILABLE"
@@ -563,3 +570,27 @@ class ConversationContext(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     customer = relationship("Customer", back_populates="conversation")
+
+
+class AmaraEvent(Base):
+    """
+    Append-only ledger of what Amara did for a merchant (#41). REPLY rows
+    are the billing record for the plan's monthly reply limit; the rest
+    feed GET /stats. Account ids and product name are stored without FKs on
+    purpose: WhatsApp accounts and products can be hard-deleted, and a
+    billing record must outlive them.
+    """
+    __tablename__ = "amara_events"
+
+    id = Column(UUIDType, primary_key=True, default=uuid.uuid4, index=True)
+    merchant_id = Column(UUIDType, ForeignKey("users.id"), nullable=False)
+    kind = Column(Enum(AmaraEventKind), nullable=False)
+    channel = Column(String, nullable=True)  # whatsapp, instagram_dm, instagram_comment
+    account_id = Column(UUIDType, nullable=True)
+    instagram_account_id = Column(UUIDType, nullable=True)
+    product_name = Column(String, nullable=True)
+    amount = Column(Float, nullable=True)
+    detail = Column(String, nullable=True)  # e.g. the USAGE_WARNING threshold
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (Index("ix_amara_events_merchant_kind_created", "merchant_id", "kind", "created_at"),)

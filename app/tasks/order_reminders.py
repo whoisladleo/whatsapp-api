@@ -6,6 +6,7 @@ from app.core.ids import coerce_uuid
 from app.db.session import SessionLocal
 from app.db.models import Order, OrderStatus, Product, WhatsAppAccount
 from app.crud import message as crud_message
+from app.services import usage
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,9 @@ def _account_for_order(db, order) -> WhatsAppAccount:
 
 
 def _log_outbound(db, account, to, body, resp):
+    # Every caller is a buyer-facing reminder, so each successful one is billable (#41).
+    if usage.whatsapp_send_succeeded(resp):
+        usage.record_reply(db, account.user_id, "whatsapp", account_id=account.id)
     crud_message.create_message(
         db,
         {

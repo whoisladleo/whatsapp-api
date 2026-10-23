@@ -1643,3 +1643,40 @@ async def test_catalog_never_exposes_real_floor(db_session, shop_account, shoes)
     assert "Lowest Price You May Offer TZS 44,000" in captured["system"]
     assert "40,000" not in captured["system"]
     assert "SECRET FLOOR" not in captured["system"]
+
+
+# --- Usage ledger (#41) ------------------------------------------------------------
+
+
+async def test_quote_is_recorded_for_stats(db_session, shop_account, shoes):
+    from app.db.models import AmaraEvent, AmaraEventKind
+
+    async def handler(**kwargs):
+        return _FakeResponse("I can do TZS 45,000. [QUOTE: product=shoes price=45000]")
+
+    service = _service_with_fake_client(handler=handler)
+
+    await service.generate_response(
+        message_body="how much?", from_phone="255711149001", db=db_session, account=shop_account,
+    )
+
+    quote = db_session.query(AmaraEvent).filter_by(kind=AmaraEventKind.QUOTE).one()
+    assert (quote.merchant_id, quote.product_name, quote.amount, quote.channel) == (
+        shop_account.user_id, "Shoes", 45000, "whatsapp"
+    )
+
+
+async def test_handoff_is_recorded_for_stats(db_session, shop_account):
+    from app.db.models import AmaraEvent, AmaraEventKind
+
+    async def handler(**kwargs):
+        return _FakeResponse("Let me get someone. [HUMAN_HANDOFF]")
+
+    service = _service_with_fake_client(handler=handler)
+
+    await service.generate_response(
+        message_body="I want a human", from_phone="255711149002", db=db_session, account=shop_account,
+    )
+
+    handoff = db_session.query(AmaraEvent).filter_by(kind=AmaraEventKind.HANDOFF).one()
+    assert (handoff.merchant_id, handoff.channel) == (shop_account.user_id, "whatsapp")
