@@ -1,3 +1,5 @@
+from datetime import datetime
+
 import pytest
 
 import app.tasks.instagram_dm_processing as task_module
@@ -267,3 +269,75 @@ def test_send_failure_does_not_create_outbound_row(
         .first()
     )
     assert outbound is None
+
+
+# --- Claude-outage retries (#38) ----------------------------------------------
+
+def test_llm_outage_retry_reclaims_and_replies_once(db_session, account, customer, inbound_dm, monkeypatch):
+    calls = []
+
+    async def flaky(**kwargs):
+        calls.append(kwargs["retry_on_outage"])
+        if len(calls) == 1:
+            raise task_module.LLMUnavailable("overloaded")
+        return "It's 45000 TZS."
+
+    class FakeLLMService:
+        generate_dm_response = staticmethod(flaky)
+
+    monkeypatch.setattr(task_module, "llm_service", FakeLLMService())
+    fake_provider = _FakeProvider("ig-tok")
+    monkeypatch.setattr(task_module, "InstagramProvider", lambda access_token: fake_provider)
+
+    task_module.process_inbound_dm.apply_async(args=[account.id, customer.id, inbound_dm.id])
+
+    assert calls == [True, True]
+    assert len(fake_provider.calls) == 1
+
+
+def test_outage_retry_claim_is_compare_and_swap(db_session, account, customer, inbound_dm, fake_llm_reply, monkeypatch):
+    """
+    While a retry is pending, the row stays claimed: a webhook redelivery
+    (claimed_at=None) and a stale retry (wrong claimed_at) are both refused;
+    only the retry holding the exact claim gets through.
+    """
+    monkeypatch.setattr(task_module, "InstagramProvider", lambda access_token: _FakeProvider("ig-tok"))
+    claimed_at = datetime(2026, 10, 23, 12, 0, 0, 123456)
+    inbound_dm.processed_at = claimed_at
+    db_session.commit()
+    ids = (account.id, customer.id, inbound_dm.id)
+
+    assert task_module.process_inbound_dm(*ids) == "Already processed; skipping duplicate dispatch."
+    assert (
+        task_module.process_inbound_dm(*ids, 1, datetime(2026, 1, 1).isoformat())
+        == "Already processed; skipping duplicate dispatch."
+    )
+    assert task_module.process_inbound_dm(*ids, 1, claimed_at.isoformat()) == "Processed."
+
+
+def test_send_failure_alerts_merchant(db_session, account, customer, inbound_dm, monkeypatch):
+    monkeypatch.setattr(task_module, "_send_with_retries", _no_retry_send)
+    alerts = []
+
+    async def reply(**kwargs):
+        return "It's 45000 TZS."
+
+    async def record_alert(db, ig_account, ig_customer, customer_message):
+        alerts.append(customer_message)
+
+    class FakeLLMService:
+        generate_dm_response = staticmethod(reply)
+        _notify_merchant_of_instagram_handoff = staticmethod(record_alert)
+
+    monkeypatch.setattr(task_module, "llm_service", FakeLLMService())
+    monkeypatch.setattr(
+        task_module, "InstagramProvider",
+        lambda access_token: _FakeProvider("ig-tok", response={"error": {"message": "outside window"}}),
+    )
+
+    assert task_module.process_inbound_dm(account.id, customer.id, inbound_dm.id) == "Send failed."
+    assert alerts == ["how much is it?"]
+
+
+async def _no_retry_send(send):
+    return await send()

@@ -3,6 +3,8 @@ import concurrent.futures
 import logging
 import uuid
 
+import httpx
+
 import app.core.rate_limit as rate_limit_module
 from app.core.celery_app import celery_app
 from app.core.ids import coerce_uuid
@@ -13,7 +15,7 @@ from app.crud import knowledge as crud_knowledge
 from app.crud import message as crud_message
 from app.db.models import WhatsAppAccount
 from app.db.session import SessionLocal
-from app.services.llm import llm_service
+from app.services.llm import LLMUnavailable, llm_service
 from app.services.merchant_handler import handle_merchant_message
 
 logger = logging.getLogger(__name__)
@@ -32,6 +34,17 @@ LOCK_MAX_RETRIES = 5  # ~10s of total contention before giving up
 # operational rather than abuse-prone the way inbound customer chat is.
 AI_REPLY_RATE_LIMIT = 20
 AI_REPLY_RATE_LIMIT_WINDOW_SECONDS = 60 * 60
+
+# A Claude outage that outlasts the SDK's own retries re-runs the whole turn
+# after each of these delays (~2 min total) before the customer gets the
+# outage reply and the merchant is alerted (#38). Safe because
+# LLMUnavailable is raised before any order, send or state change.
+LLM_RETRY_COUNTDOWNS_SECONDS = (15, 45, 60)
+
+# Meta send retries happen in-process, after the reply (and any order) is
+# final, so the LLM turn never re-runs. Kept short to stay well inside
+# LOCK_TTL_SECONDS.
+SEND_RETRY_DELAYS_SECONDS = (1, 3)
 
 
 def _run_async(coro):
@@ -52,6 +65,29 @@ def _run_async(coro):
         return asyncio.run(coro)
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         return pool.submit(asyncio.run, coro).result()
+
+
+def _is_transient_send_failure(resp) -> bool:
+    error = (resp or {}).get("error") or {}
+    # Meta codes 1/2: unknown error / service temporarily unavailable.
+    return bool(error.get("is_transient")) or error.get("code") in (1, 2)
+
+
+async def _send_with_retries(send):
+    """
+    Calls send() (a zero-arg coroutine factory returning Meta's JSON) and
+    retries only transient failures. A network exception becomes an error
+    dict instead of crashing the task, so the caller still logs the
+    outbound row and can alert the merchant.
+    """
+    for delay in (*SEND_RETRY_DELAYS_SECONDS, None):
+        try:
+            resp = await send()
+        except httpx.HTTPError as e:
+            resp = {"error": {"message": str(e), "is_transient": True}}
+        if delay is None or not _is_transient_send_failure(resp):
+            return resp
+        await asyncio.sleep(delay)
 
 
 def _lock_key(account_id: str, from_phone: str) -> str:
@@ -78,7 +114,7 @@ def _release_lock(key: str) -> None:
 
 @celery_app.task
 def process_inbound_message(
-    account_id: str, from_phone: str, message_body: str, attempt: int = 0
+    account_id: str, from_phone: str, message_body: str, attempt: int = 0, llm_attempt: int = 0
 ):
     """
     Handles a single inbound customer/merchant text message: routes it to
@@ -97,6 +133,8 @@ def process_inbound_message(
     real-worker execution: non-blocking in production (the delayed
     re-attempt is a genuinely separate broker message), and an immediate,
     deterministic, boundedly-recursive call under eager mode in tests.
+    A Claude outage (LLMUnavailable) re-dispatches the same way, counted
+    separately in `llm_attempt` (see LLM_RETRY_COUNTDOWNS_SECONDS).
     """
     db = SessionLocal()
     try:
@@ -117,20 +155,30 @@ def process_inbound_message(
                 return "Lock contention exhausted."
 
             process_inbound_message.apply_async(
-                args=[account_id, from_phone, message_body, attempt + 1],
+                args=[account_id, from_phone, message_body, attempt + 1, llm_attempt],
                 countdown=LOCK_RETRY_COUNTDOWN_SECONDS,
             )
             return "Retrying due to lock contention."
 
         try:
-            return _run_async(_process(db, account, from_phone, message_body))
+            return _run_async(_process(db, account, from_phone, message_body, llm_attempt=llm_attempt))
+        except LLMUnavailable as e:
+            outage = e
         finally:
             _release_lock(lock_key)
+
+        # Dispatched only after the lock is released, so the retry can take it.
+        logger.warning(f"Claude unavailable for {lock_key} (attempt {llm_attempt}); retrying: {outage}")
+        process_inbound_message.apply_async(
+            args=[account_id, from_phone, message_body, 0, llm_attempt + 1],
+            countdown=LLM_RETRY_COUNTDOWNS_SECONDS[llm_attempt],
+        )
+        return "Retrying: LLM unavailable."
     finally:
         db.close()
 
 
-async def _process(db, account, from_phone, message_body) -> str:
+async def _process(db, account, from_phone, message_body, llm_attempt: int = 0) -> str:
     is_merchant = account.owner and normalize_phone(from_phone) == normalize_phone(
         account.owner.username
     )
@@ -141,7 +189,8 @@ async def _process(db, account, from_phone, message_body) -> str:
         response_text = await handle_merchant_message(db, account, message_body, from_phone)
     elif llm_service:
         rate_limit_key = f"ai_reply:{account.id}:{normalize_phone(from_phone)}"
-        if not check_and_increment(
+        # An outage retry is the same message, already counted once.
+        if llm_attempt == 0 and not check_and_increment(
             rate_limit_key, AI_REPLY_RATE_LIMIT, AI_REPLY_RATE_LIMIT_WINDOW_SECONDS
         ):
             logger.warning(
@@ -166,11 +215,12 @@ async def _process(db, account, from_phone, message_body) -> str:
             from_phone=from_phone,
             db=db,
             account=account,
+            retry_on_outage=llm_attempt < len(LLM_RETRY_COUNTDOWNS_SECONDS),
         )
 
     if response_text:
         provider = WhatsAppProvider(account.access_token, account.phone_number_id)
-        resp = await provider.send_text(from_phone, response_text)
+        resp = await _send_with_retries(lambda: provider.send_text(from_phone, response_text))
 
         if resp and "messages" in resp:
             msg_id = resp["messages"][0].get("id")
@@ -179,6 +229,12 @@ async def _process(db, account, from_phone, message_body) -> str:
             msg_id = f"failed_{uuid.uuid4().hex[:8]}"
             status = "failed"
             logger.error(f"WhatsApp API Error: {resp}")
+            if not is_merchant and account.owner:
+                # The customer never got this reply — the merchant has to step in (#38).
+                try:
+                    await llm_service._send_platform_alert_to_merchant(db, account.owner, from_phone, message_body)
+                except Exception as alert_err:
+                    logger.error(f"Failed to alert merchant of undelivered reply: {alert_err}")
 
         crud_message.create_message(
             db,
