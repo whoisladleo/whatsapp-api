@@ -93,7 +93,7 @@ def test_lock_contention_retries_then_succeeds(monkeypatch, db_session, account)
 
     monkeypatch.setattr(webhook_processing, "_acquire_lock", flaky_acquire)
 
-    async def fake_process(db, acct, from_phone, body):
+    async def fake_process(db, acct, from_phone, body, **kwargs):
         processed.append(from_phone)
         return "Success"
 
@@ -201,3 +201,115 @@ def test_ai_reply_rate_limit_blocks_after_threshold(monkeypatch, db_session, acc
     assert second == "Rate limited."
     assert send_route.call_count == 1
     assert db_session.query(Message).filter(Message.direction == "outbound").count() == 1
+
+
+# --- Claude-outage and send retries (#38) --------------------------------------
+#
+# Same eager-mode recursion as the lock tests above: an outage re-dispatch
+# runs inline (countdown ignored), so a single top-level call plays out the
+# whole retry sequence.
+
+def _fake_llm(monkeypatch, generate_response, alerts=None):
+    class FakeLLMService:
+        pass
+
+    FakeLLMService.generate_response = staticmethod(generate_response)
+
+    async def record_alert(db, merchant, reply_identifier, customer_message):
+        alerts.append((reply_identifier, customer_message))
+
+    FakeLLMService._send_platform_alert_to_merchant = staticmethod(record_alert)
+    monkeypatch.setattr(webhook_processing, "llm_service", FakeLLMService())
+
+
+@respx.mock
+def test_llm_outage_retries_then_replies(monkeypatch, db_session, account):
+    respx.post(url__regex=MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "wamid.retry1"}]})
+    )
+    calls = []
+
+    async def flaky(**kwargs):
+        calls.append(kwargs["retry_on_outage"])
+        if len(calls) < 3:
+            raise webhook_processing.LLMUnavailable("overloaded")
+        return "Hello!"
+
+    _fake_llm(monkeypatch, flaky)
+    account_id = account.id  # the task's db.close() detaches `account`
+
+    webhook_processing.process_inbound_message.apply_async(args=[account_id, "255744440001", "hi"])
+
+    assert calls == [True, True, True]
+    outbound = db_session.query(Message).filter(Message.direction == "outbound").all()
+    assert [m.body for m in outbound] == ["Hello!"]
+    # Retries are the same message: counted against the rate limit once.
+    key = f"ai_reply:{account_id}:255744440001"
+    assert int(webhook_processing.rate_limit_module._redis_client.get(key)) == 1
+
+
+@respx.mock
+def test_llm_outage_exhausted_last_attempt_does_not_retry(monkeypatch, db_session, account):
+    respx.post(url__regex=MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "wamid.retry2"}]})
+    )
+    calls = []
+
+    async def always_down(**kwargs):
+        calls.append(kwargs["retry_on_outage"])
+        if kwargs["retry_on_outage"]:
+            raise webhook_processing.LLMUnavailable("overloaded")
+        return "outage reply"
+
+    _fake_llm(monkeypatch, always_down)
+
+    webhook_processing.process_inbound_message.apply_async(args=[account.id, "255744440002", "hi"])
+
+    # One try per countdown, then a final attempt that must not raise.
+    assert calls == [True] * len(webhook_processing.LLM_RETRY_COUNTDOWNS_SECONDS) + [False]
+    outbound = db_session.query(Message).filter(Message.direction == "outbound").all()
+    assert [m.body for m in outbound] == ["outage reply"]
+
+
+@respx.mock
+def test_transient_send_failure_is_retried(monkeypatch, db_session, account):
+    monkeypatch.setattr(webhook_processing, "SEND_RETRY_DELAYS_SECONDS", (0, 0))
+    route = respx.post(url__regex=MESSAGES_URL_RE).mock(
+        side_effect=[
+            httpx.ConnectError("boom"),
+            httpx.Response(500, json={"error": {"code": 2, "message": "Service unavailable"}}),
+            httpx.Response(200, json={"messages": [{"id": "wamid.retry3"}]}),
+        ]
+    )
+
+    async def reply(**kwargs):
+        return "Hello!"
+
+    _fake_llm(monkeypatch, reply)
+
+    result = webhook_processing.process_inbound_message(account.id, "255744440003", "hi")
+
+    assert result == "Success"
+    assert route.call_count == 3
+    outbound = db_session.query(Message).filter(Message.direction == "outbound").one()
+    assert outbound.status == "sent"
+
+
+@respx.mock
+def test_permanent_send_failure_not_retried_and_alerts_merchant(monkeypatch, db_session, account):
+    monkeypatch.setattr(webhook_processing, "SEND_RETRY_DELAYS_SECONDS", (0, 0))
+    route = respx.post(url__regex=MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(400, json={"error": {"code": 131047, "message": "Re-engagement message"}})
+    )
+    alerts = []
+
+    async def reply(**kwargs):
+        return "Hello!"
+
+    _fake_llm(monkeypatch, reply, alerts)
+
+    webhook_processing.process_inbound_message(account.id, "255744440004", "do you have size 42?")
+
+    assert route.call_count == 1
+    assert db_session.query(Message).filter(Message.direction == "outbound").one().status == "failed"
+    assert alerts == [("255744440004", "do you have size 42?")]

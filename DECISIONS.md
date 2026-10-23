@@ -14,6 +14,19 @@ Production-tier decisions only — what was chosen, what was considered and reje
 
 **Known limit:** an agreement between the real floor and the buffered floor is still accepted server-side. The buffer only controls what the model is told, not what the server allows.
 
+## Inbound reply retries: re-run the turn on Claude outage, retry only the send on Meta failure (2026-10-23, #38)
+
+**Chose:** two separate retry layers. (1) A transient Claude failure re-dispatches the whole task 3 times (15/45/60s), which is safe because `LLMUnavailable` is raised before any side effect. After that the buyer gets an outage reply and the chat is handed to the merchant. (2) A Meta send failure retries just the send, in-process, twice (1s/3s), and only for transient errors. A final send failure alerts the merchant.
+
+**Considered and rejected:**
+- *Celery `autoretry_for` on the task.* Rejected: the DM task claims `processed_at` before working (#33), so a plain retry hits "already processed" and no-ops. Under `task_always_eager` (the test suite) `self.retry()` also just raises. The existing lock-retry code already uses recursive `apply_async`, so this follows it.
+- *Releasing the DM claim (`processed_at = NULL`) before retrying.* This is the obvious way to let the retry claim again, but it reopens the exact window #33 closed: a webhook redelivery could claim the row during the 15–60s gap and both would run the LLM and `_close_deal`. Compare-and-swap on the attempt's own claim timestamp keeps the row claimed throughout.
+- *Retrying the whole turn on a send failure.* Rejected: `_close_deal` may already have created an order and pushed a Tunzaa payment on that turn. Re-running it is the double-order incident again.
+- *Longer in-process send backoff.* Rejected: the WhatsApp per-customer lock TTL is 30s, so a long sleep would let a second message for the same customer run concurrently.
+- *Raising the SDK's `max_retries` instead.* Rejected: SDK backoff caps around 8s per try and blocks a worker slot while holding the lock. A real minutes-long outage needs task-level retry.
+
+**Known limits:** a WhatsApp customer who sends another message during the retry gap gets that one answered first (the lock is free), and then the retry also replies, which can produce two replies. Every outage retry is a full extra Claude call.
+
 ## Per-product installment controls: scope, BNPL/SNPL (2026-10-15)
 
 **Chose:** two new `Product` fields — `allow_installments` (bool, default `True`) and `installment_mode` (enum `BNPL`/`SNPL`, default `BNPL`). Both per-product. `installment_mode` only has any effect when `is_subscription` is also true — it gates `_activate_subscription_if_linked` (BNPL activates on the first installment payment, matching pre-existing behavior; SNPL waits until the installment plan is fully paid off).

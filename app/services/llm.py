@@ -207,6 +207,34 @@ def _holding_reply(language: Optional[str]) -> str:
     return f"{_HOLDING_REPLIES['sw']}\n\n{_HOLDING_REPLIES['en']}"
 
 
+class LLMUnavailable(Exception):
+    """
+    A transient Claude failure (connection error, 429, 5xx) that survived
+    the SDK's own retries, raised only when the caller asked to retry
+    (retry_on_outage=True). Raised before any order, send or state change
+    for this turn, so the caller can safely re-run the whole turn (#38).
+    """
+
+
+def _is_transient_llm_error(e: Exception) -> bool:
+    if isinstance(e, anthropic.APIConnectionError):
+        return True
+    return isinstance(e, anthropic.APIStatusError) and (e.status_code == 429 or e.status_code >= 500)
+
+
+_OUTAGE_REPLIES = {
+    "sw": "Samahani, nina tatizo la kiufundi kwa sasa — mtu wa timu yetu atakujibu hapa hivi punde.",
+    "en": "Sorry, I'm having a technical problem right now — someone from our team will reply here shortly.",
+}
+
+
+def _outage_reply(language: Optional[str]) -> str:
+    """Sent once Claude retries are exhausted; the chat is handed to the merchant at the same time (#38)."""
+    if language in _OUTAGE_REPLIES:
+        return _OUTAGE_REPLIES[language]
+    return f"{_OUTAGE_REPLIES['sw']}\n\n{_OUTAGE_REPLIES['en']}"
+
+
 class LLMService:
     def __init__(self, api_key: str):
         self.client = anthropic.AsyncAnthropic(api_key=api_key) if api_key else None
@@ -802,6 +830,7 @@ Match the customer's language (Swahili or English). Keep both lines to one sente
         conversation_history: List[dict],
         account_name: str = "the shop",
         knowledge_content: Optional[str] = None,
+        retry_on_outage: bool = False,
     ) -> Optional[str]:
         """
         Generates Amara's reply to an ongoing Instagram DM conversation:
@@ -813,7 +842,10 @@ Match the customer's language (Swahili or English). Keep both lines to one sente
         [AGREEMENT_REACHED]. Falls back to [HUMAN_HANDOFF] for anything the
         model shouldn't handle itself (unreasonable customers, questions
         outside the catalog/knowledge, or an explicit request for a human).
-        Returns None if the model is unavailable (caller sends nothing).
+        Returns None if no client is configured (caller sends nothing). A
+        transient Claude failure raises LLMUnavailable when retry_on_outage
+        is set; otherwise any Claude failure hands off and returns the
+        outage reply.
         """
         if not self.client:
             return None
@@ -870,8 +902,14 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
                 block.text for block in response.content if block.type == "text"
             )
         except Exception as e:
-            logger.error(f"DM-response LLM error: {e}")
-            return None
+            if retry_on_outage and _is_transient_llm_error(e):
+                raise LLMUnavailable(str(e)) from e
+            logger.error(f"DM-response LLM error; handing off: {e}")
+            context.state = ConversationState.HUMAN_HANDOFF
+            context.handoff_at = datetime.utcnow()
+            db.commit()
+            await self._notify_merchant_of_instagram_handoff(db, account, customer, message_body)
+            return _outage_reply(None)
 
         if "[HUMAN_HANDOFF]" in response_text:
             response_text = response_text.replace("[HUMAN_HANDOFF]", "").strip()
@@ -912,7 +950,8 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
         history: List[dict] = None,
         from_phone: str = None,
         db: Session = None,
-        account: WhatsAppAccount = None
+        account: WhatsAppAccount = None,
+        retry_on_outage: bool = False,
     ) -> str:
         if not self.client:
             return "AI service is currently unavailable."
@@ -1145,17 +1184,26 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
             # temperature is deprecated/rejected for this model (confirmed
             # live against the real API — not documented ahead of time) —
             # omitted rather than guessing at a replacement parameter.
-            response = await self.client.messages.create(
-                model=self.model_id,
-                max_tokens=1024,
-                system=base_instruction,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": f"Recent Conversation:\n{chat_history_str}\n\nRespond as Amara:",
-                    }
-                ],
-            )
+            try:
+                response = await self.client.messages.create(
+                    model=self.model_id,
+                    max_tokens=1024,
+                    system=base_instruction,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": f"Recent Conversation:\n{chat_history_str}\n\nRespond as Amara:",
+                        }
+                    ],
+                )
+            except Exception as e:
+                if retry_on_outage and _is_transient_llm_error(e):
+                    raise LLMUnavailable(str(e)) from e
+                logger.error(f"LLM error; handing off: {e}")
+                await self._trigger_human_handoff(
+                    db, account, context, from_phone, message_body, is_platform_account
+                )
+                return _outage_reply(customer.language)
 
             # This model returns extended-thinking content blocks before the
             # text block non-deterministically (confirmed live — the same
@@ -1231,6 +1279,8 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
                 )
 
             return response_text
+        except LLMUnavailable:
+            raise
         except Exception as e:
             print(f"LLM Error: {e}")
             return "I'm sorry, I'm having trouble processing your request right now."

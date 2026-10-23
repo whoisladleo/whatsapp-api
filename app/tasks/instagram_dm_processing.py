@@ -7,27 +7,32 @@ from app.core.instagram_provider import InstagramProvider
 from app.crud import instagram as crud_instagram
 from app.db.models import ConversationState, InstagramAccount, InstagramCustomer, InstagramDirectMessage
 from app.db.session import SessionLocal
-from app.services.llm import llm_service
-from app.tasks.webhook_processing import _run_async
+from app.services.llm import LLMUnavailable, llm_service
+from app.tasks.webhook_processing import LLM_RETRY_COUNTDOWNS_SECONDS, _run_async, _send_with_retries
 
 logger = logging.getLogger(__name__)
 
 
 @celery_app.task
-def process_inbound_dm(account_id: str, customer_id: str, dm_row_id: str):
+def process_inbound_dm(
+    account_id: str, customer_id: str, dm_row_id: str, llm_attempt: int = 0, claimed_at: str | None = None
+):
     """
     Generates and sends Amara's reply to an inbound Instagram DM, continuing
     whatever conversation is already on file for this customer. dm_row_id is
     the just-created InstagramDirectMessage.id for the inbound message.
+    llm_attempt/claimed_at are only set on a Claude-outage retry (#38).
     """
     db = SessionLocal()
     try:
-        return _run_async(_process(db, account_id, customer_id, dm_row_id))
+        return _run_async(_process(db, account_id, customer_id, dm_row_id, llm_attempt, claimed_at))
     finally:
         db.close()
 
 
-async def _process(db, account_id: str, customer_id: str, dm_row_id: str) -> str:
+async def _process(
+    db, account_id: str, customer_id: str, dm_row_id: str, llm_attempt: int = 0, claimed_at: str | None = None
+) -> str:
     account_uuid = coerce_uuid(account_id)
     customer_uuid = coerce_uuid(customer_id)
     dm_row_uuid = coerce_uuid(dm_row_id)
@@ -43,11 +48,17 @@ async def _process(db, account_id: str, customer_id: str, dm_row_id: str) -> str
     # we won the race, correct on both SQLite tests and Postgres prod.
     # Confirmed live: without this, a single inbound message produced two
     # separate PAID orders. See #33.
-    claimed = (
-        db.query(InstagramDirectMessage)
-        .filter(InstagramDirectMessage.id == dm_row_uuid, InstagramDirectMessage.processed_at.is_(None))
-        .update({"processed_at": datetime.utcnow()})
-    )
+    # An outage retry (#38) re-claims by compare-and-swap on the exact
+    # processed_at its own earlier attempt wrote, rather than releasing the
+    # claim in between — releasing would let a webhook redelivery claim the
+    # row too and reopen the double-order race.
+    claim = db.query(InstagramDirectMessage).filter(InstagramDirectMessage.id == dm_row_uuid)
+    if claimed_at is None:
+        claim = claim.filter(InstagramDirectMessage.processed_at.is_(None))
+    else:
+        claim = claim.filter(InstagramDirectMessage.processed_at == datetime.fromisoformat(claimed_at))
+    now = datetime.utcnow()
+    claimed = claim.update({"processed_at": now})
     db.commit()
     if claimed == 0:
         return "Already processed; skipping duplicate dispatch."
@@ -78,25 +89,39 @@ async def _process(db, account_id: str, customer_id: str, dm_row_id: str) -> str
     latest = next((m for m in history_rows if m.id == dm_row_uuid), None)
     message_body = latest.body if latest else ""
 
-    reply_text = await llm_service.generate_dm_response(
-        message_body=message_body or "",
-        db=db,
-        account=account,
-        customer=customer,
-        context=context,
-        conversation_history=history,
-        account_name=account.username or "the shop",
-    )
+    try:
+        reply_text = await llm_service.generate_dm_response(
+            message_body=message_body or "",
+            db=db,
+            account=account,
+            customer=customer,
+            context=context,
+            conversation_history=history,
+            account_name=account.username or "the shop",
+            retry_on_outage=llm_attempt < len(LLM_RETRY_COUNTDOWNS_SECONDS),
+        )
+    except LLMUnavailable as e:
+        logger.warning("Claude unavailable for DM %s (attempt %s); retrying: %s", dm_row_uuid, llm_attempt, e)
+        process_inbound_dm.apply_async(
+            args=[account_id, customer_id, dm_row_id, llm_attempt + 1, now.isoformat()],
+            countdown=LLM_RETRY_COUNTDOWNS_SECONDS[llm_attempt],
+        )
+        return "Retrying: LLM unavailable."
     if not reply_text:
         logger.warning("No usable DM reply generated for customer %s.", customer.id)
         return "No reply generated."
 
     provider = InstagramProvider(account.access_token)
-    response = await provider.send_direct_message(
-        account.ig_business_id, customer.ig_scoped_id, reply_text
+    response = await _send_with_retries(
+        lambda: provider.send_direct_message(account.ig_business_id, customer.ig_scoped_id, reply_text)
     )
     if "error" in response:
         logger.error("DM send to customer %s failed: %s", customer.id, response)
+        # The customer never got this reply — the merchant has to step in (#38).
+        try:
+            await llm_service._notify_merchant_of_instagram_handoff(db, account, customer, message_body)
+        except Exception as alert_err:
+            logger.error("Failed to alert merchant of undelivered DM: %s", alert_err)
         return "Send failed."
 
     crud_instagram.create_direct_message(

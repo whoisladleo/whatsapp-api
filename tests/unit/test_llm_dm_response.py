@@ -1,5 +1,7 @@
 import json
 
+import anthropic
+
 import httpx
 import pytest
 import respx
@@ -18,7 +20,7 @@ from app.db.models import (
     User,
     WhatsAppAccount,
 )
-from app.services.llm import LLMService, _holding_reply
+from app.services.llm import LLMService, LLMUnavailable, _holding_reply, _outage_reply
 
 TOKEN_URL = "https://pay.tunzaa.co.tz/accounts/request/token"
 PAYMENT_URL = "https://pay.tunzaa.co.tz/payments/initiate-payment"
@@ -369,7 +371,7 @@ async def test_generate_dm_response_handoff_no_merchant_username_does_not_crash(
     assert not route.called
 
 
-async def test_generate_dm_response_returns_none_on_client_exception(db_session, ig_account, ig_customer, ig_context):
+async def test_generate_dm_response_client_exception_hands_off_with_outage_reply(db_session, ig_account, ig_customer, ig_context):
     async def handler(**kwargs):
         raise RuntimeError("API down")
 
@@ -379,7 +381,25 @@ async def test_generate_dm_response_returns_none_on_client_exception(db_session,
         "how much?", db=db_session, account=ig_account, customer=ig_customer, context=ig_context, conversation_history=[]
     )
 
-    assert result is None
+    # Used to return None, so the buyer got silence (#38).
+    assert result == _outage_reply(None)
+    db_session.refresh(ig_context)
+    assert ig_context.state == ConversationState.HUMAN_HANDOFF
+
+
+async def test_generate_dm_response_transient_error_raises_when_retrying(db_session, ig_account, ig_customer, ig_context):
+    async def handler(**kwargs):
+        raise anthropic.APIConnectionError(request=httpx.Request("POST", "https://api.anthropic.com"))
+
+    service = _service_with_fake_client(handler=handler)
+
+    with pytest.raises(LLMUnavailable):
+        await service.generate_dm_response(
+            "how much?", db=db_session, account=ig_account, customer=ig_customer, context=ig_context,
+            conversation_history=[], retry_on_outage=True,
+        )
+    db_session.refresh(ig_context)
+    assert ig_context.state != ConversationState.HUMAN_HANDOFF
 
 
 # --- AGREEMENT_REACHED (deal closing) -----------------------------------------

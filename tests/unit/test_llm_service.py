@@ -1,5 +1,7 @@
 import json
 
+import anthropic
+
 import httpx
 import pytest
 import respx
@@ -23,6 +25,8 @@ from app.services.llm import (
     LLMService,
     _holding_reply,
     _negotiation_floor,
+    LLMUnavailable,
+    _outage_reply,
     _parse_and_strip_agreement,
     _parse_and_strip_language,
     _parse_and_strip_quote,
@@ -808,7 +812,37 @@ async def test_generate_content_exception_returns_fallback_message(db_session, s
         account=shop_account,
     )
 
-    assert result == "I'm sorry, I'm having trouble processing your request right now."
+    # Any Claude failure that isn't being retried hands off too (#38).
+    assert result == _outage_reply(None)
+    assert db_session.query(ConversationContext).one().state == ConversationState.HUMAN_HANDOFF
+
+
+async def test_transient_error_raises_llm_unavailable_when_retrying(db_session, shop_account):
+    async def handler(**kwargs):
+        raise anthropic.APIConnectionError(request=httpx.Request("POST", "https://api.anthropic.com"))
+
+    service = _service_with_fake_client(handler=handler)
+
+    with pytest.raises(LLMUnavailable):
+        await service.generate_response(
+            message_body="hi", from_phone="255711119001", db=db_session, account=shop_account,
+            retry_on_outage=True,
+        )
+    assert db_session.query(ConversationContext).one().state != ConversationState.HUMAN_HANDOFF
+
+
+async def test_non_transient_error_hands_off_even_when_retrying(db_session, shop_account):
+    async def handler(**kwargs):
+        raise RuntimeError("bug, not an outage")
+
+    service = _service_with_fake_client(handler=handler)
+
+    result = await service.generate_response(
+        message_body="hi", from_phone="255711119002", db=db_session, account=shop_account,
+        retry_on_outage=True,
+    )
+
+    assert result == _outage_reply(None)
 
 
 # --- _parse_and_strip_agreement (pure function) -----------------------------
