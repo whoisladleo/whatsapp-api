@@ -61,6 +61,7 @@ def capture_customer_location(
 def _send_confirmation(db, account, to_phone: str) -> None:
     from app.core.provider import WhatsAppProvider
     from app.crud import message as crud_message
+    from app.services import usage
 
     body = "📍 Got your location, thanks! We'll use it for delivery."
     provider = WhatsAppProvider(account.access_token, account.phone_number_id)
@@ -69,6 +70,8 @@ def _send_confirmation(db, account, to_phone: str) -> None:
     except Exception as e:
         logger.error(f"Failed to send location confirmation: {e}")
         resp = None
+    if usage.whatsapp_send_succeeded(resp):
+        usage.record_reply(db, account.user_id, "whatsapp", account_id=account.id)
 
     crud_message.create_message(
         db,

@@ -5,6 +5,7 @@ from app.core.ids import coerce_uuid
 from app.core.instagram_provider import InstagramProvider
 from app.db.models import InstagramAccount, InstagramComment
 from app.db.session import SessionLocal
+from app.services import usage
 from app.services.llm import llm_service
 from app.tasks.webhook_processing import _run_async
 
@@ -55,6 +56,7 @@ async def _process(db, account_id: str, comment_row_id: str) -> str:
     public_response = await provider.reply_to_comment(comment.comment_id, reply["public_reply"])
     if "error" not in public_response:
         comment.public_reply_sent = True
+        usage.record_reply(db, account.user_id, "instagram_comment", instagram_account_id=account.id)
     else:
         logger.error(
             "Public reply to comment %s failed: %s", comment.comment_id, public_response
@@ -68,6 +70,7 @@ async def _process(db, account_id: str, comment_row_id: str) -> str:
     )
     if "error" not in private_response:
         comment.private_reply_sent = True
+        usage.record_reply(db, account.user_id, "instagram_comment", instagram_account_id=account.id)
     else:
         logger.error(
             "Private reply to comment %s failed: %s", comment.comment_id, private_response

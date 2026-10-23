@@ -7,6 +7,7 @@ from app.core.instagram_provider import InstagramProvider
 from app.crud import instagram as crud_instagram
 from app.db.models import ConversationState, InstagramAccount, InstagramCustomer, InstagramDirectMessage
 from app.db.session import SessionLocal
+from app.services import usage
 from app.services.llm import LLMUnavailable, llm_service
 from app.tasks.webhook_processing import LLM_RETRY_COUNTDOWNS_SECONDS, _run_async, _send_with_retries
 
@@ -132,5 +133,6 @@ async def _process(
         body=reply_text,
         ig_message_id=response.get("message_id"),
     )
+    usage.record_reply(db, account.user_id, "instagram_dm", instagram_account_id=account.id)
 
     return "Processed."

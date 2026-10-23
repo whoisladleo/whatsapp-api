@@ -66,6 +66,7 @@ def send_quote_nudge(context_id: str, account_id: str, scheduled_quote_at_iso: s
             return "Account not found."
 
         from app.core.provider import WhatsAppProvider
+        from app.services import usage
 
         product_name = context.current_product_intent or "that item"
         body = f"Still interested in the {product_name}? Happy to hold it for you if you let me know."
@@ -76,6 +77,8 @@ def send_quote_nudge(context_id: str, account_id: str, scheduled_quote_at_iso: s
         except Exception as e:
             logger.error(f"Quote nudge send failed for context {context_id}: {e}")
             resp = None
+        if usage.whatsapp_send_succeeded(resp):
+            usage.record_reply(db, account.user_id, "whatsapp", account_id=account.id)
 
         crud_message.create_message(
             db,

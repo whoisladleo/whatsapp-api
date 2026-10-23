@@ -313,3 +313,57 @@ def test_permanent_send_failure_not_retried_and_alerts_merchant(monkeypatch, db_
     assert route.call_count == 1
     assert db_session.query(Message).filter(Message.direction == "outbound").one().status == "failed"
     assert alerts == [("255744440004", "do you have size 42?")]
+
+
+# --- Reply metering (#41) ---------------------------------------------------------
+
+def _replies(db_session):
+    from app.db.models import AmaraEvent, AmaraEventKind
+
+    return db_session.query(AmaraEvent).filter_by(kind=AmaraEventKind.REPLY).all()
+
+
+@respx.mock
+def test_delivered_ai_reply_is_metered(monkeypatch, db_session, account):
+    respx.post(url__regex=MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "wamid.meter1"}]})
+    )
+
+    async def reply(**kwargs):
+        return "Hello!"
+
+    _fake_llm(monkeypatch, reply)
+    owner_id, account_id = account.user_id, account.id
+
+    webhook_processing.process_inbound_message(account_id, "255744450001", "hi")
+
+    replies = _replies(db_session)
+    assert [(r.merchant_id, r.channel, r.account_id) for r in replies] == [(owner_id, "whatsapp", account_id)]
+
+
+@respx.mock
+def test_undelivered_ai_reply_is_not_metered(monkeypatch, db_session, account):
+    monkeypatch.setattr(webhook_processing, "SEND_RETRY_DELAYS_SECONDS", (0, 0))
+    respx.post(url__regex=MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(400, json={"error": {"code": 131047, "message": "Re-engagement message"}})
+    )
+
+    async def reply(**kwargs):
+        return "Hello!"
+
+    _fake_llm(monkeypatch, reply, alerts=[])
+
+    webhook_processing.process_inbound_message(account.id, "255744450002", "hi")
+
+    assert _replies(db_session) == []
+
+
+@respx.mock
+def test_merchant_command_reply_is_not_metered(monkeypatch, db_session, account, owner):
+    respx.post(url__regex=MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "wamid.meter3"}]})
+    )
+
+    webhook_processing.process_inbound_message(account.id, owner.username, "/help")
+
+    assert _replies(db_session) == []

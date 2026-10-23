@@ -166,6 +166,18 @@ class Settings(BaseSettings):
     WHATSAPP_PAYMENT_ALERT_TEMPLATE_NAME: str = "payment_received"
     WHATSAPP_PAYMENT_ALERT_TEMPLATE_LANGUAGE: str = "en"
 
+    # Monthly Amara reply allowance per merchant (#41). Warn-only: alerts at
+    # 80% and 100% of this, Amara never stops replying. One global value
+    # for now; a per-plan limit (Amara Pro) would need a per-merchant one.
+    PLAN_REPLY_LIMIT: int = 2000
+    # Utility template for the usage alert, named variables {{account}},
+    # {{percent}}, {{total}}. Sent with platform credentials like the alerts
+    # above, to the merchant and to OPS_ALERT_PHONE (a human's personal
+    # WhatsApp — never the platform's own number, which can't message itself).
+    WHATSAPP_USAGE_ALERT_TEMPLATE_NAME: str = "usage_warning"
+    WHATSAPP_USAGE_ALERT_TEMPLATE_LANGUAGE: str = "en"
+    OPS_ALERT_PHONE: Optional[str] = None
+
     # Cloudflare R2
     R2_ACCOUNT_ID: Optional[str] = None
     R2_ACCESS_KEY_ID: Optional[str] = None

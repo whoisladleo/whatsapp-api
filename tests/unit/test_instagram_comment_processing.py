@@ -173,3 +173,29 @@ def test_private_reply_failure_does_not_affect_public_reply_flag(
     reloaded = db_session.query(InstagramComment).filter(InstagramComment.id == comment_id).first()
     assert reloaded.public_reply_sent is True
     assert reloaded.private_reply_sent is False
+
+
+def test_public_and_private_replies_are_each_metered(db_session, account, comment, fake_llm_reply, monkeypatch):
+    from app.db.models import AmaraEvent, AmaraEventKind
+
+    monkeypatch.setattr(
+        task_module, "InstagramProvider",
+        lambda access_token: _FakeProvider("ig-tok", public_response={"error": {"message": "nope"}}),
+    )
+    account_id, comment_id, merchant_id = account.id, comment.id, account.user_id
+
+    task_module.process_inbound_comment(account_id, comment_id)
+
+    # Only the private reply got through, so only it is billable (#41).
+    replies = db_session.query(AmaraEvent).filter_by(kind=AmaraEventKind.REPLY).all()
+    assert [(r.merchant_id, r.channel) for r in replies] == [(merchant_id, "instagram_comment")]
+
+
+def test_both_comment_replies_metered_when_both_succeed(db_session, account, comment, fake_llm_reply, monkeypatch):
+    from app.db.models import AmaraEvent, AmaraEventKind
+
+    monkeypatch.setattr(task_module, "InstagramProvider", lambda access_token: _FakeProvider("ig-tok"))
+
+    task_module.process_inbound_comment(account.id, comment.id)
+
+    assert db_session.query(AmaraEvent).filter_by(kind=AmaraEventKind.REPLY).count() == 2

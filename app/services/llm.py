@@ -25,7 +25,9 @@ from app.db.models import (
     WhatsAppAccount,
     Message,
     User,
+    AmaraEventKind,
 )
+from app.services import usage
 
 logger = logging.getLogger(__name__)
 
@@ -458,6 +460,7 @@ class LLMService:
         context.state = ConversationState.HUMAN_HANDOFF
         context.handoff_at = datetime.utcnow()
         db.commit()
+        usage.record_event(db, account.user_id, AmaraEventKind.HANDOFF, channel="whatsapp", account_id=account.id)
 
         if is_platform_account or not account.owner:
             return
@@ -474,6 +477,31 @@ class LLMService:
             )
         except Exception as sched_err:
             logger.error(f"Failed to schedule handoff reminder: {sched_err}")
+
+    async def _hand_off_instagram(
+        self, db: Session, account: InstagramAccount, customer: InstagramCustomer,
+        context: InstagramConversationContext, customer_message: str,
+    ) -> None:
+        context.state = ConversationState.HUMAN_HANDOFF
+        context.handoff_at = datetime.utcnow()
+        db.commit()
+        usage.record_event(
+            db, account.user_id, AmaraEventKind.HANDOFF, channel="instagram_dm", instagram_account_id=account.id
+        )
+        await self._notify_merchant_of_instagram_handoff(db, account, customer, customer_message)
+
+    def _record_quote(self, db: Session, merchant_id, quote: dict, channel: str, **account_ids) -> None:
+        """Ledger entry for GET /stats' products discussed (#41). Unknown products aren't recorded."""
+        product = (
+            db.query(Product)
+            .filter(Product.merchant_id == merchant_id, Product.name.ilike(quote["product_name"]))
+            .first()
+        )
+        if product:
+            usage.record_event(
+                db, merchant_id, AmaraEventKind.QUOTE, channel=channel,
+                product_name=product.name, amount=quote["price"], **account_ids,
+            )
 
     async def _notify_merchant_of_instagram_handoff(
         self, db: Session, ig_account: InstagramAccount, customer: InstagramCustomer, customer_message: str
@@ -652,6 +680,10 @@ class LLMService:
         context.pending_quote_at = datetime.utcnow()
         context.quote_nudge_count = 0
         db.commit()
+        usage.record_event(
+            db, account.user_id, AmaraEventKind.QUOTE, channel="whatsapp",
+            account_id=account.id, product_name=product.name, amount=quote["price"],
+        )
 
         if context.failed_cycles >= FAILED_CYCLES_HANDOFF_THRESHOLD:
             await self._trigger_human_handoff(
@@ -882,6 +914,7 @@ RULES:
 5. Human Handoff: if the customer is unreasonable, has complex questions you can't answer from the catalog/knowledge above, or explicitly asks for a human, include the exact marker [HUMAN_HANDOFF]. Don't include this for a normal close — that's handled by AGREEMENT_REACHED instead.
 6. Keep replies SHORT and natural, like a real Instagram DM — usually 1-3 sentences. Match the customer's language (Swahili or English).
 7. Currency: all prices are in Tanzanian Shillings (TZS) — always state them exactly as given, including the TZS label. Never say "$", "USD", "dollars", or imply any other currency, and never convert the number into another currency.
+8. Quoting: whenever you state a specific price for a product during negotiation but haven't closed the deal yet, end your response with the marker [QUOTE: product=<product name> price=<price>] (e.g. [QUOTE: product=Shoes price=45000]). Don't include this once you've emitted [AGREEMENT_REACHED] for the same deal.
 
 Reply with ONLY the message text (plus whichever marker applies, if any) — no other formatting.
 """
@@ -905,20 +938,18 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
             if retry_on_outage and _is_transient_llm_error(e):
                 raise LLMUnavailable(str(e)) from e
             logger.error(f"DM-response LLM error; handing off: {e}")
-            context.state = ConversationState.HUMAN_HANDOFF
-            context.handoff_at = datetime.utcnow()
-            db.commit()
-            await self._notify_merchant_of_instagram_handoff(db, account, customer, message_body)
+            await self._hand_off_instagram(db, account, customer, context, message_body)
             return _outage_reply(None)
+
+        # Stripped up front so the marker can never leak through the early
+        # handoff return below.
+        response_text, quote = _parse_and_strip_quote(response_text)
 
         if "[HUMAN_HANDOFF]" in response_text:
             response_text = response_text.replace("[HUMAN_HANDOFF]", "").strip()
-            context.state = ConversationState.HUMAN_HANDOFF
-            context.handoff_at = datetime.utcnow()
-            db.commit()
             if not response_text:
                 response_text = "I am transferring you to a member of our team who can help you further. Please hold."
-            await self._notify_merchant_of_instagram_handoff(db, account, customer, message_body)
+            await self._hand_off_instagram(db, account, customer, context, message_body)
             return response_text
 
         response_text, agreement = _parse_and_strip_agreement(response_text)
@@ -931,13 +962,12 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
                 (logger.warning if isinstance(deal_err, DealRejected) else logger.error)(
                     f"Instagram deal not closed; handing off: {deal_err}"
                 )
-                context.state = ConversationState.HUMAN_HANDOFF
-                context.handoff_at = datetime.utcnow()
-                db.commit()
-                await self._notify_merchant_of_instagram_handoff(db, account, customer, message_body)
+                await self._hand_off_instagram(db, account, customer, context, message_body)
                 return _holding_reply(None)
             if note:
                 response_text = f"{response_text}\n\n{note}".strip()
+        elif quote:
+            self._record_quote(db, account.user_id, quote, "instagram_dm", instagram_account_id=account.id)
 
         return response_text
 

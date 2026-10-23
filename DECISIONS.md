@@ -2,6 +2,20 @@
 
 Production-tier decisions only — what was chosen, what was considered and rejected, and why. Project-specific prior-art/incident history lives in CLAUDE.md instead; this file is for the choice itself, not the surrounding system detail.
 
+## Reply metering: append-only event ledger, all automated buyer sends, billing-cycle periods, warn-only (2026-10-23, #41)
+
+**Chose:** one `amara_events` table recording each billable send (`REPLY`) plus `QUOTE`, `HANDOFF`, `PAYMENT` and `USAGE_WARNING`. Billing reads `REPLY` and stats read everything. Billable = every automated send to a buyer that Meta accepted (your call over "conversational replies only"). The period is the merchant's own Taskflow billing cycle, with the EAT calendar month as fallback. At 80% and 100% of the limit, the merchant and ops get one template alert each; Amara never stops.
+
+**Considered and rejected:**
+- *Counting existing `Message`/`InstagramDirectMessage` outbound rows.* Rejected: about 15 writers with no sender marker, so merchant manual replies, alerts and nudges are indistinguishable. Comment replies aren't rows at all. Not auditable enough to bill on.
+- *A per-merchant monthly counter column (or Redis counter).* Cheaper to read, but not auditable (you can't show a merchant *which* replies they were billed for), has to be reset on a schedule (there's no Celery Beat), and can't answer stats questions. A row per event at this volume (about 2,000/merchant/month) is trivial for Postgres with the composite index.
+- *FKs from events to accounts/products.* Rejected: WhatsApp accounts and products are hard-deleted, so an FK would either block those deletes or cascade away billing history. Ids and the product name are stored as plain values.
+- *Pausing Amara at 100%.* Rejected: it breaks the "every DM gets an answer" promise on the site. Overage is a sales conversation (Pro), not a technical cut-off.
+- *Recording the HANDOFF count from `ConversationContext.handoff_at`.* Rejected: that context is per buyer globally, not per merchant, so it can't be scoped. The latest-only timestamp also loses repeat handoffs.
+- *A `quote → paid` conversion rate.* Rejected for v1: QUOTE events count every counter-offer turn, not distinct negotiations, so the ratio would be misleading. Shipped `conversion_rate = paid orders ÷ buyers who messaged` instead.
+
+**Known limits:** two replies at the exact same instant can both cross a threshold and send a duplicate warning (harmless; a `shortcut:` comment in `usage.py`). There's no history before this shipped. The limit is one global setting, so Amara Pro needs a per-merchant limit. "Orders paid" means orders *created* in the period that are now paid, while "TZS collected" is cash received in the period (so a payment for last month's order counts in TZS but not in orders paid).
+
 ## Negotiation floor: buffered prompt floor + holding reply on rejection (2026-10-23, #37)
 
 **Chose:** the prompt shows `min(max_price, ceil(min_price × 1.10))` as the lowest price Amara may offer. The real `min_price` is never in the prompt and stays the server-side hard limit in `_close_deal`/`_close_instagram_deal`. Any failure there replaces the model's reply with a fixed holding line and hands off to the merchant.

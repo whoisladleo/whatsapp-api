@@ -6,8 +6,10 @@ from app.core.config import settings
 from app.core.security import verify_tunzaa_signature
 from app.core.provider import WhatsAppProvider
 from app.crud import message as crud_message
+from app.services import usage
 from app.db.session import get_db
 from app.db.models import (
+    AmaraEventKind,
     Installment,
     InstallmentStatus,
     NumberSubscription,
@@ -153,6 +155,7 @@ async def handle_tunzaa_webhook(
                 _mark_single_installment_paid(db, order, installment_id)
 
         db.commit()
+        _record_payment_event(db, order, _parse_float(data.get("amount")))
 
         # Stock was already decremented at reservation time (order creation
         # in app/services/llm.py) — nothing further to do there. Just
@@ -283,6 +286,23 @@ def _fail_subscription_if_linked(db: Session, order: Order) -> None:
     )
     if subscription and subscription.status == ProductSubscriptionStatus.PENDING_PAYMENT:
         product_subscription.mark_first_payment_failed(db, subscription)
+
+
+def _record_payment_event(db: Session, order: Order, amount: Optional[float]) -> None:
+    """
+    TZS collected, for GET /stats (#41). Runs after both idempotency guards
+    above, so a Tunzaa retry can't double-count. Falls back to the agreed
+    price only for a one-off full payment, where that's the whole amount.
+    """
+    merchant = _merchant_for_order(order)
+    if amount is None and not order.tunzaa_plan_id:
+        amount = order.agreed_price
+    usage.record_event(
+        db, merchant.id if merchant else None, AmaraEventKind.PAYMENT,
+        channel="whatsapp" if order.account_id else "instagram_dm",
+        account_id=order.account_id, instagram_account_id=order.instagram_account_id,
+        product_name=order.product.name if order.product else None, amount=amount,
+    )
 
 
 def _merchant_for_order(order: Order):
@@ -510,6 +530,8 @@ async def _notify_customer_whatsapp(db: Session, order: Order, kind: str) -> Non
     except Exception as e:
         logger.error(f"Failed to send Tunzaa payment notification to customer: {e}")
         resp = None
+    if usage.whatsapp_send_succeeded(resp):
+        usage.record_reply(db, account.user_id, "whatsapp", account_id=account.id)
 
     crud_message.create_message(
         db,
@@ -555,3 +577,4 @@ async def _notify_customer_instagram(db: Session, order: Order, kind: str) -> No
         body=body,
         ig_message_id=resp.get("message_id"),
     )
+    usage.record_reply(db, account.user_id, "instagram_dm", instagram_account_id=account.id)
