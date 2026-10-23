@@ -6,6 +6,7 @@ import httpx
 import pytest
 import respx
 
+from app.core.config import settings
 from app.db.models import (
     ConversationContext,
     ConversationState,
@@ -483,6 +484,10 @@ async def test_platform_account_subsequent_message_uses_assistance_rules(db_sess
     assert "*no commission*" in instruction
     assert "Zero Upfront" not in instruction
     assert "auto-deducted" not in instruction
+    # The old whoisladleo.dev dashboard host now answers 503; the link comes
+    # from settings so a domain move can't strand it again.
+    assert f"{settings.DASHBOARD_URL}/" in instruction
+    assert "whoisladleo.dev" not in instruction
 
 
 async def test_knowledge_content_and_system_prompt_included(db_session, shop_account):
