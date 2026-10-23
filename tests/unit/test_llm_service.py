@@ -477,6 +477,12 @@ async def test_platform_account_subsequent_message_uses_assistance_rules(db_sess
     # quoting this exact price as "$100,000" to a real prospect.
     assert "Tanzanian Shillings" in instruction
     assert '"$"' in instruction
+    # Regression (#45): the pitch used to promise "zero upfront, auto-deducted
+    # from sales", contradicting the site and the actual billing (a flat
+    # monthly payment request, no commission).
+    assert "*no commission*" in instruction
+    assert "Zero Upfront" not in instruction
+    assert "auto-deducted" not in instruction
 
 
 async def test_knowledge_content_and_system_prompt_included(db_session, shop_account):
