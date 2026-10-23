@@ -18,7 +18,7 @@ from app.db.models import (
     User,
     WhatsAppAccount,
 )
-from app.services.llm import LLMService
+from app.services.llm import LLMService, _holding_reply
 
 TOKEN_URL = "https://pay.tunzaa.co.tz/accounts/request/token"
 PAYMENT_URL = "https://pay.tunzaa.co.tz/payments/initiate-payment"
@@ -542,6 +542,10 @@ async def test_agreement_price_below_min_ignored(db_session, ig_account, ig_cust
 
     assert "AGREEMENT_REACHED" not in result
     assert db_session.query(Order).count() == 0
+    # The model's "Deal!" must not stand with no order behind it (#37).
+    assert result == _holding_reply(None)
+    db_session.refresh(ig_context)
+    assert ig_context.state == ConversationState.HUMAN_HANDOFF
 
 
 async def test_agreement_unknown_product_ignored(db_session, ig_account, ig_customer, ig_context, shoes):
@@ -573,7 +577,7 @@ async def test_agreement_out_of_stock_ignored(db_session, ig_account, ig_custome
     assert db_session.query(Order).count() == 0
 
 
-async def test_agreement_close_deal_exception_does_not_lose_reply(db_session, ig_account, ig_customer, ig_context, shoes, monkeypatch):
+async def test_agreement_close_deal_exception_hands_off_with_holding_reply(db_session, ig_account, ig_customer, ig_context, shoes, monkeypatch):
     service = _service_with_fake_client(
         reply_text="Deal! [AGREEMENT_REACHED: product=Shoes price=45000 payment=full phone=255711130094]"
     )
@@ -587,4 +591,19 @@ async def test_agreement_close_deal_exception_does_not_lose_reply(db_session, ig
         "sure", db=db_session, account=ig_account, customer=ig_customer, context=ig_context, conversation_history=[]
     )
 
-    assert result == "Deal!"
+    assert result == _holding_reply(None)
+    db_session.refresh(ig_context)
+    assert ig_context.state == ConversationState.HUMAN_HANDOFF
+
+
+async def test_dm_catalog_never_exposes_real_floor(db_session, ig_account, ig_customer, ig_context, shoes):
+    captured = {}
+    service = _service_with_fake_client(captured=captured)
+
+    await service.generate_dm_response(
+        "last price?", db=db_session, account=ig_account, customer=ig_customer, context=ig_context, conversation_history=[]
+    )
+
+    assert "Lowest Price You May Offer TZS 38,500" in captured["system"]
+    assert "35,000" not in captured["system"]
+    assert "SECRET FLOOR" not in captured["system"]

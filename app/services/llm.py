@@ -1,5 +1,6 @@
 import anthropic
 import logging
+import math
 import os
 import re
 import uuid
@@ -173,6 +174,39 @@ def _parse_and_strip_agreement(text: str):
         "phone": match.group("phone"),
     }
 
+# The model only ever sees a floor 10% above the real min_price, so whatever
+# it leaks or concedes in free text is still above what the merchant
+# approved. _close_deal/_close_instagram_deal still enforce the real
+# min_price as the hard guarantee (#37).
+NEGOTIATION_FLOOR_BUFFER = 1.10
+
+
+def _negotiation_floor(product: Product) -> float:
+    return min(product.max_price, math.ceil(product.min_price * NEGOTIATION_FLOOR_BUFFER))
+
+
+class DealRejected(Exception):
+    """An AGREEMENT_REACHED marker failed server-side validation; no order was created."""
+
+
+_HOLDING_REPLIES = {
+    "sw": "Asante! Naomba nithibitishe hili na duka kwanza — mtu wa timu yetu atakujibu hapa hivi punde.",
+    "en": "Thanks! Let me confirm this with the shop first — someone from our team will reply here shortly.",
+}
+
+
+def _holding_reply(language: Optional[str]) -> str:
+    """
+    Replaces Amara's reply when a deal she just agreed to can't be closed —
+    otherwise the buyer has been told a price and nothing follows (#37).
+    Both languages when the customer's language isn't known (Instagram
+    never classifies it).
+    """
+    if language in _HOLDING_REPLIES:
+        return _HOLDING_REPLIES[language]
+    return f"{_HOLDING_REPLIES['sw']}\n\n{_HOLDING_REPLIES['en']}"
+
+
 class LLMService:
     def __init__(self, api_key: str):
         self.client = anthropic.AsyncAnthropic(api_key=api_key) if api_key else None
@@ -201,10 +235,10 @@ class LLMService:
         "SECRET FLOOR" instruction alone doesn't stop a prompt-injected
         model from claiming an out-of-band price), reserves stock, creates
         the Order, and dispatches the real Tunzaa payment. Returns a short
-        note to append to the customer-facing reply, or None if nothing
-        happened (invalid agreement — the model's own reply still goes out
-        as-is; this is expected to be rare/adversarial-only since the model
-        is instructed to stay within the catalog's own bounds).
+        note to append to the customer-facing reply. Raises DealRejected for
+        an invalid agreement — the caller replaces the model's reply with a
+        holding line and hands off, since the buyer was just told a deal
+        was agreed (#37).
         """
         product = (
             db.query(Product)
@@ -213,17 +247,14 @@ class LLMService:
         )
         price = agreement["price"]
         if not product:
-            logger.warning(f"AGREEMENT_REACHED for unknown product '{agreement['product_name']}'; ignoring.")
-            return None
+            raise DealRejected(f"AGREEMENT_REACHED for unknown product '{agreement['product_name']}'")
         if not (product.min_price <= price <= product.max_price):
-            logger.warning(
+            raise DealRejected(
                 f"AGREEMENT_REACHED price {price} outside [{product.min_price}, {product.max_price}] "
-                f"for '{product.name}'; ignoring (possible prompt injection)."
+                f"for '{product.name}' (possible prompt injection)"
             )
-            return None
         if product.quantity < 1:
-            logger.warning(f"AGREEMENT_REACHED for '{product.name}' but it's out of stock; ignoring.")
-            return None
+            raise DealRejected(f"AGREEMENT_REACHED for '{product.name}' but it's out of stock")
 
         payment_type = (
             PaymentType.INSTALLMENT if agreement["payment_type"] == "installment" else PaymentType.FULL
@@ -711,22 +742,18 @@ Match the customer's language (Swahili or English). Keep both lines to one sente
         )
         price = agreement["price"]
         if not product:
-            logger.warning(f"Instagram AGREEMENT_REACHED for unknown product '{agreement['product_name']}'; ignoring.")
-            return None
+            raise DealRejected(f"Instagram AGREEMENT_REACHED for unknown product '{agreement['product_name']}'")
         if not (product.min_price <= price <= product.max_price):
-            logger.warning(
+            raise DealRejected(
                 f"Instagram AGREEMENT_REACHED price {price} outside [{product.min_price}, {product.max_price}] "
-                f"for '{product.name}'; ignoring (possible prompt injection)."
+                f"for '{product.name}' (possible prompt injection)"
             )
-            return None
         if product.quantity < 1:
-            logger.warning(f"Instagram AGREEMENT_REACHED for '{product.name}' but it's out of stock; ignoring.")
-            return None
+            raise DealRejected(f"Instagram AGREEMENT_REACHED for '{product.name}' but it's out of stock")
 
         phone = agreement.get("phone")
         if not phone:
-            logger.warning("Instagram AGREEMENT_REACHED with no phone number; ignoring.")
-            return None
+            raise DealRejected("Instagram AGREEMENT_REACHED with no phone number")
         normalized_phone = normalize_phone(phone)
 
         customer = db.query(Customer).filter(Customer.phone_number == normalized_phone).first()
@@ -798,7 +825,7 @@ Match the customer's language (Swahili or English). Keep both lines to one sente
             catalog_str = "Available Products:\n"
             for p in products:
                 installments_note = "" if p.allow_installments else " (full payment only — installments not offered)"
-                catalog_str += f"- {p.name}: Max Price TZS {p.max_price:,.0f}, Min Price (SECRET FLOOR) TZS {p.min_price:,.0f}, Stock: {p.quantity}{installments_note}\n"
+                catalog_str += f"- {p.name}: Max Price TZS {p.max_price:,.0f}, Lowest Price You May Offer TZS {_negotiation_floor(p):,.0f}, Stock: {p.quantity}{installments_note}\n"
                 if p.description:
                     catalog_str += f"  {p.description}\n"
 
@@ -817,7 +844,7 @@ Match the customer's language (Swahili or English). Keep both lines to one sente
         instruction += """
 RULES:
 1. Be helpful and friendly. Answer questions about products, pricing, and availability using only the catalog/knowledge above — never invent a product, price, stock level, or feature/detail that isn't there.
-2. Negotiation: use the catalog's max and min prices to negotiate. Never state or agree to a price below the minimum.
+2. Negotiation: negotiate between the catalog's max price and its lowest price you may offer. Never state or agree to a price below that lowest price.
 3. Closing: once the customer has clearly agreed on a specific product and price, ask whether they'd like to pay in full or in installments — unless the catalog marks that product "full payment only", in which case don't offer installments at all; if the customer asks for installments on such a product, tell them this one is full-payment only. Instagram doesn't give us their phone number automatically, so if you don't already have it from earlier in this conversation, ask for it too — explain it's needed to send the mobile-money payment request. Once you have a specific agreed price, a payment method choice, AND a phone number, confirm the deal and end your response with the exact marker [AGREEMENT_REACHED: product=<product name> price=<agreed price> payment=<full|installment> phone=<phone number>] (e.g. [AGREEMENT_REACHED: product=Shoes price=45000 payment=full phone=255700000000]). Only include this marker once all four are explicit — never guess or assume any of them.
 4. Payment: describe it accurately — a payment request gets sent directly to the given phone number for them to approve, not a menu of payment apps to choose from. Don't name specific mobile money providers.
 5. Human Handoff: if the customer is unreasonable, has complex questions you can't answer from the catalog/knowledge above, or explicitly asks for a human, include the exact marker [HUMAN_HANDOFF]. Don't include this for a normal close — that's handled by AGREEMENT_REACHED instead.
@@ -861,8 +888,16 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
             try:
                 note = await self._close_instagram_deal(db, account, customer, agreement)
             except Exception as deal_err:
-                logger.error(f"Instagram order/payment completion failed: {deal_err}")
-                note = None
+                # Amara already told the buyer it's a deal — don't let that
+                # stand with nothing following (#37).
+                (logger.warning if isinstance(deal_err, DealRejected) else logger.error)(
+                    f"Instagram deal not closed; handing off: {deal_err}"
+                )
+                context.state = ConversationState.HUMAN_HANDOFF
+                context.handoff_at = datetime.utcnow()
+                db.commit()
+                await self._notify_merchant_of_instagram_handoff(db, account, customer, message_body)
+                return _holding_reply(None)
             if note:
                 response_text = f"{response_text}\n\n{note}".strip()
 
@@ -953,7 +988,7 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
             catalog_str = "Available Products:\n"
             for p in products:
                 installments_note = "" if p.allow_installments else " (full payment only — installments not offered)"
-                catalog_str += f"- {p.name}: Max Price TZS {p.max_price:,.0f}, Min Price (SECRET FLOOR) TZS {p.min_price:,.0f}, Stock: {p.quantity}{installments_note}\n"
+                catalog_str += f"- {p.name}: Max Price TZS {p.max_price:,.0f}, Lowest Price You May Offer TZS {_negotiation_floor(p):,.0f}, Stock: {p.quantity}{installments_note}\n"
                 if p.description:
                     catalog_str += f"  {p.description}\n"
 
@@ -1062,7 +1097,7 @@ VOICE:
 
 RULES:
 1. Selling: Be helpful and persuasive. Try to close the sale. Only describe a product using what's actually in the catalog/knowledge above (name, price, stock, description) — never invent features, specs, or details that aren't there, even ones that sound plausible for a product with that name.
-2. Pricing & Negotiation: Use the provided catalog max and min prices to negotiate. Never sell below the minimum price.
+2. Pricing & Negotiation: Negotiate between the catalog's max price and its lowest price you may offer. Never state or agree to a price below that lowest price.
 3. Don't just answer and go quiet — push toward a confirmed order. Once the customer has clearly agreed to buy a specific product at a specific price, confirm it back naturally (e.g. "Just to confirm: [item] at [price], sound right?"), ask whether they'd like to pay in full or in installments — unless the catalog marks that product "full payment only", in which case don't offer installments at all; if the customer asks for installments on such a product, tell them this one is full-payment only — then ask if they'd like pickup or delivery. Once you have both a specific agreed price AND a payment method choice, confirm the deal and end your response with the exact marker [AGREEMENT_REACHED: product=<product name> price=<agreed price> payment=<full|installment>] (e.g. [AGREEMENT_REACHED: product=Shoes price=45000 payment=full]). Only include this marker once both are explicit — never guess or assume either.
 4. Payment: describe it accurately — a payment request gets sent directly to the customer's phone for them to approve, not a menu of payment apps to choose from. Don't name specific mobile money providers.
 5. Delivery: if they want delivery, ask where and roughly when. After the order is confirmed you'll separately ask them to share their exact location via WhatsApp's location-sharing feature — you don't need to collect a written address yourself. Only quote a delivery cost or timeframe if it's actually in your knowledge/instructions below; otherwise say the shop will confirm it.
@@ -1173,7 +1208,15 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
                             db, account, customer, normalized_from_phone, agreement, context
                         )
                     except Exception as deal_err:
-                        logger.error(f"Order/payment completion failed: {deal_err}")
+                        # Amara already told the buyer it's a deal — don't
+                        # let that stand with nothing following (#37).
+                        (logger.warning if isinstance(deal_err, DealRejected) else logger.error)(
+                            f"Deal not closed; handing off: {deal_err}"
+                        )
+                        response_text = _holding_reply(customer.language)
+                        await self._trigger_human_handoff(
+                            db, account, context, from_phone, message_body, is_platform_account
+                        )
                         note = None
                     if note:
                         response_text = f"{response_text}\n\n{note}".strip()

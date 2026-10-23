@@ -21,6 +21,8 @@ from app.db.models import (
 )
 from app.services.llm import (
     LLMService,
+    _holding_reply,
+    _negotiation_floor,
     _parse_and_strip_agreement,
     _parse_and_strip_language,
     _parse_and_strip_quote,
@@ -1104,6 +1106,9 @@ async def test_agreement_price_below_min_ignored(db_session, shop_account, shoes
     assert db_session.query(Order).count() == 0
     db_session.refresh(shoes)
     assert shoes.quantity == 3  # untouched
+    # The model's "Deal!" must not stand with no order behind it (#37).
+    assert result == _holding_reply(None)
+    assert db_session.query(ConversationContext).one().state == ConversationState.HUMAN_HANDOFF
 
 
 async def test_agreement_unknown_product_ignored(db_session, shop_account, shoes):
@@ -1200,7 +1205,7 @@ async def test_agreement_tunzaa_dispatch_failure_releases_reservation(db_session
     assert shoes.quantity == 3  # decremented then released back
 
 
-async def test_agreement_close_deal_exception_does_not_lose_reply(db_session, shop_account, shoes, monkeypatch):
+async def test_agreement_close_deal_exception_hands_off_with_holding_reply(db_session, shop_account, shoes, monkeypatch):
     async def handler(**kwargs):
         return _FakeResponse(
             "Deal! [AGREEMENT_REACHED: product=Shoes price=45000 payment=full]"
@@ -1220,9 +1225,10 @@ async def test_agreement_close_deal_exception_does_not_lose_reply(db_session, sh
         account=shop_account,
     )
 
-    # The valid AI reply survives even though the order-completion side
-    # effect blew up — it's not replaced by the generic Claude-error fallback.
-    assert result == "Deal!"
+    # Not the generic Claude-error fallback, and not the model's "Deal!"
+    # either — nothing follows it, so a human takes over (#37).
+    assert result == _holding_reply(None)
+    assert db_session.query(ConversationContext).one().state == ConversationState.HUMAN_HANDOFF
     assert db_session.query(Order).count() == 0
 
 
@@ -1578,3 +1584,28 @@ async def test_quote_schedule_failure_does_not_break_reply(db_session, shop_acco
     context = db_session.query(ConversationContext).filter(ConversationContext.customer_id == customer.id).first()
     # State was still recorded even though scheduling the nudge failed.
     assert context.pending_quote_price == 45000.0
+
+
+def test_negotiation_floor_is_ten_percent_above_min_capped_at_max():
+    assert _negotiation_floor(Product(min_price=40000, max_price=50000)) == 44000
+    assert _negotiation_floor(Product(min_price=100000, max_price=100000)) == 100000
+    assert _negotiation_floor(Product(min_price=48000, max_price=50000)) == 50000
+
+
+def test_holding_reply_matches_known_language_else_both():
+    assert _holding_reply("sw").startswith("Asante")
+    assert _holding_reply("en").startswith("Thanks")
+    assert "Asante" in _holding_reply(None) and "Thanks" in _holding_reply(None)
+
+
+async def test_catalog_never_exposes_real_floor(db_session, shop_account, shoes):
+    captured = {}
+    service = _service_with_fake_client(captured=captured)
+
+    await service.generate_response(
+        message_body="bei ya mwisho?", from_phone="255711139001", db=db_session, account=shop_account,
+    )
+
+    assert "Lowest Price You May Offer TZS 44,000" in captured["system"]
+    assert "40,000" not in captured["system"]
+    assert "SECRET FLOOR" not in captured["system"]
