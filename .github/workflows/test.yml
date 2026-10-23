@@ -27,3 +27,40 @@ jobs:
 
       - name: Run tests
         run: pytest -q
+
+  migrations:
+    # pytest builds its schema with create_all and never runs a migration,
+    # so a migration chain that can't build an empty database (#43) would
+    # otherwise only surface on a brand-new environment.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      SQLALCHEMY_DATABASE_URI: postgresql://postgres:postgres@localhost:5432/postgres
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Upgrade an empty database to head
+        run: alembic upgrade head
+
+      - name: Round-trip the newest migration
+        run: alembic downgrade -1 && alembic upgrade head
