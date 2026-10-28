@@ -170,8 +170,12 @@ async def handle_tunzaa_webhook(
         order.status = OrderStatus.FAILED
         if transaction_id:
             order.tunzaa_transaction_id = transaction_id
-        _release_reservation(db, order)
+        restored_product_id = _release_reservation(db, order)
         db.commit()
+        if restored_product_id:
+            # The release may flip the catalog's availability back to in stock.
+            from app.tasks.catalog_sync import dispatch_catalog_sync
+            dispatch_catalog_sync(restored_product_id, "upsert")
 
         await _notify_customer(db, order, "payment_failed")
         _fail_subscription_if_linked(db, order)
@@ -477,13 +481,18 @@ def _parse_float(value) -> Optional[float]:
         return None
 
 
-def _release_reservation(db: Session, order: Order) -> None:
-    """Restores stock reserved at order-creation time for a failed/cancelled order."""
+def _release_reservation(db: Session, order: Order) -> Optional[uuid.UUID]:
+    """Restores stock reserved at order-creation time for a failed/cancelled order.
+
+    Returns the restored product's id, or None when nothing was restored.
+    """
     if not order.product_id:
-        return
+        return None
     product = db.query(Product).filter(Product.id == order.product_id).first()
     if product:
         product.quantity += order.quantity or 1
+        return product.id
+    return None
 
 
 def _payment_notification_body(kind: str) -> str:

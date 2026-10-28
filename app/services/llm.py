@@ -225,6 +225,12 @@ def _try_claim_stock(db: Session, product: Product) -> bool:
     if claimed == 0:
         return False
     db.refresh(product)
+    if (product.quantity or 0) < 1:
+        # The claim just took the last unit, so the catalog's availability
+        # flipped to out of stock — sync it. Non-zero claims change no
+        # catalog field (quantity itself is never sent), so they sync nothing.
+        from app.tasks.catalog_sync import dispatch_catalog_sync
+        dispatch_catalog_sync(product.id, "upsert")
     return True
 
 
@@ -561,6 +567,10 @@ class LLMService:
             product.quantity += order.quantity or 1
             order.status = OrderStatus.CANCELLED
             db.commit()
+            # The release may flip availability back to in stock (including
+            # undoing the out-of-stock sync the claim above queued).
+            from app.tasks.catalog_sync import dispatch_catalog_sync
+            dispatch_catalog_sync(product.id, "upsert")
             return "Something went wrong setting up your payment — please try again in a moment."
 
     def _schedule_reminders(self, order_id: uuid.UUID) -> None:

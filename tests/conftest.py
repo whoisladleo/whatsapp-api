@@ -67,6 +67,10 @@ def _no_real_external_credentials(monkeypatch):
     # Twilio client back on top rather than ever touching the real API.
     monkeypatch.setattr(settings, "TWILIO_ACCOUNT_SID", None)
     monkeypatch.setattr(settings, "TWILIO_AUTH_TOKEN", None)
+    # Same for the Meta catalog: product-write hooks dispatch sync_catalog_item
+    # (eager in tests), which must silently no-op rather than hit Meta.
+    monkeypatch.setattr(settings, "CATALOG_ID", None)
+    monkeypatch.setattr(settings, "CATALOG_ACCESS_TOKEN", None)
 
 
 @pytest.fixture(autouse=True)

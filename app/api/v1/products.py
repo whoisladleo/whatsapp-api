@@ -175,5 +175,9 @@ def upload_product_image(
     db.add(db_product)
     db.commit()
     db.refresh(db_product)
-    
+
+    # A first image can make a previously unsyncable product syncable.
+    from app.tasks.catalog_sync import dispatch_catalog_sync
+    dispatch_catalog_sync(db_product.id, "upsert")
+
     return db_product
