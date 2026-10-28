@@ -9,10 +9,10 @@ import shutil
 import uuid
 from app.db.session import get_db
 from app.db.models import User
-from app.schemas.product import ProductCreate, ProductUpdate, ProductResponse
+from app.schemas.product import ProductCreate, ProductUpdate, ProductStockUpdate, ProductResponse
 from app.crud.product import (
     create_product, get_product_by_id, get_products_by_merchant,
-    update_product, delete_product, bulk_upsert_products
+    update_product, update_product_stock, delete_product, bulk_upsert_products
 )
 from app.api.deps import get_current_user
 
@@ -45,6 +45,30 @@ def update_existing_product(
         raise HTTPException(status_code=404, detail="Product not found")
         
     return update_product(db=db, db_product=db_product, product_in=product_in)
+
+@router.patch("/{product_id}/stock", response_model=ProductResponse)
+def patch_product_stock(
+    product_id: uuid.UUID,
+    stock_in: ProductStockUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    # Request-shape error, so it fires before the 404 lookup — same as the
+    # automatic 422 pydantic raises for a negative quantity.
+    if stock_in.quantity is None and stock_in.is_active is None:
+        raise HTTPException(
+            status_code=422,
+            detail="At least one of quantity or is_active must be provided"
+        )
+
+    db_product = get_product_by_id(db=db, product_id=product_id, merchant_id=current_user.id)
+    if not db_product:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    return update_product_stock(
+        db=db, db_product=db_product,
+        quantity=stock_in.quantity, is_active=stock_in.is_active
+    )
 
 @router.delete("/{product_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_existing_product(

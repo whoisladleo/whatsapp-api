@@ -47,6 +47,24 @@ def update_product(db: Session, db_product: Product, product_in: ProductUpdate) 
     db.refresh(db_product)
     return db_product
 
+def update_product_stock(
+    db: Session,
+    db_product: Product,
+    quantity: Optional[int] = None,
+    is_active: Optional[bool] = None,
+) -> Product:
+    # Narrow write: only stock fields. None means "leave unchanged"
+    # (covers both omitted and explicit-null).
+    if quantity is not None:
+        db_product.quantity = quantity
+    if is_active is not None:
+        db_product.is_active = is_active
+
+    db.add(db_product)
+    db.commit()
+    db.refresh(db_product)
+    return db_product
+
 def delete_product(db: Session, db_product: Product) -> None:
     db.delete(db_product)
     db.commit()

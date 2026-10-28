@@ -108,3 +108,11 @@ Production-tier decisions only — what was chosen, what was considered and reje
 
 **Chose:** `_try_claim_stock` conditional `UPDATE ... SET quantity = quantity - 1 WHERE id = ... AND quantity >= 1` (rowcount decides; same claim style as `claim_available_pool_number`, portable SQLite/Postgres) in both close paths, replacing read-modify-write. 0-row raises `DealRejected` with messages byte-identical to each pre-check, funneling into identical holding-reply plus handoff. Also fixed adjacent pre-existing NULL bug: pre-checks now `(quantity or 0) < 1` (NULL raised `TypeError`, violating the `DealRejected` contract). Race coverage is deterministic (stale-held second close proves the stub fires; negative-control probes verified both fixes guard real behavior) — threads rejected: suite runs on one StaticPool `:memory:` connection where a threaded race would be flaky by construction. Full unit 535 passed.
 
+## PATCH stock endpoint (2026-10-27, #55)
+
+**Chose:** `PATCH /products/{id}/stock` with `ProductStockUpdate` (quantity `ge=0`, is_active, both optional, at-least-one-required 422 pre-lookup), merchant-scoped 404 identical to PUT, narrow write enforced at schema plus crud. Zero valid and locked by test; explicit null equals omitted. QA note: the spawned QA validator parked on an approval gate for 75+ minutes and was cancelled; the orchestrator ran its checklist directly (26 API tests, 535 unit, edge read of the diff) — same evidence bar, no skipped checks. Full suite 831 passed.
+
+## Dashboard stock controls (2026-10-27, dashboard #6/#7)
+
+**Chose:** one shared `updateProductStock` server action plus per-row Switch (writes `is_active`) and quantity stepper (writes absolute quantity, floor 0) in `products-table.tsx`. Display status derives from the C1 sellability rule (`is_active && quantity > 0`), not the switch alone; in-flight `Set` with early return prevents cross-row double-submit and stale lost updates. `pnpm build` plus `pnpm lint` green (verified independently by orchestrator). Live PATCH wiring verified statically (no live backend reachable from dev); end-to-end toggle check deferred to E1 staging.
+
