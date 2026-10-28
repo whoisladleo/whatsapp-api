@@ -51,3 +51,15 @@ Production-tier decisions only — what was chosen, what was considered and reje
 - *Server-side enforcement that Amara never emits `payment=installment` for a full-only product.* Rejected — this codebase already trusts the prompt for an analogous guardrail (the negotiation price floor isn't server-enforced either), so added only a prompt-level instruction + catalog annotation, consistent with that existing pattern rather than introducing asymmetric rigor for this one case.
 
 **If revisited:** if a merchant ever needs SNPL-style withholding for a regular one-time order, that requires inventing a fulfillment-gating concept first (order field + dashboard surface) — not just extending `installment_mode`'s reach, since there's nothing today to gate.
+
+## LLM provider abstraction: Claude/Muse switch (2026-10-27, #48)
+
+**Chose:** `LLMProvider` interface in `app/services/llm.py` with `ClaudeProvider` (existing Anthropic messages call, byte-identical args and text-block parsing) and `MuseProvider` (OpenAI SDK chat-completions against `https://api.meta.ai/v1`, `muse-spark-1.3`, system instruction as a `system` role message). `LLM_PROVIDER` env (`claude` default) selects; `_default_llm_service()` picks the matching key. Unknown values log a loud warning and fall back to Claude. All three call sites now go through `provider.complete(system, messages, max_tokens)`; `client`/`model_id` stay as compat properties.
+
+**Considered and rejected:**
+- *Meta Messages API (Anthropic-compatible) instead of chat-completions.* Rejected: chat-completions is the documented OpenAI-SDK path from the Meta quickstart and keeps the provider seam to one method shape; Messages API stays an option if marker compliance differs.
+- *Failing closed on unknown LLM_PROVIDER.* Rejected: a typo taking down all AI replies is worse than a warned fallback during the hackathon demo window; the warning makes it visible.
+- *Per-account provider selection.* Rejected: provider is a deployment concern, not per-merchant; one env keeps the demo and rollback story trivial (flip back to Claude with one var).
+
+**Known limits:** Muse reply quality/marker compliance unverified until the A2/A3 live evals; `openai` in requirements.txt is unpinned (same as `boto3` precedent).
+
