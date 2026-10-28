@@ -1,6 +1,7 @@
 import anthropic
 import logging
 import math
+import openai
 import os
 import re
 import uuid
@@ -211,7 +212,7 @@ def _holding_reply(language: Optional[str]) -> str:
 
 class LLMUnavailable(Exception):
     """
-    A transient Claude failure (connection error, 429, 5xx) that survived
+    A transient LLM failure (connection error, 429, 5xx) that survived
     the SDK's own retries, raised only when the caller asked to retry
     (retry_on_outage=True). Raised before any order, send or state change
     for this turn, so the caller can safely re-run the whole turn (#38).
@@ -219,9 +220,11 @@ class LLMUnavailable(Exception):
 
 
 def _is_transient_llm_error(e: Exception) -> bool:
-    if isinstance(e, anthropic.APIConnectionError):
+    if isinstance(e, (anthropic.APIConnectionError, openai.APIConnectionError)):
         return True
-    return isinstance(e, anthropic.APIStatusError) and (e.status_code == 429 or e.status_code >= 500)
+    if isinstance(e, (anthropic.APIStatusError, openai.APIStatusError)):
+        return e.status_code == 429 or e.status_code >= 500
+    return False
 
 
 _OUTAGE_REPLIES = {
@@ -237,10 +240,101 @@ def _outage_reply(language: Optional[str]) -> str:
     return f"{_OUTAGE_REPLIES['sw']}\n\n{_OUTAGE_REPLIES['en']}"
 
 
+class LLMProvider:
+    """
+    One model backend behind LLMService. complete() takes the same shape
+    every caller already builds (a system instruction, a user-messages
+    list, a max_tokens cap) and returns the reply as plain text.
+    """
+
+    name = ""
+    model_id = ""
+
+    def __init__(self, client=None):
+        self.client = client
+
+    async def complete(self, *, system: str, messages: list, max_tokens: int) -> str:
+        raise NotImplementedError
+
+
+class ClaudeProvider(LLMProvider):
+    """Existing behavior, unchanged: Anthropic messages API, same call args."""
+
+    name = "claude"
+    model_id = "claude-sonnet-5"
+
+    def __init__(self, api_key: Optional[str]):
+        super().__init__(
+            client=anthropic.AsyncAnthropic(api_key=api_key) if api_key else None
+        )
+
+    async def complete(self, *, system: str, messages: list, max_tokens: int) -> str:
+        response = await self.client.messages.create(
+            model=self.model_id,
+            max_tokens=max_tokens,
+            system=system,
+            messages=messages,
+        )
+        # This model returns extended-thinking content blocks before the
+        # text block non-deterministically (confirmed live — the same
+        # prompt sometimes returns [ThinkingBlock, TextBlock] and
+        # sometimes just [TextBlock]), so content[0] isn't reliably the
+        # reply — filter for the actual text block(s) instead.
+        return "".join(
+            block.text for block in response.content if block.type == "text"
+        )
+
+
+class MuseProvider(LLMProvider):
+    """Meta's Muse API, reached through the OpenAI-compatible SDK."""
+
+    name = "muse"
+    model_id = "muse-spark-1.3"
+    base_url = "https://api.meta.ai/v1"
+
+    def __init__(self, api_key: Optional[str]):
+        super().__init__(
+            client=openai.AsyncOpenAI(api_key=api_key, base_url=self.base_url)
+            if api_key
+            else None
+        )
+
+    async def complete(self, *, system: str, messages: list, max_tokens: int) -> str:
+        response = await self.client.chat.completions.create(
+            model=self.model_id,
+            max_tokens=max_tokens,
+            messages=[{"role": "system", "content": system}, *messages],
+        )
+        choice = response.choices[0]
+        content = choice.message.content or ""
+        return content
+
+
 class LLMService:
-    def __init__(self, api_key: str):
-        self.client = anthropic.AsyncAnthropic(api_key=api_key) if api_key else None
-        self.model_id = 'claude-sonnet-5'
+    def __init__(self, api_key: str, provider: Optional[str] = None):
+        provider = provider or settings.LLM_PROVIDER
+        if provider == MuseProvider.name:
+            self.provider: LLMProvider = MuseProvider(api_key=api_key)
+        elif provider == ClaudeProvider.name:
+            self.provider = ClaudeProvider(api_key=api_key)
+        else:
+            logger.warning(
+                "Unknown LLM_PROVIDER=%r — falling back to 'claude'", provider
+            )
+            self.provider = ClaudeProvider(api_key=api_key)
+
+    @property
+    def client(self):
+        """The underlying SDK client (None when unconfigured)."""
+        return self.provider.client
+
+    @client.setter
+    def client(self, value):
+        self.provider.client = value
+
+    @property
+    def model_id(self):
+        return self.provider.model_id
 
     def _get_knowledge_base(self, product_slug: str) -> str:
         kb_path = f"knowledge/{product_slug}.md"
@@ -751,14 +845,10 @@ Match the customer's language (Swahili or English). Keep both lines to one sente
 """
 
         try:
-            response = await self.client.messages.create(
-                model=self.model_id,
-                max_tokens=300,
+            response_text = await self.provider.complete(
                 system=instruction,
                 messages=[{"role": "user", "content": "Respond as Amara:"}],
-            )
-            response_text = "".join(
-                block.text for block in response.content if block.type == "text"
+                max_tokens=300,
             )
         except Exception as e:
             logger.error(f"Comment-reply LLM error: {e}")
@@ -920,9 +1010,7 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
 """
 
         try:
-            response = await self.client.messages.create(
-                model=self.model_id,
-                max_tokens=500,
+            response_text = await self.provider.complete(
                 system=instruction,
                 messages=[
                     {
@@ -930,9 +1018,7 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
                         "content": f'Recent conversation:\n{history_str}\nCustomer just sent: "{message_body}"\n\nRespond as Amara:',
                     }
                 ],
-            )
-            response_text = "".join(
-                block.text for block in response.content if block.type == "text"
+                max_tokens=500,
             )
         except Exception as e:
             if retry_on_outage and _is_transient_llm_error(e):
@@ -1210,14 +1296,12 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
             )
 
         try:
-            # 5. Call Claude
+            # 5. Call the model
             # temperature is deprecated/rejected for this model (confirmed
             # live against the real API — not documented ahead of time) —
             # omitted rather than guessing at a replacement parameter.
             try:
-                response = await self.client.messages.create(
-                    model=self.model_id,
-                    max_tokens=1024,
+                response_text = await self.provider.complete(
                     system=base_instruction,
                     messages=[
                         {
@@ -1225,6 +1309,7 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
                             "content": f"Recent Conversation:\n{chat_history_str}\n\nRespond as Amara:",
                         }
                     ],
+                    max_tokens=1024,
                 )
             except Exception as e:
                 if retry_on_outage and _is_transient_llm_error(e):
@@ -1234,15 +1319,6 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
                     db, account, context, from_phone, message_body, is_platform_account
                 )
                 return _outage_reply(customer.language)
-
-            # This model returns extended-thinking content blocks before the
-            # text block non-deterministically (confirmed live — the same
-            # prompt sometimes returns [ThinkingBlock, TextBlock] and
-            # sometimes just [TextBlock]), so content[0] isn't reliably the
-            # reply — filter for the actual text block(s) instead.
-            response_text = "".join(
-                block.text for block in response.content if block.type == "text"
-            )
 
             # Post-process response for special triggers
 
@@ -1315,4 +1391,10 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
             print(f"LLM Error: {e}")
             return "I'm sorry, I'm having trouble processing your request right now."
 
-llm_service = LLMService(api_key=settings.ANTHROPIC_API_KEY) if settings.ANTHROPIC_API_KEY else None
+def _default_llm_service() -> Optional[LLMService]:
+    if settings.LLM_PROVIDER == MuseProvider.name:
+        return LLMService(api_key=settings.MODEL_API_KEY, provider="muse") if settings.MODEL_API_KEY else None
+    return LLMService(api_key=settings.ANTHROPIC_API_KEY) if settings.ANTHROPIC_API_KEY else None
+
+
+llm_service = _default_llm_service()

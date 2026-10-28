@@ -95,6 +95,10 @@ class Settings(BaseSettings):
 
     # LLM
     ANTHROPIC_API_KEY: Optional[str] = None
+    # Which model backend LLMService uses: "claude" (Anthropic SDK) or
+    # "muse" (OpenAI SDK pointed at Meta's API). Default stays claude.
+    LLM_PROVIDER: str = "claude"
+    MODEL_API_KEY: Optional[str] = None
 
     VITE_API_URL: Optional[str] = None
 
