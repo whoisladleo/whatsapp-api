@@ -100,3 +100,7 @@ Production-tier decisions only — what was chosen, what was considered and reje
 - *Passing remote URLs to the vision call.* Rejected by the API (400); base64 only.
 - *Fuzzy matching or model-picked prices.* Rejected: the reply may only name catalog rows at catalog prices; anything else is an invention path.
 
+## Out-of-stock prompt rules (2026-10-27, #53)
+
+**Chose:** `_is_out_of_stock` helper (`(quantity or 0) < 1` or `is_active is False`; legacy `is_active=None` counts in-stock) with ` (OUT OF STOCK)` markers kept listed in all three catalog builders, plus a RULES line in all three prompts (never offer/quote/agree, name it plainly, pivot to an alternative). Close-time `DealRejected` stays the backstop. Live probes: never-offer held 6/6; explicit naming inconsistent, so systematic naming verification deferred to E1 rehearsal. Full suite 812 passed.
+

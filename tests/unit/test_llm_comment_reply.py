@@ -143,6 +143,63 @@ async def test_generate_comment_reply_includes_product_description_in_catalog(db
     assert "AI sales assistant for WhatsApp & Instagram" in captured["system"]
 
 
+async def test_generate_comment_reply_catalog_marks_zero_quantity_product_out_of_stock(db_session, merchant):
+    p = Product(
+        slug="ig-gone", name="Gone Item", max_price=20000, min_price=15000,
+        quantity=0, merchant_id=merchant.id,
+    )
+    db_session.add(p)
+    db_session.commit()
+
+    captured = {}
+    service = _service_with_fake_client(captured=captured)
+
+    await service.generate_comment_reply(
+        "do you have Gone Item?", merchant_id=merchant.id, db=db_session
+    )
+
+    # Still listed (so "do you have X?" gets a truthful answer), but marked.
+    # (Anchored: the comment text itself is also quoted in this prompt.)
+    line = next(l for l in captured["system"].splitlines() if l.startswith("- Gone Item:"))
+    assert "Stock: 0" in line
+    assert "(OUT OF STOCK)" in line
+
+
+async def test_generate_comment_reply_catalog_marks_inactive_product_out_of_stock(db_session, merchant):
+    p = Product(
+        slug="ig-retired", name="Retired Item", max_price=20000, min_price=15000,
+        quantity=5, merchant_id=merchant.id, is_active=False,
+    )
+    db_session.add(p)
+    db_session.commit()
+
+    captured = {}
+    service = _service_with_fake_client(captured=captured)
+
+    await service.generate_comment_reply(
+        "do you have Retired Item?", merchant_id=merchant.id, db=db_session
+    )
+
+    line = next(l for l in captured["system"].splitlines() if l.startswith("- Retired Item:"))
+    assert "(OUT OF STOCK)" in line
+
+
+async def test_generate_comment_reply_catalog_in_stock_line_wording_unchanged_and_states_stock_rule(db_session, merchant, shoes):
+    captured = {}
+    service = _service_with_fake_client(captured=captured)
+
+    await service.generate_comment_reply(
+        "how much for the shoes?", merchant_id=merchant.id, db=db_session, account_name="Shoe Shop"
+    )
+
+    line = next(l for l in captured["system"].splitlines() if l.startswith("- Shoes:"))
+    assert line == "- Shoes: Price TZS 45,000, Stock: 3"
+    # The out-of-stock instruction is unconditional — present even when
+    # nothing is out of stock (#53).
+    assert "never offer a product the catalog marks OUT OF STOCK" in captured["system"]
+    assert "suggest an in-stock alternative" in captured["system"]
+
+
 async def test_generate_comment_reply_no_products_says_so_in_catalog(db_session, merchant):
     captured = {}
     service = _service_with_fake_client(captured=captured)
