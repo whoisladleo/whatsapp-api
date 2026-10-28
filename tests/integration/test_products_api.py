@@ -255,3 +255,127 @@ def test_upload_product_image_r2_path_uses_mocked_client(client, auth_user, monk
     assert body["image_url"].startswith("https://cdn.example.test/")
     assert uploaded["bucket"] == "test-bucket"
     assert uploaded["content_type"] == "image/png"
+
+
+def test_patch_stock_sets_quantity(client, auth_user):
+    _, headers = auth_user
+    created = client.post(BASE, json=_product_payload(), headers=headers).json()
+
+    resp = client.patch(
+        f"{BASE}/{created['id']}/stock", json={"quantity": 25}, headers=headers
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["quantity"] == 25
+    # Untouched stock field keeps its value; non-stock fields untouched too.
+    assert body["is_active"] is True
+    assert body["name"] == "Shoes"
+    assert body["max_price"] == 50000
+
+
+def test_patch_stock_toggles_is_active(client, auth_user):
+    _, headers = auth_user
+    created = client.post(BASE, json=_product_payload(), headers=headers).json()
+
+    resp = client.patch(
+        f"{BASE}/{created['id']}/stock", json={"is_active": False}, headers=headers
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["is_active"] is False
+    assert body["quantity"] == 10
+
+
+def test_patch_stock_both_at_once(client, auth_user):
+    _, headers = auth_user
+    created = client.post(BASE, json=_product_payload(), headers=headers).json()
+
+    resp = client.patch(
+        f"{BASE}/{created['id']}/stock",
+        json={"quantity": 0, "is_active": False},
+        headers=headers,
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["quantity"] == 0
+    assert body["is_active"] is False
+    # Narrow write: everything else survives.
+    assert body["name"] == "Shoes"
+    assert body["min_price"] == 40000
+
+
+def test_patch_stock_neither_field_errors(client, auth_user):
+    _, headers = auth_user
+    created = client.post(BASE, json=_product_payload(), headers=headers).json()
+
+    resp = client.patch(
+        f"{BASE}/{created['id']}/stock", json={}, headers=headers
+    )
+
+    assert resp.status_code == 422
+
+
+def test_patch_stock_explicit_null_leaves_unchanged(client, auth_user):
+    _, headers = auth_user
+    created = client.post(BASE, json=_product_payload(), headers=headers).json()
+
+    resp = client.patch(
+        f"{BASE}/{created['id']}/stock",
+        json={"quantity": None, "is_active": False},
+        headers=headers,
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["quantity"] == 10
+    assert body["is_active"] is False
+
+
+def test_patch_stock_all_null_errors(client, auth_user):
+    _, headers = auth_user
+    created = client.post(BASE, json=_product_payload(), headers=headers).json()
+
+    resp = client.patch(
+        f"{BASE}/{created['id']}/stock",
+        json={"quantity": None, "is_active": None},
+        headers=headers,
+    )
+
+    assert resp.status_code == 422
+
+
+def test_patch_stock_negative_quantity_errors(client, auth_user):
+    _, headers = auth_user
+    created = client.post(BASE, json=_product_payload(), headers=headers).json()
+
+    resp = client.patch(
+        f"{BASE}/{created['id']}/stock", json={"quantity": -1}, headers=headers
+    )
+
+    assert resp.status_code == 422
+
+
+def test_patch_stock_not_found_for_other_user(client, auth_user, other_user_headers):
+    _, headers = auth_user
+    created = client.post(BASE, json=_product_payload(), headers=headers).json()
+
+    resp = client.patch(
+        f"{BASE}/{created['id']}/stock",
+        json={"quantity": 1},
+        headers=other_user_headers,
+    )
+
+    assert resp.status_code == 404
+
+
+def test_patch_stock_nonexistent_id(client, auth_user):
+    _, headers = auth_user
+
+    resp = client.patch(
+        f"{BASE}/{uuid.uuid4()}/stock", json={"quantity": 1}, headers=headers
+    )
+
+    assert resp.status_code == 404

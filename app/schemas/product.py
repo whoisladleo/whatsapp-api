@@ -1,5 +1,5 @@
 import uuid
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import datetime
 from app.db.models import InstallmentMode
@@ -46,6 +46,13 @@ class ProductUpdate(BaseModel):
     is_subscription: Optional[bool] = None
     allow_installments: Optional[bool] = None
     installment_mode: Optional[InstallmentMode] = None
+
+class ProductStockUpdate(BaseModel):
+    # Narrow PATCH body for PATCH /products/{id}/stock: only stock fields.
+    # None (omitted or explicit null) means "leave unchanged".
+    quantity: Optional[int] = Field(default=None, ge=0)
+    is_active: Optional[bool] = None
+
 
 class ProductResponse(ProductBase):
     id: uuid.UUID
