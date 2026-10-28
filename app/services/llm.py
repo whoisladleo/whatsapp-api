@@ -303,10 +303,19 @@ class MuseProvider(LLMProvider):
         response = await self.client.chat.completions.create(
             model=self.model_id,
             max_tokens=max_tokens,
+            # Negotiation replies don't need deep reasoning; at the default
+            # effort the model spends the whole budget on reasoning tokens
+            # and returns content=None with finish_reason=length (#49).
+            reasoning_effort="minimal",
             messages=[{"role": "system", "content": system}, *messages],
         )
         choice = response.choices[0]
         content = choice.message.content or ""
+        if not content:
+            logger.warning(
+                "Muse returned empty content (finish_reason=%s)",
+                choice.finish_reason,
+            )
         return content
 
 

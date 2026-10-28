@@ -63,3 +63,14 @@ Production-tier decisions only — what was chosen, what was considered and reje
 
 **Known limits:** Muse reply quality/marker compliance unverified until the A2/A3 live evals; `openai` in requirements.txt is unpinned (same as `boto3` precedent).
 
+## Muse reasoning effort minimal for negotiation (2026-10-27, #49)
+
+**Chose:** `MuseProvider.complete` passes `reasoning_effort="minimal"`. Root cause, verified live: reasoning tokens exhausted `max_tokens` before any reply text (`finish_reason=length`, `content=None`, 198/200 reasoning on a tiny prompt), which made eval passes vacuous since empty replies satisfy floor assertions trivially. `minimal` yields `finish=stop` with real content (~119 reasoning + ~29 text in a 200 budget); `low` did not help. Live haggling eval: 30/30 on Muse and 30/30 on Claude, same shared prompt wording, no `max_tokens` raise. Empty content now logs a warning with `finish_reason` instead of failing silently.
+
+**Considered and rejected:**
+- *Raising `max_tokens` instead.* Rejected after measurement: with `minimal`, current budgets (300/500/1024) suffice with zero truncations observed; raising would add latency and cost for no gain.
+- *Provider-conditional prompt branches.* Rejected: one shared wording satisfies both models (locked by a parity test); branches would double prompt-maintenance and eval burden.
+- *`reasoning_effort="none"`.* Rejected by the API: not a supported value for `muse-spark-1.3` (400).
+
+**Known limits:** `minimal` is a latency/cost/quality tradeoff tuned for short sales replies; revisit if longer-form generations truncate. The vacuous-pass trap (empty reply satisfies floor assertions) is now covered by marker-evidence checks in the eval review, not by the assertions themselves.
+

@@ -1,7 +1,8 @@
 """
 Live haggling regression set for #37: runs real conversations against the
-real Claude API and checks Amara never quotes or agrees below the real
-floor. Costs real money and is non-deterministic, so it's off by default:
+real LLM API (Claude or Muse per LLM_PROVIDER) and checks Amara never
+quotes or agrees below the real floor. Costs real money and is
+non-deterministic, so it's off by default:
 
     RUN_LIVE_EVAL=1 .venv/bin/python -m pytest tests/live -q --no-cov
 
@@ -20,9 +21,17 @@ from app.core.config import settings
 from app.db.models import Message, Product, User, WhatsAppAccount
 from app.services.llm import LLMService
 
+
+def _active_api_key():
+    """The key matching the provider under test (A2 runs this same set on Muse)."""
+    if settings.LLM_PROVIDER == "muse":
+        return settings.MODEL_API_KEY
+    return settings.ANTHROPIC_API_KEY
+
+
 pytestmark = pytest.mark.skipif(
-    not (os.environ.get("RUN_LIVE_EVAL") and settings.ANTHROPIC_API_KEY),
-    reason="live eval: set RUN_LIVE_EVAL=1 and ANTHROPIC_API_KEY",
+    not (os.environ.get("RUN_LIVE_EVAL") and _active_api_key()),
+    reason="live eval: set RUN_LIVE_EVAL=1 and the active provider's API key",
 )
 
 MAX_PRICE = 50000
@@ -99,7 +108,7 @@ def shop(db_session):
 
 @pytest.mark.parametrize("scenario_id,history,last_message", SCENARIOS, ids=[s[0] for s in SCENARIOS])
 async def test_amara_never_goes_below_floor(db_session, shop, scenario_id, history, last_message, monkeypatch):
-    service = LLMService(api_key=settings.ANTHROPIC_API_KEY)
+    service = LLMService(api_key=_active_api_key())
     agreements = []
 
     async def capture_close_deal(db, account, customer, phone, agreement, context):
