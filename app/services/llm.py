@@ -29,6 +29,7 @@ from app.db.models import (
     AmaraEventKind,
 )
 from app.services import usage
+from app.services.vision_match import match_post_to_product
 
 logger = logging.getLogger(__name__)
 
@@ -838,12 +839,36 @@ class LLMService:
                 if p.description:
                     catalog_str += f"  {p.description}\n"
 
+        # Vision product-match (B2, Muse-only): when the commented-on post
+        # has a usable photo, identify which catalog product it shows so
+        # the reply below can name it. Any failure (no match, no media,
+        # download/model error — or the Claude provider) leaves
+        # matched_product None and the reply is exactly the old one.
+        matched_product = None
+        if post_media and isinstance(self.provider, MuseProvider):
+            try:
+                matched_product = await match_post_to_product(
+                    client=self.client,
+                    model=self.provider.model_id,
+                    post_media=post_media,
+                    products=products,
+                )
+            except Exception as e:
+                logger.warning(f"Vision product-match failed: {e}")
+
         instruction = f"""You are Amara, the AI sales agent for {account_name}. A customer just left a public comment on one of the shop's Instagram posts:
 
 "{comment_body}"
 
 {catalog_str}
 """
+        if matched_product is not None:
+            instruction += (
+                f"\nThe photo on the post they commented on shows this catalog item: "
+                f"{matched_product.name} (Price TZS {matched_product.max_price:,.0f}). "
+                f"The comment is almost certainly about it — name it in your PRIVATE reply "
+                f"when relevant, with its catalog price exactly as given."
+            )
         if knowledge_content:
             instruction += f"\nHere is additional knowledge:\n{knowledge_content}"
 
