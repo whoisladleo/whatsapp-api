@@ -201,6 +201,33 @@ def _is_out_of_stock(product: Product) -> bool:
     return (product.quantity or 0) < 1 or product.is_active is False
 
 
+def _try_claim_stock(db: Session, product: Product) -> bool:
+    """
+    Atomically claims one unit of stock via a conditional UPDATE
+    (SET quantity = quantity - 1 WHERE id = ... AND quantity >= 1) —
+    the same claim style as claim_available_pool_number: the
+    affected-row count tells us whether we won the race, correct on
+    both SQLite tests and Postgres prod (#54). Returns True when this
+    call took the unit; False (0 rows) means a concurrent close took
+    the last unit first, and the caller must reject the deal exactly
+    like the out-of-stock pre-check. Refreshes the ORM object on
+    success so callers see the post-claim quantity.
+    """
+    claimed = (
+        db.query(Product)
+        .filter(Product.id == product.id, Product.quantity >= 1)
+        # synchronize_session=False: the SET value is a SQL expression
+        # (quantity - 1), not a literal, so there is no Python-side value
+        # to copy onto in-session objects — refresh below instead.
+        .update({Product.quantity: Product.quantity - 1}, synchronize_session=False)
+    )
+    db.commit()
+    if claimed == 0:
+        return False
+    db.refresh(product)
+    return True
+
+
 class DealRejected(Exception):
     """An AGREEMENT_REACHED marker failed server-side validation; no order was created."""
 
@@ -399,17 +426,22 @@ class LLMService:
                 f"AGREEMENT_REACHED price {price} outside [{product.min_price}, {product.max_price}] "
                 f"for '{product.name}' (possible prompt injection)"
             )
-        if product.quantity < 1:
+        if (product.quantity or 0) < 1:
             raise DealRejected(f"AGREEMENT_REACHED for '{product.name}' but it's out of stock")
 
         payment_type = (
             PaymentType.INSTALLMENT if agreement["payment_type"] == "installment" else PaymentType.FULL
         )
 
-        # Reserve: decrement stock now (soft-lock during the hold window,
-        # not deferred to payment success) so a second customer can't be
-        # sold the same unit while this one is paying.
-        product.quantity -= 1
+        # Reserve: claim one unit atomically (conditional UPDATE, not a
+        # read-modify-write) so two concurrent closes on the last unit
+        # can't both succeed — the loser sees 0 rows and is rejected
+        # exactly like the out-of-stock pre-check above (#54). The claim
+        # is still now, not deferred to payment success (soft-lock during
+        # the hold window, so a second customer can't be sold the same
+        # unit while this one is paying).
+        if not _try_claim_stock(db, product):
+            raise DealRejected(f"AGREEMENT_REACHED for '{product.name}' but it's out of stock")
         order = Order(
             customer_id=customer.id,
             product_id=product.id,
@@ -958,7 +990,7 @@ Match the customer's language (Swahili or English). Keep both lines to one sente
                 f"Instagram AGREEMENT_REACHED price {price} outside [{product.min_price}, {product.max_price}] "
                 f"for '{product.name}' (possible prompt injection)"
             )
-        if product.quantity < 1:
+        if (product.quantity or 0) < 1:
             raise DealRejected(f"Instagram AGREEMENT_REACHED for '{product.name}' but it's out of stock")
 
         phone = agreement.get("phone")
@@ -977,7 +1009,10 @@ Match the customer's language (Swahili or English). Keep both lines to one sente
             PaymentType.INSTALLMENT if agreement["payment_type"] == "installment" else PaymentType.FULL
         )
 
-        product.quantity -= 1
+        # Atomic stock claim — see _close_deal; a lost race rejects
+        # exactly like the out-of-stock pre-check above (#54).
+        if not _try_claim_stock(db, product):
+            raise DealRejected(f"Instagram AGREEMENT_REACHED for '{product.name}' but it's out of stock")
         order = Order(
             customer_id=customer.id,
             product_id=product.id,
