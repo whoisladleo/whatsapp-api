@@ -236,6 +236,64 @@ async def test_generate_dm_response_catalog_marks_full_payment_only_product(db_s
     assert "(full payment only — installments not offered)" in captured["system"]
 
 
+async def test_generate_dm_response_catalog_marks_zero_quantity_product_out_of_stock(db_session, ig_account, ig_customer, ig_context):
+    p = Product(
+        slug="ig-dm-gone", name="Gone Item", max_price=20000, min_price=15000,
+        quantity=0, merchant_id=ig_account.user_id,
+    )
+    db_session.add(p)
+    db_session.commit()
+
+    captured = {}
+    service = _service_with_fake_client(captured=captured)
+
+    await service.generate_dm_response(
+        "do you have Gone Item?", db=db_session, account=ig_account, customer=ig_customer, context=ig_context, conversation_history=[]
+    )
+
+    # Still listed (so "do you have X?" gets a truthful answer), but marked.
+    line = next(l for l in captured["system"].splitlines() if "Gone Item" in l)
+    assert "Stock: 0" in line
+    assert "(OUT OF STOCK)" in line
+
+
+async def test_generate_dm_response_catalog_marks_inactive_product_out_of_stock(db_session, ig_account, ig_customer, ig_context):
+    p = Product(
+        slug="ig-dm-retired", name="Retired Item", max_price=20000, min_price=15000,
+        quantity=5, merchant_id=ig_account.user_id, is_active=False,
+    )
+    db_session.add(p)
+    db_session.commit()
+
+    captured = {}
+    service = _service_with_fake_client(captured=captured)
+
+    await service.generate_dm_response(
+        "do you have Retired Item?", db=db_session, account=ig_account, customer=ig_customer, context=ig_context, conversation_history=[]
+    )
+
+    line = next(l for l in captured["system"].splitlines() if "Retired Item" in l)
+    assert "(OUT OF STOCK)" in line
+
+
+async def test_generate_dm_response_catalog_in_stock_line_wording_unchanged_and_states_stock_rule(
+    db_session, ig_account, ig_customer, ig_context, shoes
+):
+    captured = {}
+    service = _service_with_fake_client(captured=captured)
+
+    await service.generate_dm_response(
+        "what do you sell?", db=db_session, account=ig_account, customer=ig_customer, context=ig_context, conversation_history=[]
+    )
+
+    line = next(l for l in captured["system"].splitlines() if l.startswith("- Shoes:"))
+    assert line == "- Shoes: Max Price TZS 45,000, Lowest Price You May Offer TZS 38,500, Stock: 3"
+    # The out-of-stock RULES line is unconditional — present even when
+    # nothing is out of stock (#53).
+    assert "never offer, quote, or agree a price on a product the catalog marks OUT OF STOCK" in captured["system"]
+    assert "suggest an in-stock alternative" in captured["system"]
+
+
 async def test_generate_dm_response_no_products_says_so_in_catalog(db_session, ig_account, ig_customer, ig_context):
     captured = {}
     service = _service_with_fake_client(captured=captured)

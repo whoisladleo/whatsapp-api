@@ -418,6 +418,75 @@ async def test_catalog_omits_full_payment_only_note_when_installments_allowed(db
     assert "(full payment only — installments not offered)" not in captured["system"]
 
 
+async def test_catalog_marks_zero_quantity_product_out_of_stock(db_session, shop_account, merchant):
+    db_session.add(
+        Product(slug="gone-item", name="Gone Item", max_price=20000, min_price=15000, quantity=0, merchant_id=merchant.id)
+    )
+    db_session.commit()
+
+    captured = {}
+    service = _service_with_fake_client(captured=captured)
+
+    await service.generate_response(
+        message_body="do you have Gone Item?",
+        from_phone="255711111116",
+        db=db_session,
+        account=shop_account,
+    )
+
+    # Still listed (so "do you have X?" gets a truthful answer), but marked.
+    line = next(l for l in captured["system"].splitlines() if "Gone Item" in l)
+    assert "Stock: 0" in line
+    assert "(OUT OF STOCK)" in line
+
+
+async def test_catalog_marks_inactive_product_out_of_stock(db_session, shop_account, merchant):
+    db_session.add(
+        Product(
+            slug="retired-item", name="Retired Item", max_price=20000, min_price=15000,
+            quantity=5, merchant_id=merchant.id, is_active=False,
+        )
+    )
+    db_session.commit()
+
+    captured = {}
+    service = _service_with_fake_client(captured=captured)
+
+    await service.generate_response(
+        message_body="do you have Retired Item?",
+        from_phone="255711111117",
+        db=db_session,
+        account=shop_account,
+    )
+
+    line = next(l for l in captured["system"].splitlines() if "Retired Item" in l)
+    assert "(OUT OF STOCK)" in line
+
+
+async def test_catalog_in_stock_line_wording_unchanged_and_states_stock_rule(db_session, shop_account, merchant):
+    db_session.add(
+        Product(slug="shoes-3", name="Shoes", max_price=50000, min_price=40000, quantity=3, merchant_id=merchant.id)
+    )
+    db_session.commit()
+
+    captured = {}
+    service = _service_with_fake_client(captured=captured)
+
+    await service.generate_response(
+        message_body="what do you sell?",
+        from_phone="255711111118",
+        db=db_session,
+        account=shop_account,
+    )
+
+    line = next(l for l in captured["system"].splitlines() if l.startswith("- Shoes:"))
+    assert line == "- Shoes: Max Price TZS 50,000, Lowest Price You May Offer TZS 44,000, Stock: 3"
+    # The out-of-stock RULES line is unconditional — present even when
+    # nothing is out of stock (#53).
+    assert "never offer, quote, or agree a price on a product the catalog marks OUT OF STOCK" in captured["system"]
+    assert "suggest an in-stock alternative" in captured["system"]
+
+
 async def test_regular_account_no_products_shows_placeholder(db_session, shop_account):
     captured = {}
     service = _service_with_fake_client(captured=captured)

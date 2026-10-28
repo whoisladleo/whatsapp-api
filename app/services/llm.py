@@ -189,6 +189,18 @@ def _negotiation_floor(product: Product) -> float:
     return min(product.max_price, math.ceil(product.min_price * NEGOTIATION_FLOOR_BUFFER))
 
 
+def _is_out_of_stock(product: Product) -> bool:
+    """
+    Whether the catalog should show this product as OUT OF STOCK: no units
+    left (quantity < 1, e.g. via /out_of_stock) or deactivated by the
+    merchant (is_active False). Either way the model must not offer it —
+    see the out-of-stock RULES line in each prompt. Server-side
+    _close_deal/_close_instagram_deal still reject a quantity-0 close as
+    the backstop (#53).
+    """
+    return (product.quantity or 0) < 1 or product.is_active is False
+
+
 class DealRejected(Exception):
     """An AGREEMENT_REACHED marker failed server-side validation; no order was created."""
 
@@ -835,7 +847,8 @@ class LLMService:
         else:
             catalog_str = "Available Products:\n"
             for p in products:
-                catalog_str += f"- {p.name}: Price TZS {p.max_price:,.0f}, Stock: {p.quantity}\n"
+                stock_note = " (OUT OF STOCK)" if _is_out_of_stock(p) else ""
+                catalog_str += f"- {p.name}: Price TZS {p.max_price:,.0f}, Stock: {p.quantity}{stock_note}\n"
                 if p.description:
                     catalog_str += f"  {p.description}\n"
 
@@ -878,6 +891,8 @@ PUBLIC: <a short, friendly public reply visible to everyone — never state a pr
 PRIVATE: <a short direct message with the actual details they're asking about, using only the catalog/knowledge above — never invent a product, price, stock level, or feature/detail that isn't there>
 
 If the comment has nothing to do with the shop's products (off-topic, spam, greetings), still use the same two-line format — briefly deflect and invite them to ask about products.
+
+Out of stock: never offer a product the catalog marks OUT OF STOCK — if the comment asks about one, first say plainly in your PRIVATE reply, naming the product, that it is out of stock, then suggest an in-stock alternative from the catalog instead.
 
 All prices are in Tanzanian Shillings (TZS) — always state them exactly as given, including the TZS label. Never say "$", "USD", "dollars", or imply any other currency, and never convert the number into another currency.
 
@@ -1024,7 +1039,8 @@ Match the customer's language (Swahili or English). Keep both lines to one sente
             catalog_str = "Available Products:\n"
             for p in products:
                 installments_note = "" if p.allow_installments else " (full payment only — installments not offered)"
-                catalog_str += f"- {p.name}: Max Price TZS {p.max_price:,.0f}, Lowest Price You May Offer TZS {_negotiation_floor(p):,.0f}, Stock: {p.quantity}{installments_note}\n"
+                stock_note = " (OUT OF STOCK)" if _is_out_of_stock(p) else ""
+                catalog_str += f"- {p.name}: Max Price TZS {p.max_price:,.0f}, Lowest Price You May Offer TZS {_negotiation_floor(p):,.0f}, Stock: {p.quantity}{stock_note}{installments_note}\n"
                 if p.description:
                     catalog_str += f"  {p.description}\n"
 
@@ -1050,6 +1066,7 @@ RULES:
 6. Keep replies SHORT and natural, like a real Instagram DM — usually 1-3 sentences. Match the customer's language (Swahili or English).
 7. Currency: all prices are in Tanzanian Shillings (TZS) — always state them exactly as given, including the TZS label. Never say "$", "USD", "dollars", or imply any other currency, and never convert the number into another currency.
 8. Quoting: whenever you state a specific price for a product during negotiation but haven't closed the deal yet, end your response with the marker [QUOTE: product=<product name> price=<price>] (e.g. [QUOTE: product=Shoes price=45000]). Don't include this once you've emitted [AGREEMENT_REACHED] for the same deal.
+9. Out of stock: never offer, quote, or agree a price on a product the catalog marks OUT OF STOCK — if the customer asks about one, first say plainly, naming the product, that it is out of stock, then suggest an in-stock alternative from the catalog instead.
 
 Reply with ONLY the message text (plus whichever marker applies, if any) — no other formatting.
 """
@@ -1188,7 +1205,8 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
             catalog_str = "Available Products:\n"
             for p in products:
                 installments_note = "" if p.allow_installments else " (full payment only — installments not offered)"
-                catalog_str += f"- {p.name}: Max Price TZS {p.max_price:,.0f}, Lowest Price You May Offer TZS {_negotiation_floor(p):,.0f}, Stock: {p.quantity}{installments_note}\n"
+                stock_note = " (OUT OF STOCK)" if _is_out_of_stock(p) else ""
+                catalog_str += f"- {p.name}: Max Price TZS {p.max_price:,.0f}, Lowest Price You May Offer TZS {_negotiation_floor(p):,.0f}, Stock: {p.quantity}{stock_note}{installments_note}\n"
                 if p.description:
                     catalog_str += f"  {p.description}\n"
 
@@ -1304,6 +1322,7 @@ RULES:
 6. Quoting: whenever you state a specific price to the customer during negotiation but haven't closed the deal yet, end your response with the marker [QUOTE: product=<product name> price=<price>] (e.g. [QUOTE: product=Shoes price=45000]). Don't include this once you've already emitted [AGREEMENT_REACHED] for the same deal.
 7. Human Handoff: If the customer is unreasonable, has complex technical questions, or explicitly asks for a human, you must include the exact phrase [HUMAN_HANDOFF] in your response.
 8. Currency: all prices are in Tanzanian Shillings (TZS) — always state them exactly as given, including the TZS label. Never say "$", "USD", "dollars", or imply any other currency, and never convert the number into another currency.
+9. Out of stock: never offer, quote, or agree a price on a product the catalog marks OUT OF STOCK — if the customer asks about one, first say plainly, naming the product, that it is out of stock, then suggest an in-stock alternative from the catalog instead.
 """
 
         base_instruction += """
