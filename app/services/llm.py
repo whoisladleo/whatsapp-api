@@ -809,6 +809,7 @@ class LLMService:
         db: Session,
         account_name: str = "the shop",
         knowledge_content: Optional[str] = None,
+        post_media: Optional[dict] = None,
     ) -> Optional[dict]:
         """
         Generates Amara's response to a public Instagram comment: a short
@@ -820,6 +821,9 @@ class LLMService:
         continue a conversation over (see Issue 7 — full Amara-over-DM).
         Returns None (caller sends nothing) if the model is unavailable or
         its output doesn't match the expected PUBLIC:/PRIVATE: format.
+        post_media is the parent post fetched by InstagramProvider.get_media
+        (B1 threads it in; B2 matches its photo against the catalog on the
+        Muse provider only, and names the pictured product in the reply).
         """
         if not self.client:
             return None

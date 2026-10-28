@@ -1,6 +1,10 @@
+import logging
+
 import httpx
-from typing import Dict, Any
+from typing import Any, Dict, Optional
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class InstagramProvider:
@@ -94,3 +98,57 @@ class InstagramProvider:
         async with httpx.AsyncClient() as client:
             response = await client.get(url, params=params, headers=self.headers)
             return response.json()
+
+    async def get_media(self, media_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Fetches a media node (the parent post a comment was left on) by id.
+        Returns a normalized dict with caption, media_url, media_type,
+        permalink, and children — or None when the media is deleted/private
+        or anything else goes wrong. Never raises: this runs inside the
+        webhook path, where a failed lookup must fall back to a
+        media-unaware reply, not a dropped comment.
+        """
+        url = f"{self.base_url}/{media_id}"
+        params = {
+            "fields": "caption,media_url,media_type,permalink,children{media_url,media_type}"
+        }
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url, params=params, headers=self.headers)
+                payload = response.json()
+        except Exception as e:
+            logger.warning("get_media(%s) request failed: %s", media_id, e)
+            return None
+
+        if not isinstance(payload, dict) or "error" in payload:
+            # Deleted/private media (or a bad id) comes back as an error
+            # payload, e.g. "Unsupported get request" — not exceptional.
+            logger.warning("get_media(%s) returned an error payload: %s", media_id, payload)
+            return None
+
+        media_type = payload.get("media_type")
+        media_url = payload.get("media_url")
+        children = (payload.get("children") or {}).get("data", []) or []
+
+        if media_type == "CAROUSEL_ALBUM":
+            # Carousel selection rule: a carousel's own node carries no
+            # media_url, so use the first IMAGE child — images are the
+            # useful input for B2's vision step, and first keeps it
+            # deterministic. Falls back to the first child of any type
+            # when the carousel has no image (all-video), or None when it
+            # has no children at all.
+            picked = next(
+                (c for c in children if c.get("media_type") == "IMAGE"),
+                None,
+            ) or (children[0] if children else None)
+            media_url = (picked or {}).get("media_url")
+            media_type = (picked or {}).get("media_type")
+
+        return {
+            "id": media_id,
+            "caption": payload.get("caption"),
+            "media_url": media_url,
+            "media_type": media_type,
+            "permalink": payload.get("permalink"),
+            "children": children,
+        }

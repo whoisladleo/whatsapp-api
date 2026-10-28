@@ -41,17 +41,30 @@ async def _process(db, account_id: str, comment_row_id: str) -> str:
         logger.warning("llm_service unavailable; skipping comment %s.", comment.comment_id)
         return "LLM unavailable."
 
+    provider = InstagramProvider(account.access_token)
+
+    # Best-effort parent-post fetch (B1): a failed lookup (deleted media,
+    # revoked token, transport error) falls back to a media-unaware reply
+    # rather than dropping the comment.
+    post_media = None
+    if comment.media_id:
+        try:
+            post_media = await provider.get_media(comment.media_id)
+        except Exception as e:
+            logger.warning(
+                "Parent-media fetch for comment %s failed: %s", comment.comment_id, e
+            )
+
     reply = await llm_service.generate_comment_reply(
         comment_body=comment.body or "",
         merchant_id=account.user_id,
         db=db,
         account_name=account.username or "the shop",
+        post_media=post_media,
     )
     if not reply:
         logger.warning("No usable reply generated for comment %s.", comment.comment_id)
         return "No reply generated."
-
-    provider = InstagramProvider(account.access_token)
 
     public_response = await provider.reply_to_comment(comment.comment_id, reply["public_reply"])
     if "error" not in public_response:
