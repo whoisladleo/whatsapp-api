@@ -4,7 +4,8 @@ from datetime import datetime
 import pytest
 
 import app.tasks.quote_nudges as quote_nudges
-from app.db.models import ConversationContext, Customer, Message, User, WhatsAppAccount
+from app.core.config import settings
+from app.db.models import ConversationContext, Customer, Message, Product, User, WhatsAppAccount
 
 
 @pytest.fixture(autouse=True)
@@ -267,3 +268,134 @@ def test_product_name_falls_back_to_generic_when_missing(db_session, customer, a
     quote_nudges.send_quote_nudge(context.id, account.id, context.pending_quote_at.isoformat(), 1)
 
     assert "that item" in sent["body"]
+
+
+def _stocked_shoes(db_session, owner, **overrides):
+    kwargs = {
+        "slug": "shoes", "name": "Shoes", "max_price": 50000.0, "min_price": 40000.0,
+        "quantity": 3, "is_active": True, "merchant_id": owner.id,
+    }
+    kwargs.update(overrides)
+    p = Product(**kwargs)
+    db_session.add(p)
+    db_session.commit()
+    db_session.refresh(p)
+    return p
+
+
+def test_nudge_attempts_product_card_for_in_stock_product(
+    db_session, quoted_context, account, owner, monkeypatch
+):
+    product = _stocked_shoes(db_session, owner)
+    product_id = product.id  # task closes the shared session; read it first
+    attempted = {}
+
+    async def fake_card(self, to, prod, fallback_text, body=None, footer=None, catalog_id=None):
+        attempted["to"] = to
+        attempted["product_id"] = prod.id
+        attempted["fallback_text"] = fallback_text
+        return {"messages": [{"id": "wamid.card"}]}
+
+    async def exploding_text(self, to, body, preview_url=False):
+        raise AssertionError("plain text must not be sent when the card is attempted")
+
+    monkeypatch.setattr("app.core.provider.WhatsAppProvider.send_product_card_or_text", fake_card)
+    monkeypatch.setattr("app.core.provider.WhatsAppProvider.send_text", exploding_text)
+    monkeypatch.setattr(quote_nudges.send_quote_nudge, "apply_async", lambda *a, **kw: None)
+
+    result = quote_nudges.send_quote_nudge(
+        quoted_context.id, account.id, quoted_context.pending_quote_at.isoformat(), 1
+    )
+
+    assert result == "Success"
+    assert attempted["to"] == "255722228888"
+    assert attempted["product_id"] == product_id
+    assert "Shoes" in attempted["fallback_text"]
+    outbound = (
+        db_session.query(Message)
+        .filter(Message.direction == "outbound", Message.to_phone == "255722228888")
+        .first()
+    )
+    assert outbound.status == "sent"
+    assert outbound.body == attempted["fallback_text"]
+
+
+def test_nudge_preserves_text_when_card_fails(
+    db_session, quoted_context, account, owner, monkeypatch
+):
+    """Card rejected by Meta (e.g. catalog not linked to this WABA) → the
+    real helper falls back and the customer still gets the nudge line as text."""
+    _stocked_shoes(db_session, owner)
+    monkeypatch.setattr(settings, "CATALOG_ID", "CAT123")
+
+    async def rejected_card(self, *a, **kw):
+        return {"error": {"message": "catalog not connected", "code": 133004}}
+
+    sent = {}
+
+    async def fake_send_text(self, to, body, preview_url=False):
+        sent["to"] = to
+        sent["body"] = body
+        return {"messages": [{"id": "wamid.fallback"}]}
+
+    monkeypatch.setattr("app.core.provider.WhatsAppProvider.send_product_message", rejected_card)
+    monkeypatch.setattr("app.core.provider.WhatsAppProvider.send_text", fake_send_text)
+    monkeypatch.setattr(quote_nudges.send_quote_nudge, "apply_async", lambda *a, **kw: None)
+
+    result = quote_nudges.send_quote_nudge(
+        quoted_context.id, account.id, quoted_context.pending_quote_at.isoformat(), 1
+    )
+
+    assert result == "Success"
+    assert sent["to"] == "255722228888"
+    assert "Shoes" in sent["body"]
+
+
+def test_nudge_sends_plain_text_for_out_of_stock_product(
+    db_session, quoted_context, account, owner, monkeypatch
+):
+    _stocked_shoes(db_session, owner, quantity=0)
+    sent = {}
+
+    async def exploding_card(self, *a, **kw):
+        raise AssertionError("no card attempt for an out-of-stock product")
+
+    async def fake_send_text(self, to, body, preview_url=False):
+        sent["body"] = body
+        return {"messages": [{"id": "wamid.text"}]}
+
+    monkeypatch.setattr("app.core.provider.WhatsAppProvider.send_product_card_or_text", exploding_card)
+    monkeypatch.setattr("app.core.provider.WhatsAppProvider.send_text", fake_send_text)
+    monkeypatch.setattr(quote_nudges.send_quote_nudge, "apply_async", lambda *a, **kw: None)
+
+    result = quote_nudges.send_quote_nudge(
+        quoted_context.id, account.id, quoted_context.pending_quote_at.isoformat(), 1
+    )
+
+    assert result == "Success"
+    assert "Shoes" in sent["body"]
+
+
+def test_nudge_sends_plain_text_for_deactivated_product(
+    db_session, quoted_context, account, owner, monkeypatch
+):
+    _stocked_shoes(db_session, owner, is_active=False)
+    sent = {}
+
+    async def exploding_card(self, *a, **kw):
+        raise AssertionError("no card attempt for a deactivated product")
+
+    async def fake_send_text(self, to, body, preview_url=False):
+        sent["body"] = body
+        return {"messages": [{"id": "wamid.text"}]}
+
+    monkeypatch.setattr("app.core.provider.WhatsAppProvider.send_product_card_or_text", exploding_card)
+    monkeypatch.setattr("app.core.provider.WhatsAppProvider.send_text", fake_send_text)
+    monkeypatch.setattr(quote_nudges.send_quote_nudge, "apply_async", lambda *a, **kw: None)
+
+    result = quote_nudges.send_quote_nudge(
+        quoted_context.id, account.id, quoted_context.pending_quote_at.isoformat(), 1
+    )
+
+    assert result == "Success"
+    assert "Shoes" in sent["body"]
