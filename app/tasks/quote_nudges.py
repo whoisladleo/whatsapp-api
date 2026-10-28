@@ -66,14 +66,44 @@ def send_quote_nudge(context_id: str, account_id: str, scheduled_quote_at_iso: s
             return "Account not found."
 
         from app.core.provider import WhatsAppProvider
+        from app.db.models import Product
         from app.services import usage
 
         product_name = context.current_product_intent or "that item"
         body = f"Still interested in the {product_name}? Happy to hold it for you if you let me know."
 
+        # D3: a nudge targets one specific quoted product mid-consideration —
+        # the highest-value moment for a visual card. Resolve it the same way
+        # _track_quote/_close_deal do, and only attempt the card while it's
+        # sellable (quantity>=1, not merchant-deactivated — same rule as
+        # product_to_catalog_item); anything else keeps today's plain text.
+        # The helper falls back to the identical line on any card failure, so
+        # this stays one Meta-accepted send either way (metering unchanged),
+        # and the logged body stays accurate whichever path was taken.
+        product = None
+        if context.current_product_intent:
+            product = (
+                db.query(Product)
+                .filter(
+                    Product.merchant_id == account.user_id,
+                    Product.name.ilike(context.current_product_intent),
+                )
+                .first()
+            )
+        cardable = (
+            product is not None
+            and (product.quantity or 0) >= 1
+            and product.is_active is not False
+        )
+
         provider = WhatsAppProvider(account.access_token, account.phone_number_id)
         try:
-            resp = _send_sync(provider, customer.phone_number, body)
+            if cardable:
+                resp = asyncio.run(
+                    provider.send_product_card_or_text(customer.phone_number, product, body)
+                )
+            else:
+                resp = _send_sync(provider, customer.phone_number, body)
         except Exception as e:
             logger.error(f"Quote nudge send failed for context {context_id}: {e}")
             resp = None
