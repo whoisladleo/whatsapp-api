@@ -91,6 +91,10 @@ async def pay_now(db: Session, user: User, phone_number: Optional[str]) -> dict:
     db.commit()
     db.refresh(order)
 
+    # The decrement above may have taken the last unit.
+    from app.tasks.catalog_sync import dispatch_catalog_sync
+    dispatch_catalog_sync(product.id, "upsert")
+
     # Reuses an existing unpaid attempt for this customer+product rather
     # than inserting a new row every time Pay Now is clicked — see
     # product_subscription.get_or_create_pending_subscription.
@@ -125,3 +129,5 @@ def _release_failed_order(db: Session, order: Order, product: Product) -> None:
     product.quantity += order.quantity or 1
     order.status = OrderStatus.CANCELLED
     db.commit()
+    from app.tasks.catalog_sync import dispatch_catalog_sync
+    dispatch_catalog_sync(product.id, "upsert")

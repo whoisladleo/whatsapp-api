@@ -35,16 +35,22 @@ def create_product(db: Session, product_in: ProductCreate, merchant_id: uuid.UUI
     db.add(db_product)
     db.commit()
     db.refresh(db_product)
+    # Best-effort Meta catalog sync: silent no-op when CATALOG_* is unset,
+    # never breaks this write (see app/tasks/catalog_sync.py).
+    from app.tasks.catalog_sync import dispatch_catalog_sync
+    dispatch_catalog_sync(db_product.id, "upsert")
     return db_product
 
 def update_product(db: Session, db_product: Product, product_in: ProductUpdate) -> Product:
     update_data = product_in.model_dump(exclude_unset=True)
     for field, value in update_data.items():
         setattr(db_product, field, value)
-    
+
     db.add(db_product)
     db.commit()
     db.refresh(db_product)
+    from app.tasks.catalog_sync import dispatch_catalog_sync
+    dispatch_catalog_sync(db_product.id, "upsert")
     return db_product
 
 def update_product_stock(
@@ -63,11 +69,16 @@ def update_product_stock(
     db.add(db_product)
     db.commit()
     db.refresh(db_product)
+    from app.tasks.catalog_sync import dispatch_catalog_sync
+    dispatch_catalog_sync(db_product.id, "upsert")
     return db_product
 
 def delete_product(db: Session, db_product: Product) -> None:
+    retailer_id = str(db_product.id)
     db.delete(db_product)
     db.commit()
+    from app.tasks.catalog_sync import dispatch_catalog_sync
+    dispatch_catalog_sync(retailer_id, "delete")
 
 def bulk_upsert_products(db: Session, merchant_id: uuid.UUID, products_data: List[dict], dry_run: bool = False) -> dict:
     """
@@ -81,7 +92,12 @@ def bulk_upsert_products(db: Session, merchant_id: uuid.UUID, products_data: Lis
         "duplicate_products_count": 0,
         "duplicate_skus": []
     }
-    
+
+    # Rows actually written, for the catalog sync below (dry runs write
+    # nothing, so there is nothing to sync).
+    touched_ids = []
+    new_products = []
+
     for p_data in products_data:
         sku = p_data.get("sku")
         db_product = None
@@ -100,6 +116,7 @@ def bulk_upsert_products(db: Session, merchant_id: uuid.UUID, products_data: Lis
                     if hasattr(db_product, key) and key not in ['id', 'merchant_id', 'slug', 'created_at']:
                         setattr(db_product, key, value)
                 db.add(db_product)
+                touched_ids.append(db_product.id)
         else:
             stats["new_products_count"] += 1
             if not dry_run:
@@ -111,8 +128,14 @@ def bulk_upsert_products(db: Session, merchant_id: uuid.UUID, products_data: Lis
                     **p_data
                 )
                 db.add(new_product)
+                new_products.append(new_product)
 
     if not dry_run:
         db.commit()
-        
+        for new_product in new_products:
+            touched_ids.append(new_product.id)
+        from app.tasks.catalog_sync import dispatch_catalog_sync
+        for touched_id in touched_ids:
+            dispatch_catalog_sync(touched_id, "upsert")
+
     return stats

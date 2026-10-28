@@ -185,12 +185,19 @@ def auto_cancel_order(order_id: str):
 
         order.status = OrderStatus.CANCELLED
 
+        restored_product_id = None
         if order.product_id:
             product = db.query(Product).filter(Product.id == order.product_id).first()
             if product:
                 product.quantity += order.quantity or 1
+                restored_product_id = product.id
 
         db.commit()
+
+        if restored_product_id:
+            # The release may flip the catalog's availability back to in stock.
+            from app.tasks.catalog_sync import dispatch_catalog_sync
+            dispatch_catalog_sync(restored_product_id, "upsert")
 
         account = _account_for_order(db, order)
         if account and order.customer:

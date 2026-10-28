@@ -81,6 +81,8 @@ async def handle_merchant_message(db: Session, account: WhatsAppAccount, message
 
             product.quantity += qty_change
             db.commit()
+            from app.tasks.catalog_sync import dispatch_catalog_sync
+            dispatch_catalog_sync(product.id, "upsert")
             return f"Updated stock for '{product.name}'. New quantity: {product.quantity}"
         else:
             return "Invalid format. Example: `/stock Shoes +10`"
@@ -99,6 +101,8 @@ async def handle_merchant_message(db: Session, account: WhatsAppAccount, message
 
             product.quantity = 0
             db.commit()
+            from app.tasks.catalog_sync import dispatch_catalog_sync
+            dispatch_catalog_sync(product.id, "upsert")
             return f"'{product.name}' is now out of stock."
 
     elif body.lower().startswith("/price "):
@@ -119,6 +123,8 @@ async def handle_merchant_message(db: Session, account: WhatsAppAccount, message
             product.max_price = max_p
             product.min_price = min_p
             db.commit()
+            from app.tasks.catalog_sync import dispatch_catalog_sync
+            dispatch_catalog_sync(product.id, "upsert")
             return f"Updated prices for '{product.name}'. Max: {max_p}, Min: {min_p}"
         else:
             return "Invalid format. Example: `/price Shoes max:50000 min:40000`"
