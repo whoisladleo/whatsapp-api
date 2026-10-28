@@ -88,3 +88,7 @@ Production-tier decisions only — what was chosen, what was considered and reje
 
 **Chose:** per-file autouse `_pin_claude_provider` fixtures in the three Anthropic-shaped test files, so the suite is green regardless of ambient `LLM_PROVIDER` (demo `.env` sets `muse`). A conftest-level fixture was rejected because the Muse live eval needs ambient settings. 133 passed under both values.
 
+## IG post-media fetch, behavior-neutral (2026-10-27, #51)
+
+**Chose:** `InstagramProvider.get_media` (`GET /{media-id}` with caption, media_url, media_type, permalink, children) threaded best-effort through comment processing into an accepted-and-ignored `post_media` param. Carousel rule: first `IMAGE` child (fallback first child of any type). All failures (deleted/private, transport, parse) log and return `None`, never raise into the webhook path. Zero reply-behavior change — B2 consumes the data. Full suite 782 passed, coverage gate met. Live `get_media` deferred to staging: no IG user token exists locally (only app id + webhook verify token).
+
