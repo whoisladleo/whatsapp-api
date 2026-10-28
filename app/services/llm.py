@@ -848,6 +848,8 @@ Reply with EXACTLY two lines, nothing else, in this format:
 PUBLIC: <a short, friendly public reply visible to everyone — never state a price or personal details, just acknowledge them and say you've sent more info to their DMs>
 PRIVATE: <a short direct message with the actual details they're asking about, using only the catalog/knowledge above — never invent a product, price, stock level, or feature/detail that isn't there>
 
+If the comment has nothing to do with the shop's products (off-topic, spam, greetings), still use the same two-line format — briefly deflect and invite them to ask about products.
+
 All prices are in Tanzanian Shillings (TZS) — always state them exactly as given, including the TZS label. Never say "$", "USD", "dollars", or imply any other currency, and never convert the number into another currency.
 
 Match the customer's language (Swahili or English). Keep both lines to one sentence each.
@@ -857,7 +859,12 @@ Match the customer's language (Swahili or English). Keep both lines to one sente
             response_text = await self.provider.complete(
                 system=instruction,
                 messages=[{"role": "user", "content": "Respond as Amara:"}],
-                max_tokens=300,
+                # 300 truncated Muse on off-topic comments (reasoning
+                # exhausted the budget, finish_reason=length, content=None
+                # -> unparseable -> sends nothing). 500 matches the DM
+                # budget; Claude replies are short so the higher cap
+                # doesn't change its output.
+                max_tokens=500,
             )
         except Exception as e:
             logger.error(f"Comment-reply LLM error: {e}")
