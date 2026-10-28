@@ -92,3 +92,11 @@ Production-tier decisions only — what was chosen, what was considered and reje
 
 **Chose:** `InstagramProvider.get_media` (`GET /{media-id}` with caption, media_url, media_type, permalink, children) threaded best-effort through comment processing into an accepted-and-ignored `post_media` param. Carousel rule: first `IMAGE` child (fallback first child of any type). All failures (deleted/private, transport, parse) log and return `None`, never raise into the webhook path. Zero reply-behavior change — B2 consumes the data. Full suite 782 passed, coverage gate met. Live `get_media` deferred to staging: no IG user token exists locally (only app id + webhook verify token).
 
+## Vision product-match on comments (2026-10-27, #52)
+
+**Chose:** `app/services/vision_match.py`, Muse-only, strict parser accepting only an exact case-insensitive catalog name or `NO_MATCH` (prose/hedged/invented output becomes `None`, never raises). Matched product feeds one context line into the comment prompt directing naming to PRIVATE only. Transport is always server-side download plus base64 data URL: Meta's API returned 400 "URL is not fetchable by this service" for remote URLs. `max_tokens=500` after live-caught reasoning starvation at 100 (same truncation mode as #49). Live: 3/3 positive match, 3/3 NO_MATCH negative. All failure paths yield byte-identical prompts to pre-B2; Claude never calls vision. Full IG-post end-to-end deferred to staging (no IG token locally; IG-CDN signed-URL download unproven, fails soft).
+
+**Considered and rejected:**
+- *Passing remote URLs to the vision call.* Rejected by the API (400); base64 only.
+- *Fuzzy matching or model-picked prices.* Rejected: the reply may only name catalog rows at catalog prices; anything else is an invention path.
+
