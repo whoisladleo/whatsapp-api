@@ -7,6 +7,9 @@ import pytest
 
 from app.core.config import Settings
 from app.db.models import (
+    InstagramAccount,
+    InstagramConversationContext,
+    InstagramCustomer,
     Product,
     User,
     WhatsAppAccount,
@@ -179,3 +182,114 @@ async def test_openai_connection_error_raises_llm_unavailable_when_retrying(
         )
 
 
+@pytest.fixture
+def parity_ig_shop(db_session):
+    """Merchant + IG account + product for DM/comment parity tests (#50)."""
+    merchant = User(username="255700000301")
+    db_session.add(merchant)
+    db_session.commit()
+    account = InstagramAccount(
+        ig_business_id="ig_biz_parity", access_token="tok", username="parityshop",
+        ai_enabled=True, user_id=merchant.id,
+    )
+    db_session.add(account)
+    db_session.add(Product(
+        slug="parity-ig-shoes", name="Shoes", max_price=50000, min_price=40000,
+        quantity=3, merchant_id=merchant.id,
+    ))
+    db_session.commit()
+    return account
+
+
+def _dm_service_with_stubbed_complete(provider_name, captured, reply_text="Hi! They're 50,000 TZS."):
+    service = LLMService(api_key=None, provider=provider_name)
+    service.client = object()  # truthy so generate_dm_response doesn't short-circuit
+
+    async def stubbed_complete(*, system, messages, max_tokens):
+        captured["system"] = system
+        captured["messages"] = messages
+        captured["max_tokens"] = max_tokens
+        return reply_text
+
+    service.provider.complete = stubbed_complete
+    return service
+
+
+async def test_dm_system_prompt_identical_across_providers(db_session, parity_ig_shop):
+    """Both providers get the same DM instruction (#50).
+
+    generate_dm_response builds one prompt regardless of backend; if a
+    provider-conditional branch ever becomes necessary it must be a
+    deliberate, reviewed change — not something that slips in silently.
+    """
+    def fresh_customer(tag):
+        c = InstagramCustomer(ig_scoped_id=f"igsid_parity_{tag}", username=f"parity_{tag}", account_id=parity_ig_shop.id)
+        db_session.add(c)
+        db_session.commit()
+        ctx = InstagramConversationContext(customer_id=c.id)
+        db_session.add(ctx)
+        db_session.commit()
+        return c, ctx
+
+    captured_claude, captured_muse = {}, {}
+    claude = _dm_service_with_stubbed_complete("claude", captured_claude)
+    muse = _dm_service_with_stubbed_complete("muse", captured_muse)
+
+    c1, ctx1 = fresh_customer("c1")
+    await claude.generate_dm_response(
+        "How much for the shoes?", db=db_session, account=parity_ig_shop,
+        customer=c1, context=ctx1, conversation_history=[],
+    )
+    c2, ctx2 = fresh_customer("c2")
+    await muse.generate_dm_response(
+        "How much for the shoes?", db=db_session, account=parity_ig_shop,
+        customer=c2, context=ctx2, conversation_history=[],
+    )
+
+    assert captured_muse["system"] == captured_claude["system"]
+    # Guard against vacuous equality: the shared prompt must carry the
+    # buffered floor (10% above the 40,000 real floor) and the phone-bearing
+    # agreement format.
+    assert "44,000" in captured_muse["system"]
+    assert "phone=<phone number>" in captured_muse["system"]
+    assert captured_muse["max_tokens"] == captured_claude["max_tokens"] == 500
+
+
+def _comment_service_with_stubbed_complete(provider_name, captured):
+    service = LLMService(api_key=None, provider=provider_name)
+    service.client = object()  # truthy so generate_comment_reply doesn't short-circuit
+
+    async def stubbed_complete(*, system, messages, max_tokens):
+        captured["system"] = system
+        captured["messages"] = messages
+        captured["max_tokens"] = max_tokens
+        return "PUBLIC: Thanks! Sent you a DM.\nPRIVATE: They're 50,000 TZS."
+
+    service.provider.complete = stubbed_complete
+    return service
+
+
+async def test_comment_system_prompt_identical_across_providers(db_session, parity_ig_shop):
+    """Both providers get the same comment instruction (#50).
+
+    Same rationale as the WhatsApp/DM parity tests: one shared wording,
+    no silent provider-conditional branches.
+    """
+    captured_claude, captured_muse = {}, {}
+    claude = _comment_service_with_stubbed_complete("claude", captured_claude)
+    muse = _comment_service_with_stubbed_complete("muse", captured_muse)
+
+    await claude.generate_comment_reply(
+        "How much?", merchant_id=parity_ig_shop.user_id, db=db_session,
+    )
+    await muse.generate_comment_reply(
+        "How much?", merchant_id=parity_ig_shop.user_id, db=db_session,
+    )
+
+    assert captured_muse["system"] == captured_claude["system"]
+    # Guard against vacuous equality: currency guardrail, off-topic
+    # guidance (#50), and the PUBLIC:/PRIVATE: format must all be present.
+    assert "Tanzanian Shillings" in captured_muse["system"]
+    assert "has nothing to do with the shop" in captured_muse["system"]
+    assert "PUBLIC:" in captured_muse["system"]
+    assert captured_muse["max_tokens"] == captured_claude["max_tokens"] == 500

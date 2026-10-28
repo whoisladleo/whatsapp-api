@@ -44,6 +44,13 @@ def _service_with_fake_client(handler=None, captured=None):
     return service
 
 
+@pytest.fixture(autouse=True)
+def _pin_claude_provider(monkeypatch):
+    """These tests stub an Anthropic-shaped client, so pin the provider they
+    exercise to Claude regardless of ambient LLM_PROVIDER."""
+    monkeypatch.setattr("app.services.llm.settings.LLM_PROVIDER", "claude")
+
+
 @pytest.fixture
 def merchant(db_session):
     owner = User(username="255700000300")
@@ -104,6 +111,11 @@ async def test_generate_comment_reply_success(db_session, merchant, shoes):
     # instead — see llm.py's currency RULES additions.
     assert "Tanzanian Shillings" in captured["system"]
     assert '"$"' in captured["system"]
+    # Regression (#50): Muse returned empty (reasoning exhausted the 300
+    # budget, finish_reason=length) on off-topic comments with no guidance
+    # for what to do there — sends nothing. The prompt now tells both
+    # models to deflect in-format.
+    assert "has nothing to do with the shop" in captured["system"]
 
 
 async def test_generate_comment_reply_includes_product_description_in_catalog(db_session, merchant):

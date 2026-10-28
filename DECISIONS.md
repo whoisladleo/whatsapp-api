@@ -74,3 +74,17 @@ Production-tier decisions only — what was chosen, what was considered and reje
 
 **Known limits:** `minimal` is a latency/cost/quality tradeoff tuned for short sales replies; revisit if longer-form generations truncate. The vacuous-pass trap (empty reply satisfies floor assertions) is now covered by marker-evidence checks in the eval review, not by the assertions themselves.
 
+## IG comment off-topic deflect plus shared budget (2026-10-27, #50)
+
+**Chose:** one shared prompt line in `generate_comment_reply` (off-topic/spam/greetings still use the two-line format: brief deflect, invite product questions) plus `max_tokens` 300 to 500. Pre-fix, Muse truncated off-topic comments to empty (`finish_reason=length`) 5/5, which sends nothing; post-fix 6/7 deflect in-format. DM needed no changes (4/4 live). Claude behavior unchanged: the line only triggers off-topic and the higher cap cannot alter its short replies (Claude-path units green; Claude live key valid but full comment re-verification skipped as low-risk).
+
+**Considered and rejected:**
+- *Provider-conditional comment prompt.* Rejected: one wording satisfies both, locked by parity tests.
+- *Treating empty comment replies as success.* Rejected: silence on a public comment is a visible failure; B2's vision match further reduces off-topic incidence.
+
+**Known limits:** 6/7 post-fix reflects live non-determinism; one fragment observed in 7 runs.
+
+## Hermetic LLM unit tests (2026-10-27, #50 round 2)
+
+**Chose:** per-file autouse `_pin_claude_provider` fixtures in the three Anthropic-shaped test files, so the suite is green regardless of ambient `LLM_PROVIDER` (demo `.env` sets `muse`). A conftest-level fixture was rejected because the Muse live eval needs ambient settings. 133 passed under both values.
+

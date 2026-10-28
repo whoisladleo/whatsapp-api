@@ -80,6 +80,13 @@ def _service_with_fake_client(handler=None, captured=None):
     return service
 
 
+@pytest.fixture(autouse=True)
+def _pin_claude_provider(monkeypatch):
+    """These tests stub an Anthropic-shaped client, so pin the provider they
+    exercise to Claude regardless of ambient LLM_PROVIDER."""
+    monkeypatch.setattr("app.services.llm.settings.LLM_PROVIDER", "claude")
+
+
 @pytest.fixture
 def merchant(db_session):
     owner = User(username="255700000200")
