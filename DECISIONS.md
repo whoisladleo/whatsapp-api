@@ -116,3 +116,7 @@ Production-tier decisions only — what was chosen, what was considered and reje
 
 **Chose:** one shared `updateProductStock` server action plus per-row Switch (writes `is_active`) and quantity stepper (writes absolute quantity, floor 0) in `products-table.tsx`. Display status derives from the C1 sellability rule (`is_active && quantity > 0`), not the switch alone; in-flight `Set` with early return prevents cross-row double-submit and stale lost updates. `pnpm build` plus `pnpm lint` green (verified independently by orchestrator). Live PATCH wiring verified statically (no live backend reachable from dev); end-to-end toggle check deferred to E1 staging.
 
+## Catalog client plus mapping (2026-10-27, #56)
+
+**Chose:** `app/core/catalog_client.py` with `MetaCatalogClient` (`items_batch` upsert/delete plus status polling, typed errors) and pure `product_to_catalog_item`. Public data only: retailer_id (product id), name, `max_price` as `"50000.00 TZS"`, C1-mirrored availability, image, `wa.me` merchant-chat link. `min_price`/floor/cost asserted absent by key and value. Image: absolute R2 passthrough, relative joined to `PUBLIC_BASE_URL`, missing raises. No lifecycle hooks, no other behavior change. D1 is staging-unverified (no catalog credentials locally); six format assumptions flagged `STAGING` in code plus `CATALOG_SETUP.md` one-time setup doc. Full suite 856 passed.
+

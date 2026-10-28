@@ -182,6 +182,14 @@ class Settings(BaseSettings):
     WHATSAPP_USAGE_ALERT_TEMPLATE_LANGUAGE: str = "en"
     OPS_ALERT_PHONE: Optional[str] = None
 
+    # Meta Commerce catalog (D1: MetaCatalogClient only; D2 wires the
+    # product-lifecycle hooks). CATALOG_ACCESS_TOKEN is a business
+    # system-user token with catalog_management (and business_management for
+    # catalog setup) scopes — see CATALOG_SETUP.md. Both unset disables
+    # catalog sync entirely.
+    CATALOG_ID: Optional[str] = None
+    CATALOG_ACCESS_TOKEN: Optional[str] = None
+
     # Cloudflare R2
     R2_ACCOUNT_ID: Optional[str] = None
     R2_ACCESS_KEY_ID: Optional[str] = None
