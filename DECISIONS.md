@@ -104,3 +104,7 @@ Production-tier decisions only — what was chosen, what was considered and reje
 
 **Chose:** `_is_out_of_stock` helper (`(quantity or 0) < 1` or `is_active is False`; legacy `is_active=None` counts in-stock) with ` (OUT OF STOCK)` markers kept listed in all three catalog builders, plus a RULES line in all three prompts (never offer/quote/agree, name it plainly, pivot to an alternative). Close-time `DealRejected` stays the backstop. Live probes: never-offer held 6/6; explicit naming inconsistent, so systematic naming verification deferred to E1 rehearsal. Full suite 812 passed.
 
+## Atomic stock claim at close (2026-10-27, #54)
+
+**Chose:** `_try_claim_stock` conditional `UPDATE ... SET quantity = quantity - 1 WHERE id = ... AND quantity >= 1` (rowcount decides; same claim style as `claim_available_pool_number`, portable SQLite/Postgres) in both close paths, replacing read-modify-write. 0-row raises `DealRejected` with messages byte-identical to each pre-check, funneling into identical holding-reply plus handoff. Also fixed adjacent pre-existing NULL bug: pre-checks now `(quantity or 0) < 1` (NULL raised `TypeError`, violating the `DealRejected` contract). Race coverage is deterministic (stale-held second close proves the stub fires; negative-control probes verified both fixes guard real behavior) — threads rejected: suite runs on one StaticPool `:memory:` connection where a threaded race would be flaky by construction. Full unit 535 passed.
+
