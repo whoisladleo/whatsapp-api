@@ -47,6 +47,11 @@ class Settings(BaseSettings):
     INSTAGRAM_OAUTH_AUTHORIZE_URL: str = "https://www.instagram.com/oauth/authorize"
     INSTAGRAM_OAUTH_TOKEN_URL: str = "https://api.instagram.com/oauth/access_token"
     INSTAGRAM_REDIRECT_URI: Optional[str] = None
+    # Instagram Login (merchant sign-in, /auth/instagram/*) — same Meta App
+    # as the channel-connect flow above, but Meta requires each OAuth flow
+    # to have its own authorize-registered redirect URI, so login gets its
+    # own callback rather than reusing INSTAGRAM_REDIRECT_URI.
+    INSTAGRAM_LOGIN_REDIRECT_URI: Optional[str] = None
     # Where to send the merchant's browser back to once the OAuth callback
     # finishes (success or failure) — the dashboard's settings page.
     DASHBOARD_URL: str = "https://business.taskflowos.dev"

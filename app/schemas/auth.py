@@ -25,6 +25,9 @@ class Token(BaseModel):
 class TokenPayload(BaseModel):
     sub: Optional[str] = None
 
+class InstagramExchangeRequest(BaseModel):
+    code: str
+
 class UserProfile(BaseModel):
     id: uuid.UUID
     username: Optional[str] = None
