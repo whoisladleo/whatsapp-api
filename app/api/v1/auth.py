@@ -1,4 +1,10 @@
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
+import secrets
+import uuid
+from typing import Optional
+
+import jwt
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request
+from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 from datetime import timedelta, datetime
 
@@ -13,17 +19,27 @@ from app.schemas.auth import (
     Token,
     OTPRequest,
     OTPVerify,
+    InstagramExchangeRequest,
     UserProfile,
     UserProfileUpdate,
     MySubscriptionRead,
     PayNowRequest,
     PayNowResponse,
 )
+from app.crud import instagram as crud_instagram
 from app.crud import user as crud_user
 from app.core.provider import WhatsAppProvider
-from app.services import self_service_billing
+from app.services import instagram_oauth, self_service_billing
 
 router = APIRouter()
+
+# Instagram Login: the /callback redirect only carries a short-lived login
+# code (exchanged for the real session token by /exchange) rather than the
+# token itself, so a long-lived credential never ends up in a URL — browser
+# history, server access logs, etc. Same shape as the removed Facebook
+# Login, which solved the same problem (unreliable WhatsApp OTP) before.
+INSTAGRAM_LOGIN_CODE_EXPIRE_MINUTES = 2
+INSTAGRAM_LOGIN_STATE_EXPIRE_MINUTES = 10
 
 # Kept in sync with WHATSAPP_OTP_TEMPLATE_LANGUAGE so the plain-text
 # fallback (sent when the template send fails, or is unconfigured) is in
@@ -159,7 +175,123 @@ def verify_otp(
         
     # Clear OTP after successful verification
     crud_user.clear_user_otp(db, user)
-    
+
+    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    return {
+        "access_token": security.create_access_token(
+            user.id, expires_delta=access_token_expires
+        ),
+        "token_type": "bearer",
+    }
+
+
+@router.get("/instagram/start")
+async def start_instagram_login(request: Request):
+    """
+    An independent alternative to WhatsApp OTP login — no current_user
+    dependency, since unlike Instagram's channel-connect oauth/start, this
+    endpoint IS the login mechanism and there's no session yet.
+    """
+    client_ip = request.client.host if request.client else "unknown"
+    if not check_and_increment(f"ig_login_start:{client_ip}", limit=30, window_seconds=300):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many login attempts. Please wait a few minutes and try again.",
+        )
+
+    # Signed state (not a bare random string): /callback verifies the
+    # signature + expiry without any server-side storage, so a forged or
+    # replayed state from another flow can't drive this one.
+    state = jwt.encode(
+        {
+            "nonce": secrets.token_urlsafe(16),
+            "exp": datetime.utcnow() + timedelta(minutes=INSTAGRAM_LOGIN_STATE_EXPIRE_MINUTES),
+        },
+        settings.SECRET_KEY,
+        algorithm=settings.ALGORITHM,
+    )
+    return {"authorize_url": instagram_oauth.build_login_authorize_url(state)}
+
+
+@router.get("/instagram/callback")
+async def instagram_login_callback(
+    db: Session = Depends(get_db),
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
+):
+    """
+    Meta redirects the merchant's browser here after the consent screen.
+    Finds-or-creates the User by ig_user_id (an IG already connected under
+    a phone-based account logs into that same user — that match IS the
+    account link), auto-connects the DM channel via upsert_account, and
+    redirects to the dashboard with a short-lived login code.
+    """
+    login_url = f"{settings.DASHBOARD_URL}/login"
+
+    if error or not code or not state:
+        return RedirectResponse(f"{login_url}?ig_error=1")
+
+    try:
+        payload = jwt.decode(state, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        payload["nonce"]
+    except (jwt.InvalidTokenError, KeyError, TypeError):
+        return RedirectResponse(f"{login_url}?ig_error=1")
+
+    try:
+        short_lived_token = await instagram_oauth.exchange_code_for_short_lived_token(
+            code, redirect_uri=settings.INSTAGRAM_LOGIN_REDIRECT_URI
+        )
+        long_lived_token = await instagram_oauth.exchange_for_long_lived_token(short_lived_token)
+        ig_user_id, username = await instagram_oauth.fetch_account_identity(long_lived_token)
+    except instagram_oauth.InstagramOAuthError as e:
+        print(f"Instagram login exchange failed: {e}")
+        return RedirectResponse(f"{login_url}?ig_error=1")
+
+    existing = crud_instagram.get_account_by_ig_business_id(db, ig_user_id)
+    if existing is not None and existing.owner is not None:
+        user = existing.owner
+    else:
+        user = crud_user.create_instagram_user(db, username)
+
+    # Same upsert as the channel-connect flow: creates the row for a new
+    # merchant, refreshes the token for a returning one, and takes over a
+    # stale/orphaned row on collision (most recent OAuth consent wins).
+    crud_instagram.upsert_account(db, user.id, ig_user_id, long_lived_token, username)
+
+    try:
+        # Messages-only: this token was granted without the comments scope.
+        await instagram_oauth.subscribe_to_webhooks(long_lived_token, fields="messages")
+    except instagram_oauth.InstagramOAuthError as e:
+        print(f"Failed to subscribe {ig_user_id} to Instagram webhooks on login: {e}")
+
+    login_code = security.create_access_token(
+        user.id, expires_delta=timedelta(minutes=INSTAGRAM_LOGIN_CODE_EXPIRE_MINUTES)
+    )
+    return RedirectResponse(f"{login_url}?ig_code={login_code}")
+
+
+@router.post("/instagram/exchange", response_model=Token)
+def exchange_instagram_login_code(payload: InstagramExchangeRequest, db: Session = Depends(get_db)):
+    """Trades the short-lived code from /instagram/callback for a real session token."""
+    if not check_and_increment(
+        f"ig_login_exchange:{payload.code[-12:]}", limit=5, window_seconds=300
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many attempts. Please start Instagram login again.",
+        )
+
+    try:
+        decoded = jwt.decode(payload.code, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        user_id = uuid.UUID(decoded["sub"])
+    except (jwt.InvalidTokenError, KeyError, TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="Invalid or expired login code")
+
+    user = crud_user.get_user(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
     access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     return {
         "access_token": security.create_access_token(

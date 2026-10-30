@@ -25,7 +25,31 @@ def build_authorize_url(state: str) -> str:
     return f"{settings.INSTAGRAM_OAUTH_AUTHORIZE_URL}?{urlencode(params)}"
 
 
-async def exchange_code_for_short_lived_token(code: str) -> str:
+# Login-time scopes: identity + DM automation only. manage_comments is
+# deliberately excluded — Meta hasn't approved it, and requesting an
+# unapproved scope makes the whole authorize request fail for merchants
+# outside the app's test roles. The login flow auto-connects the DM
+# channel (same as /oauth/callback minus comments), so this is all a
+# new merchant needs on day one.
+LOGIN_SCOPES = "instagram_business_basic,instagram_business_manage_messages"
+
+
+def build_login_authorize_url(state: str) -> str:
+    """Authorize URL for Instagram Login (/auth/instagram/start) — same app
+    as the channel-connect flow, but its own redirect URI and scopes."""
+    params = {
+        "client_id": settings.INSTAGRAM_APP_ID,
+        "redirect_uri": settings.INSTAGRAM_LOGIN_REDIRECT_URI,
+        "response_type": "code",
+        "scope": LOGIN_SCOPES,
+        "state": state,
+    }
+    return f"{settings.INSTAGRAM_OAUTH_AUTHORIZE_URL}?{urlencode(params)}"
+
+
+async def exchange_code_for_short_lived_token(code: str, redirect_uri: str | None = None) -> str:
+    # Meta requires the token exchange to echo the exact redirect_uri the
+    # authorize request used — the login flow passes its own.
     async with httpx.AsyncClient() as client:
         response = await client.post(
             settings.INSTAGRAM_OAUTH_TOKEN_URL,
@@ -33,7 +57,7 @@ async def exchange_code_for_short_lived_token(code: str) -> str:
                 "client_id": settings.INSTAGRAM_APP_ID,
                 "client_secret": settings.INSTAGRAM_APP_SECRET,
                 "grant_type": "authorization_code",
-                "redirect_uri": settings.INSTAGRAM_REDIRECT_URI,
+                "redirect_uri": redirect_uri or settings.INSTAGRAM_REDIRECT_URI,
                 "code": code,
             },
         )
@@ -82,19 +106,20 @@ async def fetch_account_identity(access_token: str) -> Tuple[str, str]:
     return ig_user_id, data.get("username")
 
 
-async def subscribe_to_webhooks(access_token: str) -> None:
+async def subscribe_to_webhooks(access_token: str, fields: str = "comments,messages") -> None:
     """
     The app-level webhook callback URL/verify token (configured once in the
     Meta dashboard) isn't enough on its own — each connected account has to
     separately opt itself in via this call, using its own access token, or
     Meta never sends comment events for it. Best-effort: logged by the
     caller rather than raised, since a failure here shouldn't block the
-    OAuth flow itself completing.
+    OAuth flow itself completing. The login flow passes messages-only —
+    its token was granted without the comments scope.
     """
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"{settings.INSTAGRAM_GRAPH_BASE_URL}/me/subscribed_apps",
-            params={"subscribed_fields": "comments,messages", "access_token": access_token},
+            params={"subscribed_fields": fields, "access_token": access_token},
         )
     data = response.json()
     if not data.get("success"):
