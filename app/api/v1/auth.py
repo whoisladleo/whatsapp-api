@@ -3,13 +3,13 @@ import uuid
 from typing import Optional
 
 import jwt
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, status, BackgroundTasks, Request
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 from datetime import timedelta, datetime
 
-from app.api.deps import get_current_user
-from app.db.models import User
+from app.api.deps import forbid_impersonated, get_current_user, get_impersonation
+from app.db.models import SupportAccessKind, User
 from app.db.session import get_db
 from app.core import security
 from app.core.config import settings
@@ -20,6 +20,10 @@ from app.schemas.auth import (
     OTPRequest,
     OTPVerify,
     InstagramExchangeRequest,
+    ImpersonateRequest,
+    ImpersonatorRef,
+    MerchantListRead,
+    SessionRead,
     UserProfile,
     UserProfileUpdate,
     MySubscriptionRead,
@@ -30,6 +34,7 @@ from app.crud import instagram as crud_instagram
 from app.crud import user as crud_user
 from app.core.provider import WhatsAppProvider
 from app.services import instagram_oauth, self_service_billing
+from app.services import support_access
 
 router = APIRouter()
 
@@ -301,6 +306,148 @@ def exchange_instagram_login_code(payload: InstagramExchangeRequest, db: Session
     }
 
 
+@router.post("/impersonate", response_model=Token)
+def impersonate_merchant(
+    payload: ImpersonateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    _own_session: None = Depends(forbid_impersonated),
+):
+    """
+    Support access (#75): an allow-listed operator mints a short-lived
+    token acting as a merchant. forbid_impersonated blocks nesting (an
+    impersonated token can never mint); the operator check below uses
+    verified identities only (see support_access).
+    """
+    operator_label = support_access.operator_match(db, current_user)
+    if operator_label is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Support access only.",
+        )
+    if not check_and_increment(
+        f"impersonate:{current_user.id}", limit=20, window_seconds=3600
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many impersonation attempts. Try again later.",
+        )
+
+    digits = normalize_phone((payload.target_phone or "").strip())
+    target = None
+    if digits:
+        target = crud_user.get_user_by_username(db, digits)
+    if target is None and digits:
+        target = crud_user.get_user_by_phone_number(db, digits)
+    if target is None:
+        raise HTTPException(status_code=404, detail="Merchant not found")
+    if target.id == current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="You are already yourself.",
+        )
+    if support_access.is_support_operator(db, target):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot impersonate another operator.",
+        )
+
+    token = support_access.create_impersonation_token(target.id, current_user.id)
+    support_access.record_support_event(
+        db, current_user.id, target.id, SupportAccessKind.START,
+        operator_label=operator_label,
+        target_label=support_access.target_label(target),
+    )
+    return {"access_token": token, "token_type": "bearer"}
+
+
+@router.post("/impersonate/exit")
+def exit_impersonation(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    impersonation=Depends(get_impersonation),
+):
+    """
+    Ends an impersonated session audit-side. Stateless JWTs can't be
+    revoked — the 30-minute expiry bounds the token — so this records END
+    and the dashboard drops the token and restores the operator session.
+    """
+    if impersonation is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Not an impersonated session.",
+        )
+    operator = crud_user.get_user(db, impersonation.operator_id)
+    support_access.record_support_event(
+        db, impersonation.operator_id, current_user.id, SupportAccessKind.END,
+        operator_label=(
+            support_access.operator_match(db, operator) if operator else None
+        ),
+        target_label=support_access.target_label(current_user),
+    )
+    return {"success": True}
+
+
+@router.get("/session", response_model=SessionRead)
+def get_session(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    impersonation=Depends(get_impersonation),
+):
+    """Who this token acts as, operator status, and who's behind the mask."""
+    if impersonation is not None:
+        operator = crud_user.get_user(db, impersonation.operator_id)
+        return SessionRead(
+            user=current_user,
+            is_operator=True,
+            impersonated_by=ImpersonatorRef(
+                id=impersonation.operator_id,
+                label=(
+                    support_access.operator_match(db, operator)
+                    if operator else None
+                ),
+            ),
+        )
+    return SessionRead(
+        user=current_user,
+        is_operator=support_access.is_support_operator(db, current_user),
+        impersonated_by=None,
+    )
+
+
+@router.get("/merchants", response_model=MerchantListRead)
+def list_merchants(
+    q: Optional[str] = Query(default=None, max_length=100),
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    _own_session: None = Depends(forbid_impersonated),
+):
+    """
+    Support access (#75): operator-only merchant list backing the /admin UI.
+    Returns exactly the merchants this operator can impersonate — operators
+    and self are excluded (minting for either is a 400 anyway). Reads are
+    not audit-logged (same rule as the WRITE-only middleware); the START
+    row on impersonate bounds the window.
+    """
+    if support_access.operator_match(db, current_user) is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Support access only.",
+        )
+    candidates = crud_user.search_users(db, q)
+    impersonable = [
+        user for user in candidates
+        if user.id != current_user.id
+        and not support_access.is_support_operator(db, user)
+    ]
+    return MerchantListRead(
+        items=impersonable[offset:offset + limit],
+        total=len(impersonable),
+    )
+
+
 @router.get("/me", response_model=UserProfile)
 def get_my_profile(current_user: User = Depends(get_current_user)):
     return current_user
@@ -352,6 +499,7 @@ async def pay_now(
     payload: PayNowRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    _own_session: None = Depends(forbid_impersonated),
 ):
     """
     Dashboard-native Pay Now for Taskflow's own subscription — same flow

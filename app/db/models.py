@@ -55,6 +55,11 @@ class AmaraEventKind(enum.Enum):
     PAYMENT = "PAYMENT"
     USAGE_WARNING = "USAGE_WARNING"
 
+class SupportAccessKind(enum.Enum):
+    START = "START"  # operator minted an impersonation token
+    END = "END"  # operator exited (or the token expired server-side)
+    WRITE = "WRITE"  # one impersonated mutating API call (method+path only)
+
 class PhoneNumberStatus(enum.Enum):
     AVAILABLE = "AVAILABLE"
     ASSIGNED = "ASSIGNED"
@@ -600,3 +605,29 @@ class AmaraEvent(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     __table_args__ = (Index("ix_amara_events_merchant_kind_created", "merchant_id", "kind", "created_at"),)
+
+class SupportAccessEvent(Base):
+    """
+    Append-only audit ledger for support impersonation (#75): who acted as
+    whom, when, and what they touched. Ids are stored WITHOUT FKs on
+    purpose (same rationale as AmaraEvent): users can be hard-deleted, and
+    an audit record must outlive them. Labels snapshot the human-readable
+    identity at write time for the same reason. No request bodies, ever.
+    """
+    __tablename__ = "support_access_events"
+
+    id = Column(UUIDType, primary_key=True, default=uuid.uuid4, index=True)
+    operator_id = Column(UUIDType, nullable=False)
+    operator_label = Column(String, nullable=True)  # verified phone or @handle
+    target_id = Column(UUIDType, nullable=False)
+    target_label = Column(String, nullable=True)
+    kind = Column(Enum(SupportAccessKind), nullable=False)
+    method = Column(String, nullable=True)  # WRITE rows only (POST/PUT/...)
+    path = Column(String, nullable=True)  # WRITE rows only, no query string
+    detail = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("ix_support_access_target_created", "target_id", "created_at"),
+        Index("ix_support_access_operator_created", "operator_id", "created_at"),
+    )

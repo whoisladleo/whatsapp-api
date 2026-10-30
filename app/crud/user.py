@@ -1,7 +1,8 @@
 import uuid
-from typing import Optional
+from typing import List, Optional
 
-from sqlalchemy.orm import Session
+from sqlalchemy import or_
+from sqlalchemy.orm import Session, selectinload
 from app.db.models import User
 from datetime import datetime
 
@@ -58,6 +59,28 @@ def clear_user_otp(db: Session, user: User) -> User:
 
 def get_user_by_phone_number(db: Session, phone_number: str) -> Optional[User]:
     return db.query(User).filter(User.phone_number == phone_number).first()
+
+
+def search_users(db: Session, q: Optional[str], cap: int = 1000) -> List[User]:
+    """
+    Support-list candidates for GET /auth/merchants: newest first, optional
+    case-insensitive match on username / phone_number / business_name / name.
+    Eager-loads instagram_accounts so the caller's operator check doesn't
+    N+1. Capped (not paged): the caller filters operators out in Python —
+    operator status lives in env + linked rows, not a column — then pages.
+    Fine at support scale; revisit past ~1k merchants.
+    """
+    query = db.query(User).options(selectinload(User.instagram_accounts))
+    needle = (q or "").strip()
+    if needle:
+        like = f"%{needle}%"
+        query = query.filter(or_(
+            User.username.ilike(like),
+            User.phone_number.ilike(like),
+            User.business_name.ilike(like),
+            User.name.ilike(like),
+        ))
+    return query.order_by(User.created_at.desc()).limit(cap).all()
 
 
 def set_user_phone_number(db: Session, user: User, phone_number: Optional[str]) -> User:

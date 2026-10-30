@@ -11,6 +11,18 @@ class Settings(BaseSettings):
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 7 days
 
+    # Support impersonation (#75): comma-separated verified identities
+    # allowed to mint impersonation tokens. Phones match User.username
+    # only (the OTP-verified number — self-reported phone_number never
+    # grants this, or any IG-login user could claim an operator's number
+    # via PATCH /me). Instagram entries match the handle of a linked,
+    # Meta-verified InstagramAccount ("@" optional, case-insensitive); a
+    # handle rename breaks access until this is updated. Unset/empty =
+    # nobody can impersonate.
+    SUPPORT_OPERATOR_PHONES: Optional[str] = None
+    SUPPORT_OPERATOR_INSTAGRAMS: Optional[str] = None
+    IMPERSONATION_TOKEN_EXPIRE_MINUTES: int = 30
+
     # Postgres
     POSTGRES_SERVER: str = "db"
     POSTGRES_PORT: str = "5432"

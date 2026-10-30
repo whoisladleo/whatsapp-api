@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.v1 import auth, whatsapp, instagram, knowledge, tunzaa_webhook, accounts, products, orders, pool, stats
+from app.core.audit_middleware import SupportAuditMiddleware
 from app.core.config import settings
 
 from fastapi.staticfiles import StaticFiles
@@ -29,6 +30,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Support-impersonation audit (#75): one WRITE row per mutating API call
+# made with an impersonated token. Never breaks requests.
+app.add_middleware(SupportAuditMiddleware)
 
 
 app.include_router(auth.router, prefix=f"{settings.API_V1_STR}/auth", tags=["auth"])

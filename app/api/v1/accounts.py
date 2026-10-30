@@ -14,7 +14,7 @@ from app.crud.account import (
     create_account, get_account_by_id, get_accounts_by_user,
     update_account, delete_account,
 )
-from app.api.deps import get_current_user
+from app.api.deps import forbid_impersonated, get_current_user
 from app.core.config import settings
 from app.services import number_billing
 
@@ -184,6 +184,7 @@ async def purchase_number(
     account_id: uuid.UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    _own_session: None = Depends(forbid_impersonated),
 ):
     """
     Starts a paid, on-demand number purchase (10,000 TZS/month) — numbers
