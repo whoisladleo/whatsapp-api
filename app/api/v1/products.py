@@ -9,10 +9,19 @@ import shutil
 import uuid
 from app.db.session import get_db
 from app.db.models import User
-from app.schemas.product import ProductCreate, ProductUpdate, ProductStockUpdate, ProductResponse
+from app.schemas.product import (
+    ProductCreate, ProductUpdate, ProductStockUpdate, ProductResponse,
+    CatalogImportRequest,
+)
+from app.core.catalog_client import (
+    IMPORT_MAX_ITEMS, MetaCatalogClient, catalog_item_to_product_data,
+    CatalogError, CatalogMappingError,
+)
+from app.core.config import settings
 from app.crud.product import (
     create_product, get_product_by_id, get_products_by_merchant,
-    update_product, update_product_stock, delete_product, bulk_upsert_products
+    update_product, update_product_stock, delete_product, bulk_upsert_products,
+    import_catalog_products,
 )
 from app.api.deps import get_current_user
 
@@ -130,6 +139,74 @@ def upload_csv_bulk(
         return stats
         
     return {"message": "Successfully processed products", "stats": stats}
+
+@router.post("/import/instagram-shop", status_code=status.HTTP_200_OK)
+async def import_instagram_shop(
+    payload: CatalogImportRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    One-time import of a merchant's Instagram Shop (Commerce catalog)
+    into Taskflow products (#73). The merchant grants Taskflow partner
+    access to their catalog out-of-band, then pastes the catalog id here
+    (or via the dashboard button). Unmappable items (missing title/price,
+    non-TZS currency) and already-present products are skipped with
+    reasons — the response reports imported/skipped, never partial-fails.
+    """
+    if not settings.CATALOG_ACCESS_TOKEN:
+        raise HTTPException(
+            status_code=503, detail="Catalog import isn't configured yet."
+        )
+
+    catalog_id = (payload.catalog_id or "").strip()
+    if not catalog_id:
+        raise HTTPException(status_code=422, detail="catalog_id is required.")
+
+    client = MetaCatalogClient(catalog_id, settings.CATALOG_ACCESS_TOKEN)
+    raw_items = []
+    after = None
+    truncated = False
+    try:
+        while len(raw_items) < IMPORT_MAX_ITEMS:
+            page = await client.list_products(limit=100, after=after)
+            data = page.get("data")
+            if not isinstance(data, list):
+                raise CatalogError(f"catalog products returned no data list: {page!r}")
+            raw_items.extend(data)
+            after = (page.get("paging") or {}).get("cursors", {}).get("after")
+            if not after or not data:
+                # An empty page ends the import even if Meta still sends a
+                # cursor — otherwise a pathological empty-but-cursored page
+                # would loop forever without raw_items ever growing.
+                break
+        else:
+            truncated = True
+    except CatalogError as e:
+        # Permission-shaped failures (no partner grant yet, wrong catalog
+        # id) surface Meta's message so the dashboard can tell the merchant
+        # what to fix, instead of a bare 502.
+        raise HTTPException(status_code=502, detail=f"Could not read catalog: {e}")
+
+    if len(raw_items) > IMPORT_MAX_ITEMS:
+        raw_items = raw_items[:IMPORT_MAX_ITEMS]
+        truncated = True
+
+    products_data = []
+    mapping_skipped = []
+    for item in raw_items:
+        try:
+            products_data.append(catalog_item_to_product_data(item))
+        except CatalogMappingError as e:
+            label = item.get("title") or item.get("id") if isinstance(item, dict) else None
+            mapping_skipped.append({"name": label or "unknown item", "reason": str(e)})
+
+    stats = import_catalog_products(db, current_user.id, products_data)
+    stats["skipped_count"] += len(mapping_skipped)
+    stats["skipped"].extend(mapping_skipped)
+    stats["total_items"] = len(raw_items)
+    stats["truncated"] = truncated
+    return stats
 
 @router.post("/{product_id}/image", response_model=ProductResponse)
 def upload_product_image(

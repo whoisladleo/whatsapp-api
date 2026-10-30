@@ -53,6 +53,12 @@ class ProductStockUpdate(BaseModel):
     quantity: Optional[int] = Field(default=None, ge=0)
     is_active: Optional[bool] = None
 
+class CatalogImportRequest(BaseModel):
+    # The merchant's own Commerce catalog id (Commerce Manager URL) — read
+    # via Taskflow's system-user token once the merchant grants partner
+    # access (see CATALOG_IMPORT_SETUP.md).
+    catalog_id: str
+
 
 class ProductResponse(ProductBase):
     id: uuid.UUID

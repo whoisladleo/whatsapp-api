@@ -1,3 +1,10 @@
+import uuid
+
+import pytest
+from sqlalchemy import select
+from sqlalchemy.dialects import postgresql, sqlite
+from sqlalchemy.orm import Query
+
 from app.crud import account as crud_account
 from app.crud import message as crud_message
 from app.crud import product as crud_product
@@ -69,3 +76,68 @@ def test_generate_slug_falls_back_to_uuid_for_unusable_name(db_session):
 
     assert slug != ""
     assert len(slug) == 8
+
+
+def test_lock_merchant_row_returns_merchant(db_session):
+    user = User(username="255700000702")
+    db_session.add(user)
+    db_session.commit()
+
+    locked = crud_product.lock_merchant_row(db_session, user.id)
+
+    assert locked.id == user.id
+
+
+def test_lock_merchant_row_missing_user_raises(db_session):
+    from sqlalchemy.exc import NoResultFound
+
+    with pytest.raises(NoResultFound):
+        crud_product.lock_merchant_row(db_session, uuid.uuid4())
+
+
+def test_import_catalog_products_holds_merchant_lock(db_session, monkeypatch):
+    """
+    Regression test for the simultaneous-import race: two imports for one
+    merchant must serialize on the merchant row, or both miss each other's
+    uncommitted rows and insert duplicates (no DB uniqueness on sku/name).
+    A real threaded race is untestable here — the suite runs on one
+    StaticPool :memory: SQLite connection — so this pins the wiring
+    instead: every import requests the row lock exactly once.
+    """
+    user = User(username="255700000703")
+    db_session.add(user)
+    db_session.commit()
+
+    calls = []
+    real_with_for_update = Query.with_for_update
+
+    def recording_with_for_update(self, *args, **kwargs):
+        calls.append((args, kwargs))
+        return real_with_for_update(self, *args, **kwargs)
+
+    monkeypatch.setattr(Query, "with_for_update", recording_with_for_update)
+
+    stats = crud_product.import_catalog_products(
+        db_session,
+        user.id,
+        [{"name": "Kettle", "max_price": 1.0, "min_price": 1.0, "sku": "igshop:1"}],
+    )
+
+    assert stats["imported_count"] == 1
+    assert len(calls) == 1
+
+
+def test_merchant_lock_renders_for_update_on_postgres_only():
+    """
+    Pins the dialect assumption the import guard rests on: Postgres honors
+    the row lock, SQLite silently renders a plain SELECT (which is why the
+    test above spies the method call instead of sniffing SQL, and why
+    SQLite correctness comes from its database-level writer serialization).
+    """
+    stmt = select(User.id).filter(User.id == uuid.uuid4()).with_for_update()
+
+    pg_sql = str(stmt.compile(dialect=postgresql.dialect()))
+    sqlite_sql = str(stmt.compile(dialect=sqlite.dialect()))
+
+    assert "FOR UPDATE" in pg_sql
+    assert "FOR UPDATE" not in sqlite_sql

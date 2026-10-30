@@ -1,9 +1,23 @@
+from sqlalchemy import func
 from sqlalchemy.orm import Session
-from app.db.models import Product
+from app.db.models import Product, User
 from app.schemas.product import ProductCreate, ProductUpdate
 from typing import List, Optional
 import re
 import uuid
+
+
+def lock_merchant_row(db: Session, merchant_id: uuid.UUID) -> User:
+    """
+    Row-locks the merchant's User row for the surrounding transaction
+    (SELECT ... FOR UPDATE on Postgres; silently a plain SELECT on
+    SQLite, which serializes writers at the database level instead).
+    Product rows can't be the lock target — the racy ones don't exist
+    yet — so the merchant row is the stable per-merchant serialization
+    point. Callers must hold no other row locks (lock ordering is trivially
+    safe: this is the only FOR UPDATE in the codebase).
+    """
+    return db.query(User).filter(User.id == merchant_id).with_for_update().one()
 
 def generate_slug(db: Session, name: str) -> str:
     base_slug = re.sub(r'[^a-z0-9]+', '-', name.strip().lower()).strip('-')
@@ -137,5 +151,89 @@ def bulk_upsert_products(db: Session, merchant_id: uuid.UUID, products_data: Lis
         from app.tasks.catalog_sync import dispatch_catalog_sync
         for touched_id in touched_ids:
             dispatch_catalog_sync(touched_id, "upsert")
+
+    return stats
+
+def import_catalog_products(db: Session, merchant_id: uuid.UUID, products_data: List[dict]) -> dict:
+    """
+    Persists items already mapped by catalog_item_to_product_data (each has
+    name + sku "igshop:<catalog-item-id>"). Unlike bulk_upsert_products,
+    matches NEVER update: a sku match (same catalog item re-imported) or a
+    case-insensitive name match (merchant already hand-entered it) skips
+    the row, since merchant-tuned prices/floors must not be overwritten by
+    a re-import. Always writes (no dry run) and syncs created rows to the
+    Taskflow catalog like every other product write path.
+
+    The whole match-then-insert runs under the merchant's row lock: two
+    simultaneous imports for one merchant would otherwise both miss each
+    other's uncommitted rows and insert duplicates (there is no DB
+    uniqueness on sku/name to catch it). The second import blocks here
+    until the first commits, then sees its rows and skips. The slow Meta
+    fetch stays outside the lock (in the endpoint) — only match+insert
+    holds it.
+    """
+    lock_merchant_row(db, merchant_id)
+    stats = {
+        "total_items": len(products_data),
+        "imported_count": 0,
+        "skipped_count": 0,
+        "skipped": [],
+    }
+
+    new_products = []
+    # Keys already taken by earlier rows in THIS batch — the batch commits
+    # once at the end, so the DB lookups below can't see them yet.
+    seen_skus = set()
+    seen_names = set()
+    for p_data in products_data:
+        name = (p_data.get("name") or "").strip()
+        sku = p_data.get("sku")
+        db_product = None
+        reason = None
+        if sku and str(sku) in seen_skus:
+            reason = "duplicate item in this import"
+        elif name and name.lower() in seen_names:
+            reason = "duplicate name in this import"
+        if reason:
+            stats["skipped_count"] += 1
+            stats["skipped"].append({"name": name or sku, "reason": reason})
+            continue
+        if sku:
+            db_product = db.query(Product).filter(
+                Product.merchant_id == merchant_id,
+                Product.sku == str(sku)
+            ).first()
+            if db_product:
+                reason = "already imported"
+        if not db_product and name:
+            db_product = db.query(Product).filter(
+                Product.merchant_id == merchant_id,
+                func.lower(Product.name) == name.lower()
+            ).first()
+            if db_product:
+                reason = "a product with this name already exists"
+
+        if db_product:
+            stats["skipped_count"] += 1
+            stats["skipped"].append({"name": name or sku, "reason": reason})
+            continue
+
+        stats["imported_count"] += 1
+        if sku:
+            seen_skus.add(str(sku))
+        if name:
+            seen_names.add(name.lower())
+        db_product = Product(
+            merchant_id=merchant_id,
+            slug=generate_slug(db, name),
+            **p_data
+        )
+        db.add(db_product)
+        new_products.append(db_product)
+
+    db.commit()
+    from app.tasks.catalog_sync import dispatch_catalog_sync
+    for new_product in new_products:
+        dispatch_catalog_sync(new_product.id, "upsert")
 
     return stats

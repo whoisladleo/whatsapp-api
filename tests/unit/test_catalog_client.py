@@ -7,10 +7,13 @@ import pytest
 import respx
 
 from app.core.catalog_client import (
+    CATALOG_PRODUCT_FIELDS,
     CatalogError,
     CatalogMappingError,
     MetaCatalogClient,
+    catalog_item_to_product_data,
     format_price_tzs,
+    parse_catalog_price,
     product_to_catalog_item,
 )
 from app.core.config import settings
@@ -368,3 +371,142 @@ async def test_get_batch_status_raises_on_http_error_status(client):
 
     with pytest.raises(CatalogError, match="HTTP 403"):
         await client.get_batch_status("handle_1")
+
+
+# Shop import: price parsing
+
+
+def test_parse_catalog_price_valid():
+    assert parse_catalog_price("50000.00 TZS") == 50000.0
+    assert parse_catalog_price("45,000.50 TZS") == 45000.5
+    assert parse_catalog_price("50000.00 tzs") == 50000.0
+
+
+def test_parse_catalog_price_rejects_foreign_currency():
+    # Importing a USD amount as unitless TZS would be a ~2500x error —
+    # the same incident class as the $100,000 production quote.
+    with pytest.raises(CatalogMappingError, match="not TZS"):
+        parse_catalog_price("100.00 USD")
+
+
+def test_parse_catalog_price_rejects_malformed():
+    for bad in ["50000", "TZS", "", None, 50000, "-10.00 TZS", "abc TZS"]:
+        with pytest.raises(CatalogMappingError):
+            parse_catalog_price(bad)
+
+
+# Shop import: item mapping
+
+
+def _catalog_item(**overrides):
+    item = {
+        "id": "987654321",
+        "title": "Leather Handbag",
+        "description": "Genuine leather",
+        "price": "120000.00 TZS",
+        "availability": "in stock",
+        "image_url": "https://cdn.meta.com/bag.jpg",
+        "link": "https://shop.example.com/bag",
+        "brand": "Test Shop",
+    }
+    item.update(overrides)
+    return item
+
+
+def test_catalog_item_mapping_in_stock():
+    data = catalog_item_to_product_data(_catalog_item())
+
+    assert data["name"] == "Leather Handbag"
+    assert data["description"] == "Genuine leather"
+    assert data["max_price"] == 120000.0
+    assert data["min_price"] == 120000.0
+    assert data["quantity"] == 1
+    assert data["is_active"] is True
+    assert data["image_url"] == "https://cdn.meta.com/bag.jpg"
+    assert data["sku"] == "igshop:987654321"
+
+
+def test_catalog_item_mapping_out_of_stock():
+    data = catalog_item_to_product_data(_catalog_item(availability="out of stock"))
+
+    assert data["quantity"] == 0
+    assert data["is_active"] is False
+
+
+def test_catalog_item_mapping_missing_optionals():
+    data = catalog_item_to_product_data(
+        _catalog_item(description="", image_url="", availability="available for order")
+    )
+
+    assert data["description"] is None
+    assert data["image_url"] is None
+    # Any availability that isn't exactly "in stock" counts as out.
+    assert data["quantity"] == 0
+    assert data["is_active"] is False
+
+
+def test_catalog_item_mapping_rejects_missing_title_or_id():
+    with pytest.raises(CatalogMappingError, match="title"):
+        catalog_item_to_product_data(_catalog_item(title="  "))
+    with pytest.raises(CatalogMappingError, match="id"):
+        catalog_item_to_product_data(_catalog_item(id=""))
+    with pytest.raises(CatalogMappingError, match="not an object"):
+        catalog_item_to_product_data("not-a-dict")
+
+
+def test_catalog_item_mapping_rejects_bad_price():
+    with pytest.raises(CatalogMappingError, match="not TZS"):
+        catalog_item_to_product_data(_catalog_item(price="50.00 USD"))
+    with pytest.raises(CatalogMappingError):
+        catalog_item_to_product_data(_catalog_item(price="free"))
+
+
+# Shop import: product listing
+
+
+PRODUCTS_URL_RE = r"https://graph\.facebook\.com/.+/catalog_123/products"
+
+
+@respx.mock
+async def test_list_products_success(client):
+    route = respx.get(url__regex=PRODUCTS_URL_RE).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": [_catalog_item()],
+                "paging": {"cursors": {"after": "cursor_1"}},
+            },
+        )
+    )
+
+    result = await client.list_products(limit=50)
+
+    assert result["data"][0]["title"] == "Leather Handbag"
+    assert result["paging"]["cursors"]["after"] == "cursor_1"
+    params = route.calls.last.request.url.params
+    assert params["fields"] == CATALOG_PRODUCT_FIELDS
+    assert params["limit"] == "50"
+    assert "after" not in params
+
+
+@respx.mock
+async def test_list_products_passes_after_cursor(client):
+    route = respx.get(url__regex=PRODUCTS_URL_RE).mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+
+    await client.list_products(after="cursor_1")
+
+    assert route.calls.last.request.url.params["after"] == "cursor_1"
+
+
+@respx.mock
+async def test_list_products_raises_on_meta_error(client):
+    respx.get(url__regex=PRODUCTS_URL_RE).mock(
+        return_value=httpx.Response(
+            200, json={"error": {"message": "(#200) Permissions error"}}
+        )
+    )
+
+    with pytest.raises(CatalogError, match="Permissions error"):
+        await client.list_products()
