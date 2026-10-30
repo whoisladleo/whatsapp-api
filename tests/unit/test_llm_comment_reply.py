@@ -184,6 +184,24 @@ async def test_generate_comment_reply_catalog_marks_inactive_product_out_of_stoc
     assert "(OUT OF STOCK)" in line
 
 
+async def test_generate_comment_reply_catalog_excludes_drafts(db_session, merchant):
+    p = Product(
+        slug="ig-draft", name="Untitled import 12345678", max_price=0.0, min_price=0.0,
+        quantity=0, merchant_id=merchant.id, is_active=False, is_draft=True,
+    )
+    db_session.add(p)
+    db_session.commit()
+
+    captured = {}
+    service = _service_with_fake_client(captured=captured)
+
+    await service.generate_comment_reply(
+        "what do you sell?", merchant_id=merchant.id, db=db_session
+    )
+
+    assert "Untitled import" not in captured["system"]
+
+
 async def test_generate_comment_reply_catalog_in_stock_line_wording_unchanged_and_states_stock_rule(db_session, merchant, shoes):
     captured = {}
     service = _service_with_fake_client(captured=captured)

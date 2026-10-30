@@ -71,6 +71,50 @@ def test_update_product(client, auth_user):
     assert resp.json()["quantity"] == 99
 
 
+def _draft_row(db_session, user_id):
+    p = Product(
+        slug="draft-vase", name="Untitled import 333", max_price=0.0, min_price=0.0,
+        quantity=0, is_active=False, is_draft=True, merchant_id=user_id,
+        sku="igshop:333",
+    )
+    db_session.add(p)
+    db_session.commit()
+    db_session.refresh(p)
+    return p
+
+
+def test_update_product_completes_draft_on_valid_save(client, auth_user, db_session):
+    user, headers = auth_user
+    draft = _draft_row(db_session, user.id)
+
+    resp = client.put(
+        f"{BASE}/{draft.id}",
+        json={"name": "Priceless Vase", "max_price": 80000, "min_price": 70000},
+        headers=headers,
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["is_draft"] is False
+    assert body["is_active"] is True
+    assert body["quantity"] == 0
+
+
+def test_update_product_partial_save_keeps_draft(client, auth_user, db_session):
+    user, headers = auth_user
+    draft = _draft_row(db_session, user.id)
+
+    resp = client.put(
+        f"{BASE}/{draft.id}",
+        json={"max_price": 80000, "min_price": 70000},
+        headers=headers,
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["is_draft"] is True
+    assert resp.json()["is_active"] is False
+
+
 def test_update_product_not_found_for_other_user(client, auth_user, other_user_headers):
     _, headers = auth_user
     created = client.post(BASE, json=_product_payload(), headers=headers).json()

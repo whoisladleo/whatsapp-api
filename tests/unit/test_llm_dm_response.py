@@ -276,6 +276,24 @@ async def test_generate_dm_response_catalog_marks_inactive_product_out_of_stock(
     assert "(OUT OF STOCK)" in line
 
 
+async def test_generate_dm_response_catalog_excludes_drafts(db_session, ig_account, ig_customer, ig_context):
+    p = Product(
+        slug="ig-dm-draft", name="Untitled import 12345678", max_price=0.0, min_price=0.0,
+        quantity=0, merchant_id=ig_account.user_id, is_active=False, is_draft=True,
+    )
+    db_session.add(p)
+    db_session.commit()
+
+    captured = {}
+    service = _service_with_fake_client(captured=captured)
+
+    await service.generate_dm_response(
+        "what do you sell?", db=db_session, account=ig_account, customer=ig_customer, context=ig_context, conversation_history=[]
+    )
+
+    assert "Untitled import" not in captured["system"]
+
+
 async def test_generate_dm_response_catalog_in_stock_line_wording_unchanged_and_states_stock_rule(
     db_session, ig_account, ig_customer, ig_context, shoes
 ):

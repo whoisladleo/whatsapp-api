@@ -65,6 +65,11 @@ class ProductResponse(ProductBase):
     slug: str
     merchant_id: uuid.UUID
     created_at: datetime
+    # Shop-import drafts (#74) — the dashboard badges these until a valid
+    # save auto-completes them. Deliberately absent from ProductCreate /
+    # ProductUpdate: merchants can neither create drafts directly nor flip
+    # the flag except through the completion rule.
+    is_draft: bool = False
 
     class Config:
         from_attributes = True

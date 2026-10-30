@@ -376,6 +376,32 @@ def test_nudge_sends_plain_text_for_out_of_stock_product(
     assert "Shoes" in sent["body"]
 
 
+def test_nudge_sends_plain_text_for_draft_product(
+    db_session, quoted_context, account, owner, monkeypatch
+):
+    # Stocked AND active — only the draft flag holds the card back.
+    _stocked_shoes(db_session, owner, is_draft=True)
+    sent = {}
+
+    async def exploding_card(self, *a, **kw):
+        raise AssertionError("no card attempt for a draft product")
+
+    async def fake_send_text(self, to, body, preview_url=False):
+        sent["body"] = body
+        return {"messages": [{"id": "wamid.text"}]}
+
+    monkeypatch.setattr("app.core.provider.WhatsAppProvider.send_product_card_or_text", exploding_card)
+    monkeypatch.setattr("app.core.provider.WhatsAppProvider.send_text", fake_send_text)
+    monkeypatch.setattr(quote_nudges.send_quote_nudge, "apply_async", lambda *a, **kw: None)
+
+    result = quote_nudges.send_quote_nudge(
+        quoted_context.id, account.id, quoted_context.pending_quote_at.isoformat(), 1
+    )
+
+    assert result == "Success"
+    assert "Shoes" in sent["body"]
+
+
 def test_nudge_sends_plain_text_for_deactivated_product(
     db_session, quoted_context, account, owner, monkeypatch
 ):

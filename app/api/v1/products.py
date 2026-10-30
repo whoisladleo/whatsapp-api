@@ -15,7 +15,8 @@ from app.schemas.product import (
 )
 from app.core.catalog_client import (
     IMPORT_MAX_ITEMS, MetaCatalogClient, catalog_item_to_product_data,
-    CatalogError, CatalogMappingError,
+    catalog_item_to_draft_data, CatalogError, CatalogMappingError,
+    CatalogDraftableError,
 )
 from app.core.config import settings
 from app.crud.product import (
@@ -150,9 +151,11 @@ async def import_instagram_shop(
     One-time import of a merchant's Instagram Shop (Commerce catalog)
     into Taskflow products (#73). The merchant grants Taskflow partner
     access to their catalog out-of-band, then pastes the catalog id here
-    (or via the dashboard button). Unmappable items (missing title/price,
-    non-TZS currency) and already-present products are skipped with
-    reasons — the response reports imported/skipped, never partial-fails.
+    (or via the dashboard button). Items missing a title or usable price
+    persist as drafts the merchant completes in the dashboard (#74);
+    unfixable items (foreign currency, missing id) and already-present
+    products are skipped with reasons — the response reports
+    imported/drafts/skipped, never partial-fails.
     """
     if not settings.CATALOG_ACCESS_TOKEN:
         raise HTTPException(
@@ -193,15 +196,19 @@ async def import_instagram_shop(
         truncated = True
 
     products_data = []
+    drafts_data = []
     mapping_skipped = []
     for item in raw_items:
         try:
             products_data.append(catalog_item_to_product_data(item))
+        except CatalogDraftableError:
+            # Subclass catch must come first — these persist as drafts.
+            drafts_data.append(catalog_item_to_draft_data(item))
         except CatalogMappingError as e:
             label = item.get("title") or item.get("id") if isinstance(item, dict) else None
             mapping_skipped.append({"name": label or "unknown item", "reason": str(e)})
 
-    stats = import_catalog_products(db, current_user.id, products_data)
+    stats = import_catalog_products(db, current_user.id, products_data, drafts_data)
     stats["skipped_count"] += len(mapping_skipped)
     stats["skipped"].extend(mapping_skipped)
     stats["total_items"] = len(raw_items)

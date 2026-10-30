@@ -427,6 +427,10 @@ class LLMService:
         price = agreement["price"]
         if not product:
             raise DealRejected(f"AGREEMENT_REACHED for unknown product '{agreement['product_name']}'")
+        # Drafts carry placeholder 0 prices — a close must never land on
+        # one, even if a merchant set stock on it before completing it.
+        if product.is_draft:
+            raise DealRejected(f"AGREEMENT_REACHED for '{product.name}' but it's an uncompleted draft")
         if not (product.min_price <= price <= product.max_price):
             raise DealRejected(
                 f"AGREEMENT_REACHED price {price} outside [{product.min_price}, {product.max_price}] "
@@ -821,7 +825,11 @@ class LLMService:
 
         product = (
             db.query(Product)
-            .filter(Product.merchant_id == account.user_id, Product.name.ilike(quote["product_name"]))
+            .filter(
+                Product.merchant_id == account.user_id,
+                Product.name.ilike(quote["product_name"]),
+                Product.is_draft == False,
+            )
             .first()
         )
         if not product:
@@ -883,7 +891,14 @@ class LLMService:
         if not self.client:
             return None
 
-        products = db.query(Product).filter(Product.merchant_id == merchant_id).all()
+        # Drafts are invisible to Amara: excluded at the query, so the model
+        # can neither offer nor match them (close paths reject them as a
+        # backstop). Same filter on all three catalog builders.
+        products = (
+            db.query(Product)
+            .filter(Product.merchant_id == merchant_id, Product.is_draft == False)
+            .all()
+        )
         if not products:
             catalog_str = "No products currently available."
         else:
@@ -995,6 +1010,9 @@ Match the customer's language (Swahili or English). Keep both lines to one sente
         price = agreement["price"]
         if not product:
             raise DealRejected(f"Instagram AGREEMENT_REACHED for unknown product '{agreement['product_name']}'")
+        # Same draft backstop as the WhatsApp close path above.
+        if product.is_draft:
+            raise DealRejected(f"Instagram AGREEMENT_REACHED for '{product.name}' but it's an uncompleted draft")
         if not (product.min_price <= price <= product.max_price):
             raise DealRejected(
                 f"Instagram AGREEMENT_REACHED price {price} outside [{product.min_price}, {product.max_price}] "
@@ -1077,7 +1095,12 @@ Match the customer's language (Swahili or English). Keep both lines to one sente
         if not self.client:
             return None
 
-        products = db.query(Product).filter(Product.merchant_id == account.user_id).all()
+        # Drafts excluded — see the comment-reply builder above.
+        products = (
+            db.query(Product)
+            .filter(Product.merchant_id == account.user_id, Product.is_draft == False)
+            .all()
+        )
         if not products:
             catalog_str = "No products currently available."
         else:
@@ -1242,8 +1265,12 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
             # The person texting is a customer, the merchant is the account owner
             merchant_id = account.user_id
 
-        # 2. Fetch products for this merchant
-        products = db.query(Product).filter(Product.merchant_id == merchant_id).all()
+        # 2. Fetch products for this merchant (drafts excluded — see above)
+        products = (
+            db.query(Product)
+            .filter(Product.merchant_id == merchant_id, Product.is_draft == False)
+            .all()
+        )
         if not products:
             catalog_str = "No products currently available."
         else:

@@ -127,6 +127,115 @@ def test_import_catalog_products_holds_merchant_lock(db_session, monkeypatch):
     assert len(calls) == 1
 
 
+def _draft_product(db_session, merchant_id, **overrides):
+    from app.db.models import Product
+
+    attrs = {
+        "slug": f"draft-{uuid.uuid4().hex[:6]}",
+        "name": "Untitled import 98765432",
+        "max_price": 0.0,
+        "min_price": 0.0,
+        "quantity": 0,
+        "is_active": False,
+        "is_draft": True,
+        "merchant_id": merchant_id,
+    }
+    attrs.update(overrides)
+    p = Product(**attrs)
+    db_session.add(p)
+    db_session.commit()
+    db_session.refresh(p)
+    return p
+
+
+def test_maybe_complete_draft_completes_valid_save(db_session):
+    user = User(username="255700000704")
+    db_session.add(user)
+    db_session.commit()
+    p = _draft_product(db_session, user.id)
+    p.name = "Leather Handbag"
+    p.max_price = 120000.0
+    p.min_price = 100000.0
+
+    assert crud_product.maybe_complete_draft(p) is True
+    assert p.is_draft is False
+    assert p.is_active is True
+    # Quantity untouched: still out of stock until the merchant sets units.
+    assert p.quantity == 0
+
+
+def test_maybe_complete_draft_stays_until_fully_valid(db_session):
+    user = User(username="255700000705")
+    db_session.add(user)
+    db_session.commit()
+
+    # Placeholder name kept, even with prices set.
+    p = _draft_product(db_session, user.id)
+    p.max_price = 120000.0
+    p.min_price = 100000.0
+    assert crud_product.maybe_complete_draft(p) is False
+    assert p.is_draft is True
+
+    # Real name but zero prices.
+    p.name = "Leather Handbag"
+    p.max_price = 0.0
+    assert crud_product.maybe_complete_draft(p) is False
+    assert p.is_draft is True
+    assert p.is_active is False
+
+
+def test_maybe_complete_draft_ignores_non_drafts(db_session):
+    user = User(username="255700000706")
+    db_session.add(user)
+    db_session.commit()
+    p = _draft_product(
+        db_session, user.id, name="Retired", max_price=10.0, min_price=5.0,
+        is_draft=False, is_active=False,
+    )
+
+    # An inactive non-draft is a merchant choice — never touched.
+    assert crud_product.maybe_complete_draft(p) is False
+    assert p.is_active is False
+
+
+def test_bulk_upsert_cannot_flip_is_draft_directly(db_session):
+    from app.db.models import Product
+
+    user = User(username="255700000707")
+    db_session.add(user)
+    db_session.commit()
+    p = _draft_product(db_session, user.id, sku="D-1")
+
+    stats = crud_product.bulk_upsert_products(
+        db_session, user.id,
+        [{"sku": "D-1", "name": "Hacked", "is_draft": False}],
+    )
+
+    db_session.refresh(p)
+    assert p.is_draft is True
+    assert p.name == "Hacked"
+    assert stats["duplicate_products_count"] == 1
+
+
+def test_bulk_upsert_completes_draft_via_valid_row(db_session):
+    user = User(username="255700000708")
+    db_session.add(user)
+    db_session.commit()
+    p = _draft_product(db_session, user.id, sku="D-2")
+
+    crud_product.bulk_upsert_products(
+        db_session, user.id,
+        [{
+            "sku": "D-2", "name": "Leather Handbag",
+            "max_price": 120000.0, "min_price": 100000.0,
+        }],
+    )
+
+    db_session.refresh(p)
+    assert p.is_draft is False
+    assert p.is_active is True
+
+
 def test_merchant_lock_renders_for_update_on_postgres_only():
     """
     Pins the dialect assumption the import guard rests on: Postgres honors

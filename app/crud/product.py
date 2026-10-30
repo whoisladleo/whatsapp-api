@@ -1,10 +1,35 @@
 from sqlalchemy import func
 from sqlalchemy.orm import Session
+from app.core.catalog_client import DRAFT_NAME_PREFIX
 from app.db.models import Product, User
 from app.schemas.product import ProductCreate, ProductUpdate
 from typing import List, Optional
 import re
 import uuid
+
+
+def maybe_complete_draft(db_product: Product) -> bool:
+    """
+    Clears is_draft once the row is genuinely sellable: a real (non-blank,
+    non-placeholder) name and both prices above 0. Completion also flips
+    is_active on — the save expresses "this product is real now" — while
+    quantity is untouched, so a completed draft with no stock entered yet
+    still shows OUT OF STOCK until the merchant sets units. A real free
+    (price-0) product can never auto-complete; that stays a conscious
+    limitation, not a silent freebie. Returns True when it completed.
+    """
+    if not db_product.is_draft:
+        return False
+    name = (db_product.name or "").strip()
+    if not name or name.startswith(DRAFT_NAME_PREFIX):
+        return False
+    if not (db_product.max_price or 0) > 0:
+        return False
+    if not (db_product.min_price or 0) > 0:
+        return False
+    db_product.is_draft = False
+    db_product.is_active = True
+    return True
 
 
 def lock_merchant_row(db: Session, merchant_id: uuid.UUID) -> User:
@@ -59,6 +84,9 @@ def update_product(db: Session, db_product: Product, product_in: ProductUpdate) 
     update_data = product_in.model_dump(exclude_unset=True)
     for field, value in update_data.items():
         setattr(db_product, field, value)
+    # A save that makes a draft valid completes it (and the upsert dispatch
+    # below then pushes it to the catalog for the first time).
+    maybe_complete_draft(db_product)
 
     db.add(db_product)
     db.commit()
@@ -127,8 +155,11 @@ def bulk_upsert_products(db: Session, merchant_id: uuid.UUID, products_data: Lis
                 stats["duplicate_skus"].append(sku)
             if not dry_run:
                 for key, value in p_data.items():
-                    if hasattr(db_product, key) and key not in ['id', 'merchant_id', 'slug', 'created_at']:
+                    if hasattr(db_product, key) and key not in ['id', 'merchant_id', 'slug', 'created_at', 'is_draft']:
                         setattr(db_product, key, value)
+                # A bulk row can only clear the flag via the completion rule,
+                # never set or clear it directly (see excluded keys above).
+                maybe_complete_draft(db_product)
                 db.add(db_product)
                 touched_ids.append(db_product.id)
         else:
@@ -154,15 +185,22 @@ def bulk_upsert_products(db: Session, merchant_id: uuid.UUID, products_data: Lis
 
     return stats
 
-def import_catalog_products(db: Session, merchant_id: uuid.UUID, products_data: List[dict]) -> dict:
+def import_catalog_products(
+    db: Session,
+    merchant_id: uuid.UUID,
+    products_data: List[dict],
+    drafts_data: Optional[List[dict]] = None,
+) -> dict:
     """
     Persists items already mapped by catalog_item_to_product_data (each has
-    name + sku "igshop:<catalog-item-id>"). Unlike bulk_upsert_products,
-    matches NEVER update: a sku match (same catalog item re-imported) or a
-    case-insensitive name match (merchant already hand-entered it) skips
-    the row, since merchant-tuned prices/floors must not be overwritten by
-    a re-import. Always writes (no dry run) and syncs created rows to the
-    Taskflow catalog like every other product write path.
+    name + sku "igshop:<catalog-item-id>"), plus drafts_data rows mapped by
+    catalog_item_to_draft_data. Unlike bulk_upsert_products, matches NEVER
+    update: a sku match (same catalog item re-imported) or a case-insensitive
+    name match (merchant already hand-entered it) skips the row, since
+    merchant-tuned prices/floors must not be overwritten by a re-import.
+    Always writes (no dry run). Sellable rows sync to the Taskflow catalog
+    like every other product write path; drafts never dispatch (and the sync
+    task drops them as a backstop) until a merchant save completes them.
 
     The whole match-then-insert runs under the merchant's row lock: two
     simultaneous imports for one merchant would otherwise both miss each
@@ -174,18 +212,22 @@ def import_catalog_products(db: Session, merchant_id: uuid.UUID, products_data: 
     """
     lock_merchant_row(db, merchant_id)
     stats = {
-        "total_items": len(products_data),
+        "total_items": len(products_data) + len(drafts_data or []),
         "imported_count": 0,
+        "draft_count": 0,
+        "drafts": [],
         "skipped_count": 0,
         "skipped": [],
     }
 
     new_products = []
     # Keys already taken by earlier rows in THIS batch — the batch commits
-    # once at the end, so the DB lookups below can't see them yet.
+    # once at the end, so the DB lookups below can't see them yet. Shared
+    # across sellable and draft rows so the two lists can't dupe each other.
     seen_skus = set()
     seen_names = set()
-    for p_data in products_data:
+
+    def persist_one(p_data: dict, is_draft: bool) -> None:
         name = (p_data.get("name") or "").strip()
         sku = p_data.get("sku")
         db_product = None
@@ -197,7 +239,7 @@ def import_catalog_products(db: Session, merchant_id: uuid.UUID, products_data: 
         if reason:
             stats["skipped_count"] += 1
             stats["skipped"].append({"name": name or sku, "reason": reason})
-            continue
+            return
         if sku:
             db_product = db.query(Product).filter(
                 Product.merchant_id == merchant_id,
@@ -216,9 +258,8 @@ def import_catalog_products(db: Session, merchant_id: uuid.UUID, products_data: 
         if db_product:
             stats["skipped_count"] += 1
             stats["skipped"].append({"name": name or sku, "reason": reason})
-            continue
+            return
 
-        stats["imported_count"] += 1
         if sku:
             seen_skus.add(str(sku))
         if name:
@@ -229,7 +270,17 @@ def import_catalog_products(db: Session, merchant_id: uuid.UUID, products_data: 
             **p_data
         )
         db.add(db_product)
-        new_products.append(db_product)
+        if is_draft:
+            stats["draft_count"] += 1
+            stats["drafts"].append(name)
+        else:
+            stats["imported_count"] += 1
+            new_products.append(db_product)
+
+    for p_data in products_data:
+        persist_one(p_data, is_draft=False)
+    for d_data in drafts_data or []:
+        persist_one(d_data, is_draft=True)
 
     db.commit()
     from app.tasks.catalog_sync import dispatch_catalog_sync

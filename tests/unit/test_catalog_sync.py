@@ -615,6 +615,37 @@ def test_task_missing_image_skips_without_client_call(
     assert "no image" in caplog.text.lower()
 
 
+def test_task_draft_skips_without_client_call(
+    db_session, product, catalog_creds, fake_client
+):
+    product.is_draft = True
+    product.is_active = False
+    product.max_price = 0.0
+    product.min_price = 0.0
+    db_session.commit()
+
+    result = catalog_sync.sync_catalog_item(str(product.id), "upsert")
+
+    assert result == "Draft; skipped."
+    assert fake_client.instances[0].upserts == []
+
+
+def test_import_dispatches_sellable_only_not_drafts(
+    db_session, merchant, catalog_creds, dispatched
+):
+    stats = crud_product.import_catalog_products(
+        db_session,
+        merchant.id,
+        [{"name": "Kettle", "max_price": 1.0, "min_price": 1.0, "sku": "igshop:1"}],
+        [{"name": "Untitled import 2", "max_price": 0.0, "min_price": 0.0,
+          "quantity": 0, "is_active": False, "is_draft": True, "sku": "igshop:2"}],
+    )
+
+    assert stats["imported_count"] == 1
+    assert stats["draft_count"] == 1
+    assert len(dispatched) == 1
+
+
 def test_task_unusable_merchant_phone_skips(db_session, catalog_creds, fake_client):
     owner = User(username=None, phone_number=None)
     db_session.add(owner)

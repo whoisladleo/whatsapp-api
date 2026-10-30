@@ -20,4 +20,7 @@ Import semantics (for support): prices import firm (`min_price` =
 `max_price`), in-stock items get quantity 1, out-of-stock items arrive
 inactive with quantity 0, images are hotlinked from Meta's CDN, and
 re-imports skip (never overwrite) by catalog id and product name. Items
-with missing titles/prices or non-TZS currencies are skipped with reasons.
+missing a title or usable price arrive as drafts (placeholder name, 0
+prices, inactive) that a valid merchant save auto-completes; drafts are
+hidden from Amara and never push to the catalog until completed.
+Foreign-currency and id-less items are skipped with reasons.

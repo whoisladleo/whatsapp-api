@@ -86,6 +86,23 @@ class CatalogMappingError(CatalogError):
     """A Product row cannot be represented as a catalog item (bad image/phone)."""
 
 
+class CatalogDraftableError(CatalogMappingError):
+    """
+    A catalog item that can't become a sellable product right now, but the
+    merchant could complete by hand (missing title or unusable price) — the
+    importer persists these as drafts instead of skipping them. Anything
+    without a stable identity (missing id, non-dict) or an unfixable value
+    (foreign currency) stays a plain CatalogMappingError: a hard skip.
+    Subclass order matters to callers: catch this before CatalogMappingError.
+    """
+
+
+# Placeholder prefix for draft names (completion clears when the merchant
+# saves a real name — see maybe_complete_draft). Distinctive enough that a
+# merchant is unlikely to collide with it on purpose.
+DRAFT_NAME_PREFIX = "Untitled import "
+
+
 def format_price_tzs(amount: float) -> str:
     """
     Meta "<amount> <ISO>" price format, e.g. "50000.00 TZS" — matches the
@@ -194,16 +211,18 @@ def product_to_catalog_item(
 def parse_catalog_price(value: Any) -> float:
     """
     Inverse of format_price_tzs: Meta "<amount> <ISO>" (e.g. "50000.00 TZS")
-    back to a float. Anything malformed — or any currency that isn't TZS —
-    raises: Product prices are unitless TZS everywhere downstream (see the
-    $100,000 production incident in CLAUDE.md), so importing a foreign
-    amount as shillings would be a silent ~1000x error.
+    back to a float. Anything malformed raises CatalogDraftableError (the
+    merchant can type a real price into the draft) — except a foreign
+    currency, which stays a hard skip: Product prices are unitless TZS
+    everywhere downstream (see the $100,000 production incident in
+    CLAUDE.md), so importing a foreign amount as shillings would be a
+    silent ~1000x error, and no currency field exists to fix it into.
     """
     if not isinstance(value, str):
-        raise CatalogMappingError(f"price is not a string: {value!r}")
+        raise CatalogDraftableError(f"price is not a string: {value!r}")
     parts = value.strip().split()
     if len(parts) != 2:
-        raise CatalogMappingError(f"unparseable price: {value!r}")
+        raise CatalogDraftableError(f"unparseable price: {value!r}")
     amount_str, currency = parts
     if currency.upper() != CURRENCY:
         raise CatalogMappingError(
@@ -212,9 +231,9 @@ def parse_catalog_price(value: Any) -> float:
     try:
         amount = float(amount_str.replace(",", ""))
     except ValueError:
-        raise CatalogMappingError(f"unparseable price: {value!r}") from None
+        raise CatalogDraftableError(f"unparseable price: {value!r}") from None
     if amount < 0:
-        raise CatalogMappingError(f"negative price: {value!r}")
+        raise CatalogDraftableError(f"negative price: {value!r}")
     return amount
 
 
@@ -236,10 +255,10 @@ def catalog_item_to_product_data(item: Dict[str, Any]) -> Dict[str, Any]:
         raise CatalogMappingError(f"catalog item is not an object: {item!r}")
     item_id = item.get("id")
     title = (item.get("title") or "").strip()
-    if not item_id or not title:
-        raise CatalogMappingError(
-            f"item is missing {'id' if not item_id else 'title'}: {item!r}"
-        )
+    if not item_id:
+        raise CatalogMappingError(f"item is missing id: {item!r}")
+    if not title:
+        raise CatalogDraftableError(f"item is missing title: {item!r}")
     price = parse_catalog_price(item.get("price"))
     in_stock = (item.get("availability") or "").strip().lower() == IN_STOCK
     image_url = (item.get("image_url") or "").strip() or None
@@ -251,6 +270,31 @@ def catalog_item_to_product_data(item: Dict[str, Any]) -> Dict[str, Any]:
         "quantity": 1 if in_stock else 0,
         "is_active": in_stock,
         "image_url": image_url,
+        "sku": f"igshop:{item_id}",
+    }
+
+
+def catalog_item_to_draft_data(item: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Fallback for items that raise CatalogDraftableError from
+    catalog_item_to_product_data: whatever partial data exists (real title
+    if present, description, image) plus safe placeholders (0 prices,
+    quantity 0, inactive, is_draft). Only called on the draftable path,
+    where item is always a dict with an id — the "unknown" sku fallback is
+    unreachable insurance, and still dedupes safely via the importer's
+    in-batch matching if it ever fires.
+    """
+    item_id = item.get("id") or "unknown"
+    title = (item.get("title") or "").strip()
+    return {
+        "name": title or f"{DRAFT_NAME_PREFIX}{str(item_id)[:8]}",
+        "description": (item.get("description") or "").strip() or None,
+        "max_price": 0.0,
+        "min_price": 0.0,
+        "quantity": 0,
+        "is_active": False,
+        "is_draft": True,
+        "image_url": (item.get("image_url") or "").strip() or None,
         "sku": f"igshop:{item_id}",
     }
 

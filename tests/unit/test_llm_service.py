@@ -463,6 +463,30 @@ async def test_catalog_marks_inactive_product_out_of_stock(db_session, shop_acco
     assert "(OUT OF STOCK)" in line
 
 
+async def test_catalog_excludes_drafts_entirely(db_session, shop_account, merchant):
+    db_session.add(
+        Product(
+            slug="draft-item", name="Untitled import 12345678", max_price=0.0, min_price=0.0,
+            quantity=0, merchant_id=merchant.id, is_active=False, is_draft=True,
+        )
+    )
+    db_session.commit()
+
+    captured = {}
+    service = _service_with_fake_client(captured=captured)
+
+    await service.generate_response(
+        message_body="what do you sell?",
+        from_phone="255711111118",
+        db=db_session,
+        account=shop_account,
+    )
+
+    # Not listed at all (unlike out-of-stock rows) — the model must not
+    # offer, match, or quote a placeholder.
+    assert "Untitled import" not in captured["system"]
+
+
 async def test_catalog_in_stock_line_wording_unchanged_and_states_stock_rule(db_session, shop_account, merchant):
     db_session.add(
         Product(slug="shoes-3", name="Shoes", max_price=50000, min_price=40000, quantity=3, merchant_id=merchant.id)

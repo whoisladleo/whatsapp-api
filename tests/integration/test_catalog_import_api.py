@@ -111,7 +111,7 @@ def test_import_creates_products_across_pages(client, db_session, auth_user):
 
 
 @respx.mock
-def test_import_skips_unmappable_and_existing_without_touching_them(
+def test_import_drafts_unmappable_and_skips_existing_without_touching_them(
     client, db_session, auth_user
 ):
     user, headers = auth_user
@@ -129,7 +129,8 @@ def test_import_skips_unmappable_and_existing_without_touching_them(
                     _item("111", "Kettle"),
                     _item("222", "USD Lamp", price="100.00 USD"),
                     _item("333", "Priceless Vase", price="free"),
-                    _item("444", "Radio"),
+                    _item("444", "", price="20000.00 TZS"),
+                    _item("555", "Radio"),
                 ]
             },
         )
@@ -141,13 +142,29 @@ def test_import_skips_unmappable_and_existing_without_touching_them(
 
     assert resp.status_code == 200
     stats = resp.json()
-    assert stats["total_items"] == 4
+    assert stats["total_items"] == 5
     assert stats["imported_count"] == 1
-    assert stats["skipped_count"] == 3
+    assert stats["draft_count"] == 2
+    assert stats["skipped_count"] == 2
     reasons = {s["name"]: s["reason"] for s in stats["skipped"]}
     assert "already exists" in reasons["Kettle"]
     assert "not TZS" in reasons["USD Lamp"]
-    assert "unparseable price" in reasons["Priceless Vase"]
+    assert "Priceless Vase" in stats["drafts"]
+
+    vase = db_session.query(Product).filter(
+        Product.merchant_id == user.id, Product.sku == "igshop:333"
+    ).one()
+    assert vase.name == "Priceless Vase"
+    assert vase.max_price == 0.0
+    assert vase.min_price == 0.0
+    assert vase.quantity == 0
+    assert vase.is_active is False
+    assert vase.is_draft is True
+    untitled = db_session.query(Product).filter(
+        Product.merchant_id == user.id, Product.sku == "igshop:444"
+    ).one()
+    assert untitled.name == "Untitled import 444"
+    assert untitled.is_draft is True
 
     # The name-matched row keeps its merchant-tuned floor and stock.
     db_session.refresh(existing)
@@ -156,7 +173,7 @@ def test_import_skips_unmappable_and_existing_without_touching_them(
     assert existing.sku == "SHOP-K1"
     assert (
         db_session.query(Product).filter(Product.merchant_id == user.id).count()
-    ) == 2
+    ) == 4
 
 
 @respx.mock
@@ -187,6 +204,33 @@ def test_reimport_matches_by_sku_instead_of_duplicating(client, db_session, auth
         db_session.query(Product).filter(Product.merchant_id == user.id).count()
     ) == 1
     assert route.call_count == 2
+
+
+@respx.mock
+def test_reimport_skips_existing_draft_without_duplicating(
+    client, db_session, auth_user
+):
+    user, headers = auth_user
+    respx.get(url__regex=PRODUCTS_URL_RE).mock(
+        return_value=httpx.Response(
+            200, json={"data": [_item("333", "Priceless Vase", price="free")]}
+        )
+    )
+
+    first = client.post(
+        IMPORT_URL, json={"catalog_id": "merchant_cat_1"}, headers=headers
+    )
+    second = client.post(
+        IMPORT_URL, json={"catalog_id": "merchant_cat_1"}, headers=headers
+    )
+
+    assert first.json()["draft_count"] == 1
+    assert second.json()["draft_count"] == 0
+    assert second.json()["skipped_count"] == 1
+    assert second.json()["skipped"][0]["reason"] == "already imported"
+    assert (
+        db_session.query(Product).filter(Product.merchant_id == user.id).count()
+    ) == 1
 
 
 @respx.mock

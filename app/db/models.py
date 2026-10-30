@@ -391,6 +391,12 @@ class Product(Base):
     quantity = Column(Integer, default=0)
     weight = Column(Float, nullable=True)
     is_active = Column(Boolean, default=True)
+    # Shop-import draft (#74): an item that failed mapping (missing title
+    # or price) persists as an inactive draft instead of being dropped.
+    # Drafts are excluded from Amara's catalog, close-time validation and
+    # catalog push until auto-completed by a valid merchant save (see
+    # maybe_complete_draft in app/crud/product.py).
+    is_draft = Column(Boolean, default=False, nullable=False)
     # Opts this product into recurring billing instead of a one-time sale —
     # see ProductSubscription / app/services/product_subscription.py. A deal
     # closed on a subscription product still rides the normal one-time

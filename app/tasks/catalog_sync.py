@@ -146,6 +146,16 @@ def sync_catalog_item(product_id: str, op: str = OP_UPSERT):
                     "(deleted between dispatch and execution).", product_id,
                 )
                 return "Product not found; skipped."
+            if product.is_draft:
+                # Drafts never push (placeholder 0 prices must not go
+                # public); the save that completes one dispatches a normal
+                # upsert. Routine, not a warning — the importer intentionally
+                # doesn't dispatch for drafts at all.
+                logger.info(
+                    "Skipping catalog upsert for product %s: still a draft.",
+                    product_id,
+                )
+                return "Draft; skipped."
             merchant = db.get(User, product.merchant_id) if product.merchant_id else None
             merchant_phone = None
             merchant_name = None

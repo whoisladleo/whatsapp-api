@@ -94,6 +94,9 @@ def send_quote_nudge(context_id: str, account_id: str, scheduled_quote_at_iso: s
             product is not None
             and (product.quantity or 0) >= 1
             and product.is_active is not False
+            # Drafts carry placeholder 0 prices — never card one, even if a
+            # merchant set stock on it before completing it.
+            and not product.is_draft
         )
 
         provider = WhatsAppProvider(account.access_token, account.phone_number_id)

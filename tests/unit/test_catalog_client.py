@@ -8,9 +8,12 @@ import respx
 
 from app.core.catalog_client import (
     CATALOG_PRODUCT_FIELDS,
+    DRAFT_NAME_PREFIX,
+    CatalogDraftableError,
     CatalogError,
     CatalogMappingError,
     MetaCatalogClient,
+    catalog_item_to_draft_data,
     catalog_item_to_product_data,
     format_price_tzs,
     parse_catalog_price,
@@ -457,8 +460,53 @@ def test_catalog_item_mapping_rejects_missing_title_or_id():
 def test_catalog_item_mapping_rejects_bad_price():
     with pytest.raises(CatalogMappingError, match="not TZS"):
         catalog_item_to_product_data(_catalog_item(price="50.00 USD"))
-    with pytest.raises(CatalogMappingError):
+    with pytest.raises(CatalogDraftableError):
         catalog_item_to_product_data(_catalog_item(price="free"))
+
+
+def test_draftable_taxonomy():
+    """
+    Missing title/price → draftable (merchant can complete by hand);
+    missing id/non-dict/foreign currency → hard skip. The draftable
+    error subclasses the mapping error so old callers keep working.
+    """
+    assert issubclass(CatalogDraftableError, CatalogMappingError)
+
+    with pytest.raises(CatalogDraftableError):
+        catalog_item_to_product_data(_catalog_item(title=""))
+    with pytest.raises(CatalogDraftableError):
+        parse_catalog_price("free")
+
+    for hard_skip in [
+        lambda: catalog_item_to_product_data("not-a-dict"),
+        lambda: catalog_item_to_product_data(_catalog_item(id="")),
+        lambda: catalog_item_to_product_data(_catalog_item(price="50.00 USD")),
+    ]:
+        with pytest.raises(CatalogMappingError) as exc_info:
+            hard_skip()
+        assert type(exc_info.value) is CatalogMappingError
+
+
+def test_catalog_item_to_draft_data_placeholders():
+    data = catalog_item_to_draft_data(_catalog_item(title="", price="free"))
+
+    assert data["name"] == f"{DRAFT_NAME_PREFIX}98765432"
+    assert data["max_price"] == 0.0
+    assert data["min_price"] == 0.0
+    assert data["quantity"] == 0
+    assert data["is_active"] is False
+    assert data["is_draft"] is True
+    assert data["sku"] == "igshop:987654321"
+    # Partial data survives: description and image carry over.
+    assert data["description"] == "Genuine leather"
+    assert data["image_url"] == "https://cdn.meta.com/bag.jpg"
+
+
+def test_catalog_item_to_draft_data_keeps_real_title():
+    data = catalog_item_to_draft_data(_catalog_item(price="free"))
+
+    assert data["name"] == "Leather Handbag"
+    assert data["is_draft"] is True
 
 
 # Shop import: product listing
