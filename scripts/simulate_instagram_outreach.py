@@ -54,15 +54,15 @@ CLOSE_NOTE = ["payment request", "has been sent", "approve", "thibitisha", "tuma
 
 OPENERS = {
     # O1 — Swahili opener, hand-sent by the seller (ingested as echo).
+    # v2: spec-verbatim text (v1 used a same-spirit equivalent).
     "O1": (
-        "Habari! Naitwa Juma kutoka Taskflow. Tunasaidia maduka kujibu "
-        "wateja papo hapo na kufunga mauzo hata ukiwa busy — ungependa "
-        "nikueleze kwa kifupi?"
+        "Habari! Nimeona duka lako — naweza kukusaidia kujibu wateja "
+        "papo hapo na kufunga mauzo hata ukiwa busy. Uko tayari kujaribu?"
     ),
-    # O2 — English opener.
+    # O2 — English opener, spec-verbatim.
     "O2": (
-        "Hi! I'm Juma from Taskflow. We help shops reply to customers "
-        "instantly and close sales even on busy days — can I explain briefly?"
+        "Hi! Saw your shop — I can help you reply to customers instantly "
+        "and close sales even when you're busy. Want to try it?"
     ),
 }
 
