@@ -13,6 +13,7 @@ from app.core.security import is_safe_external_url, verify_meta_signature
 import httpx
 from app.core.attachments import describe_attachments
 from app.core.webhook_parser import WebhookParser
+from app.services.handoff_flow import normalize_button_id
 from app.crud import message as crud_message
 from app.tasks.webhook_processing import apply_async_or_rollback, process_inbound_message
 from app.tasks.location_capture import capture_customer_location
@@ -167,6 +168,28 @@ async def handle_webhook(
                 apply_async_or_rollback(
                     process_inbound_message,
                     [str(account_id), item.get("from_phone"), message_body],
+                    db, Message, stored.id,
+                )
+            elif (
+                item.get("direction") == "inbound"
+                and item.get("type") == "interactive"
+                and (
+                    normalize_button_id(item.get("interactive_id"), item.get("body")) or ""
+                ).startswith("handoff_")
+            ):
+                # Handoff template button tap — not gated on ai_enabled,
+                # merchant tooling stays live even when AI replies are off.
+                apply_async_or_rollback(
+                    process_inbound_message,
+                    [
+                        str(account_id),
+                        item.get("from_phone"),
+                        item.get("body") or "",
+                        0,
+                        0,
+                        normalize_button_id(item.get("interactive_id"), item.get("body")),
+                        item.get("context_message_id"),
+                    ],
                     db, Message, stored.id,
                 )
             elif (

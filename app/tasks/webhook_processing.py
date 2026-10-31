@@ -137,14 +137,22 @@ def _release_lock(key: str) -> None:
 
 @celery_app.task
 def process_inbound_message(
-    account_id: str, from_phone: str, message_body: str, attempt: int = 0, llm_attempt: int = 0
+    account_id: str,
+    from_phone: str,
+    message_body: str,
+    attempt: int = 0,
+    llm_attempt: int = 0,
+    interactive_id: str | None = None,
+    context_message_id: str | None = None,
 ):
     """
     Handles a single inbound customer/merchant text message: routes it to
     either the merchant command handler or the AI sales engine, sends the
     reply, and logs it. Moved off the webhook request path so a slow Claude
     call or WhatsApp send can't hold up Meta's webhook ACK and risk a
-    retried (duplicate) delivery.
+    retried (duplicate) delivery. interactive_id/context_message_id carry a
+    handoff template button tap (see app/services/handoff_flow.py) — only
+    ever set on that dispatch path.
 
     Lock contention (see _acquire_lock) is handled by re-dispatching this
     same task via apply_async(countdown=...) with `attempt` incremented,
@@ -178,13 +186,23 @@ def process_inbound_message(
                 return "Lock contention exhausted."
 
             process_inbound_message.apply_async(
-                args=[account_id, from_phone, message_body, attempt + 1, llm_attempt],
+                args=[account_id, from_phone, message_body, attempt + 1, llm_attempt, interactive_id, context_message_id],
                 countdown=LOCK_RETRY_COUNTDOWN_SECONDS,
             )
             return "Retrying due to lock contention."
 
         try:
-            return _run_async(_process(db, account, from_phone, message_body, llm_attempt=llm_attempt))
+            return _run_async(
+                _process(
+                    db,
+                    account,
+                    from_phone,
+                    message_body,
+                    llm_attempt=llm_attempt,
+                    interactive_id=interactive_id,
+                    context_message_id=context_message_id,
+                )
+            )
         except LLMUnavailable as e:
             outage = e
         finally:
@@ -193,7 +211,7 @@ def process_inbound_message(
         # Dispatched only after the lock is released, so the retry can take it.
         logger.warning(f"Claude unavailable for {lock_key} (attempt {llm_attempt}); retrying: {outage}")
         process_inbound_message.apply_async(
-            args=[account_id, from_phone, message_body, 0, llm_attempt + 1],
+            args=[account_id, from_phone, message_body, 0, llm_attempt + 1, interactive_id, context_message_id],
             countdown=LLM_RETRY_COUNTDOWNS_SECONDS[llm_attempt],
         )
         return "Retrying: LLM unavailable."
@@ -201,45 +219,76 @@ def process_inbound_message(
         db.close()
 
 
-async def _process(db, account, from_phone, message_body, llm_attempt: int = 0) -> str:
-    is_merchant = account.owner and normalize_phone(from_phone) == normalize_phone(
-        account.owner.username
-    )
+async def _process(
+    db,
+    account,
+    from_phone,
+    message_body,
+    llm_attempt: int = 0,
+    interactive_id: str | None = None,
+    context_message_id: str | None = None,
+) -> str:
+    from app.services.handoff_flow import consume_reply_mode, handle_button, resolve_merchant
 
     response_text = None
+    is_merchant = False
 
-    if is_merchant:
-        response_text = await handle_merchant_message(db, account, message_body, from_phone)
-    elif llm_service:
-        rate_limit_key = f"ai_reply:{account.id}:{normalize_phone(from_phone)}"
-        # An outage retry is the same message, already counted once.
-        if llm_attempt == 0 and not check_and_increment(
-            rate_limit_key, AI_REPLY_RATE_LIMIT, AI_REPLY_RATE_LIMIT_WINDOW_SECONDS
-        ):
-            logger.warning(
-                f"AI reply rate limit exceeded for {from_phone} on account {account.id}; "
-                "dropping this message without a reply."
-            )
-            return "Rate limited."
+    if interactive_id:
+        # Handoff template button tap — lands on the platform number, where
+        # the sender is never account.owner, so this runs before the
+        # merchant/customer fork below.
+        merchant = resolve_merchant(db, from_phone)
+        response_text = await handle_button(db, merchant, interactive_id, context_message_id)
+        if response_text is None:
+            return "Unknown button tap; staying silent."
+        is_merchant = True
+    elif account.is_platform_account:
+        merchant = resolve_merchant(db, from_phone)
+        if merchant is not None:
+            # An armed tap-to-reply consumes the merchant's next message
+            # here, on the platform chat where the alert arrived — the
+            # onboarding flow below never sees it.
+            response_text = await consume_reply_mode(db, merchant, message_body)
+            if response_text is not None:
+                is_merchant = True
 
-        knowledge_content = None
-        if account.product_slug:
-            kb = crud_knowledge.get_knowledge_base_by_slug(
-                db, account.product_slug, account.user_id
-            )
-            if kb:
-                knowledge_content = kb.content
-
-        response_text = await llm_service.generate_response(
-            message_body=message_body,
-            product_slug=account.product_slug,
-            knowledge_content=knowledge_content,
-            system_prompt=account.system_prompt,
-            from_phone=from_phone,
-            db=db,
-            account=account,
-            retry_on_outage=llm_attempt < len(LLM_RETRY_COUNTDOWNS_SECONDS),
+    if response_text is None:
+        is_merchant = account.owner and normalize_phone(from_phone) == normalize_phone(
+            account.owner.username
         )
+
+        if is_merchant:
+            response_text = await handle_merchant_message(db, account, message_body, from_phone)
+        elif llm_service:
+            rate_limit_key = f"ai_reply:{account.id}:{normalize_phone(from_phone)}"
+            # An outage retry is the same message, already counted once.
+            if llm_attempt == 0 and not check_and_increment(
+                rate_limit_key, AI_REPLY_RATE_LIMIT, AI_REPLY_RATE_LIMIT_WINDOW_SECONDS
+            ):
+                logger.warning(
+                    f"AI reply rate limit exceeded for {from_phone} on account {account.id}; "
+                    "dropping this message without a reply."
+                )
+                return "Rate limited."
+
+            knowledge_content = None
+            if account.product_slug:
+                kb = crud_knowledge.get_knowledge_base_by_slug(
+                    db, account.product_slug, account.user_id
+                )
+                if kb:
+                    knowledge_content = kb.content
+
+            response_text = await llm_service.generate_response(
+                message_body=message_body,
+                product_slug=account.product_slug,
+                knowledge_content=knowledge_content,
+                system_prompt=account.system_prompt,
+                from_phone=from_phone,
+                db=db,
+                account=account,
+                retry_on_outage=llm_attempt < len(LLM_RETRY_COUNTDOWNS_SECONDS),
+            )
 
     if response_text:
         provider = WhatsAppProvider(account.access_token, account.phone_number_id)
@@ -257,7 +306,19 @@ async def _process(db, account, from_phone, message_body, llm_attempt: int = 0) 
             if not is_merchant and account.owner:
                 # The customer never got this reply — the merchant has to step in (#38).
                 try:
-                    await llm_service._send_platform_alert_to_merchant(db, account.owner, from_phone, message_body)
+                    await llm_service._send_platform_alert_to_merchant(
+                        db,
+                        account.owner,
+                        from_phone,
+                        message_body,
+                        alert_target={
+                            "channel": "whatsapp",
+                            "ref": from_phone,
+                            "name": from_phone,
+                            "account_id": str(account.id),
+                            "customer_id": None,
+                        },
+                    )
                 except Exception as alert_err:
                     logger.error(f"Failed to alert merchant of undelivered reply: {alert_err}")
 

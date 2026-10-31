@@ -215,7 +215,7 @@ def _fake_llm(monkeypatch, generate_response, alerts=None):
 
     FakeLLMService.generate_response = staticmethod(generate_response)
 
-    async def record_alert(db, merchant, reply_identifier, customer_message):
+    async def record_alert(db, merchant, reply_identifier, customer_message, alert_target=None):
         alerts.append((reply_identifier, customer_message))
 
     FakeLLMService._send_platform_alert_to_merchant = staticmethod(record_alert)

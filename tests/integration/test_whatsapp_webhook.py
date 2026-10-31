@@ -775,3 +775,195 @@ def test_unsigned_webhook_rejected_when_secret_unset_and_flag_off(client, monkey
 
     assert resp.status_code == 403
     assert resp.json()["detail"] == "Webhook signature verification is not configured"
+
+
+def _button_tap_payload(phone_number_id, from_phone, button_id, context_id=None, msg_id="wamid.tap1"):
+    message = {
+        "from": from_phone,
+        "id": msg_id,
+        "timestamp": "1700000000",
+        "type": "interactive",
+        "interactive": {
+            "type": "button_reply",
+            "button_reply": {"id": button_id, "title": "Reply"},
+        },
+    }
+    if context_id:
+        message["context"] = {"id": context_id}
+    return {
+        "entry": [
+            {
+                "id": "entry1",
+                "changes": [
+                    {
+                        "value": {
+                            "messaging_product": "whatsapp",
+                            "metadata": {
+                                "display_phone_number": "255700000000",
+                                "phone_number_id": phone_number_id,
+                            },
+                            "messages": [message],
+                        },
+                        "field": "messages",
+                    }
+                ],
+            }
+        ]
+    }
+
+
+@respx.mock
+def test_handoff_reply_tap_arms_reply_mode_and_confirms(
+    client, db_session, merchant_owner, monkeypatch
+):
+    import fakeredis
+
+    import app.services.handoff_flow as flow_module
+
+    monkeypatch.setattr(flow_module, "redis_client", fakeredis.FakeRedis())
+
+    platform = WhatsAppAccount(
+        name="Taskflow",
+        phone_number_id="PHONE_PLATFORM",
+        access_token="tok",
+        ai_enabled=True,
+        is_platform_account=True,
+        user_id=merchant_owner.id,
+    )
+    db_session.add(platform)
+    business = WhatsAppAccount(
+        name="Shop",
+        phone_number_id="PHONE_TAP",
+        access_token="tok",
+        ai_enabled=True,
+        user_id=merchant_owner.id,
+    )
+    db_session.add(business)
+    db_session.commit()
+
+    from app.db.models import ConversationContext, ConversationState, Customer
+
+    customer = Customer(phone_number="255711111111")
+    db_session.add(customer)
+    db_session.commit()
+    db_session.refresh(customer)
+    db_session.add(
+        ConversationContext(customer_id=customer.id, state=ConversationState.HUMAN_HANDOFF)
+    )
+    db_session.add(
+        Message(
+            whatsapp_message_id="wamid.histtap",
+            from_phone="255711111111",
+            type="text",
+            body="hello?",
+            direction="inbound",
+            status="delivered",
+            account_id=business.id,
+        )
+    )
+    db_session.commit()
+
+    send_route = respx.post(url__regex=MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "wamid.confirm1"}]})
+    )
+
+    owner_id = merchant_owner.id
+    payload = _button_tap_payload("PHONE_PLATFORM", merchant_owner.username, "handoff_reply")
+    resp = client.post(WEBHOOK_URL, json=payload)
+
+    assert resp.status_code == 200
+    assert send_route.called
+    assert flow_module.get_reply_mode(owner_id)["ref"] == "255711111111"
+
+    outbound = db_session.query(Message).filter(Message.direction == "outbound").first()
+    assert "You're replying to 255711111111" in outbound.body
+
+
+@respx.mock
+def test_non_handoff_button_tap_is_stored_but_not_dispatched(
+    client, db_session, merchant_owner
+):
+    platform = WhatsAppAccount(
+        name="Taskflow",
+        phone_number_id="PHONE_PLATFORM2",
+        access_token="tok",
+        ai_enabled=True,
+        is_platform_account=True,
+        user_id=merchant_owner.id,
+    )
+    db_session.add(platform)
+    db_session.commit()
+
+    send_route = respx.post(url__regex=MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "wamid.x"}]})
+    )
+
+    payload = _button_tap_payload("PHONE_PLATFORM2", merchant_owner.username, "some_other_flow")
+    resp = client.post(WEBHOOK_URL, json=payload)
+
+    assert resp.status_code == 200
+    assert not send_route.called
+    stored = db_session.query(Message).filter(Message.whatsapp_message_id == "wamid.tap1").first()
+    assert stored is not None
+
+
+@respx.mock
+def test_handoff_tap_routing_accepts_title_as_id(client, db_session, merchant_owner, monkeypatch):
+    import fakeredis
+
+    import app.services.handoff_flow as flow_module
+
+    monkeypatch.setattr(flow_module, "redis_client", fakeredis.FakeRedis())
+
+    platform = WhatsAppAccount(
+        name="Taskflow",
+        phone_number_id="PHONE_PLATFORM3",
+        access_token="tok",
+        ai_enabled=True,
+        is_platform_account=True,
+        user_id=merchant_owner.id,
+    )
+    db_session.add(platform)
+    db_session.commit()
+
+    send_route = respx.post(url__regex=MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "wamid.confirm2"}]})
+    )
+
+    # Meta may echo the button title as the tap id instead of a payload.
+    message = {
+        "from": merchant_owner.username,
+        "id": "wamid.tap3",
+        "timestamp": "1700000000",
+        "type": "interactive",
+        "interactive": {
+            "type": "button_reply",
+            "button_reply": {"id": "✅ Done", "title": "✅ Done"},
+        },
+    }
+    payload = {
+        "entry": [
+            {
+                "id": "entry1",
+                "changes": [
+                    {
+                        "value": {
+                            "messaging_product": "whatsapp",
+                            "metadata": {
+                                "display_phone_number": "255700000000",
+                                "phone_number_id": "PHONE_PLATFORM3",
+                            },
+                            "messages": [message],
+                        },
+                        "field": "messages",
+                    }
+                ],
+            }
+        ]
+    }
+    resp = client.post(WEBHOOK_URL, json=payload)
+
+    assert resp.status_code == 200
+    assert send_route.called
+    outbound = db_session.query(Message).filter(Message.direction == "outbound").first()
+    assert "Nothing in progress" in outbound.body

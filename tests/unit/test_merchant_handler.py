@@ -502,3 +502,32 @@ async def test_reply_instagram_customer_meta_error_is_reported(db_session, merch
 
     assert "Failed to send reply" in reply
     assert "user not reachable" in reply
+
+
+async def test_cancel_with_armed_reply_mode_disarms(db_session, merchant_account, monkeypatch):
+    import fakeredis
+
+    import app.services.handoff_flow as flow_module
+
+    monkeypatch.setattr(flow_module, "redis_client", fakeredis.FakeRedis())
+    flow_module.arm_reply_mode(
+        merchant_account.user_id,
+        {"channel": "whatsapp", "ref": "255711111111", "name": "255711111111"},
+    )
+
+    reply = await handle_merchant_message(db_session, merchant_account, "/cancel", "255700000099")
+
+    assert reply == "Cancelled — nothing was sent."
+    assert flow_module.get_reply_mode(merchant_account.user_id) is None
+
+
+async def test_cancel_with_nothing_armed(db_session, merchant_account, monkeypatch):
+    import fakeredis
+
+    import app.services.handoff_flow as flow_module
+
+    monkeypatch.setattr(flow_module, "redis_client", fakeredis.FakeRedis())
+
+    reply = await handle_merchant_message(db_session, merchant_account, "/cancel", "255700000099")
+
+    assert reply == "Nothing to cancel."

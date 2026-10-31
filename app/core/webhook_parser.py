@@ -50,17 +50,19 @@ class WebhookParser:
 
                     body = ""
                     location = None
+                    # Static quick-reply payload (see the handoff buttons in
+                    # #88) + the alert message it was tapped on, if any.
+                    item_interactive_id = None
+                    item_context_message_id = (message.get("context") or {}).get("id")
                     attachments = WebhookParser.extract_attachments(msg_type, message)
                     if msg_type == "text":
                         body = message.get("text", {}).get("body", "")
                     elif msg_type == "button":
                         body = message.get("button", {}).get("text", "")
                     elif msg_type == "interactive":
-                        body = (
-                            message.get("interactive", {})
-                            .get("button_reply", {})
-                            .get("title", "")
-                        )
+                        button_reply = message.get("interactive", {}).get("button_reply", {})
+                        body = button_reply.get("title", "")
+                        item_interactive_id = button_reply.get("id")
                     elif msg_type in ["image", "document", "audio", "video"]:
                         # The media id used to land in body (noise for Amara
                         # and the dashboard); the caption is the readable
@@ -94,6 +96,10 @@ class WebhookParser:
                         item["location"] = location
                     if attachments:
                         item["attachments"] = attachments
+                    if item_interactive_id:
+                        item["interactive_id"] = item_interactive_id
+                    if item_context_message_id:
+                        item["context_message_id"] = item_context_message_id
                     parsed_messages.append(item)
 
                 # Handle Status Updates (delivered, read, etc)

@@ -2,6 +2,7 @@ from sqlalchemy.orm import Session
 from app.db.models import WhatsAppAccount, Product, Message, InstagramAccount, InstagramCustomer
 from app.crud import message as crud_message
 from app.crud import instagram as crud_instagram
+from app.services.handoff_flow import relay_to_instagram_customer, relay_to_whatsapp_customer
 import re
 
 async def handle_merchant_message(db: Session, account: WhatsAppAccount, message_body: str, from_phone: str) -> str:
@@ -13,8 +14,17 @@ async def handle_merchant_message(db: Session, account: WhatsAppAccount, message
     /price [Product_Name] max:[Price] min:[Price]
     /resume [Phone|@instagram_username]
     /reply [Phone|@instagram_username] [Message]
+    /cancel (leave an armed handoff reply-mode without sending)
     """
     body = message_body.strip()
+
+    if body.lower() == "/cancel":
+        from app.services.handoff_flow import clear_reply_mode, get_reply_mode
+
+        if get_reply_mode(account.user_id) is None:
+            return "Nothing to cancel."
+        clear_reply_mode(account.user_id)
+        return "Cancelled — nothing was sent."
 
     # If the merchant just types /stock or /price without arguments, they enter MANAGEMENT state
     if body.lower() in ["/stock", "/price", "/manage"]:
@@ -60,8 +70,8 @@ async def handle_merchant_message(db: Session, account: WhatsAppAccount, message
         identifier, reply_text = match.group(1), match.group(2).strip()
 
         if identifier.startswith("@"):
-            return await _relay_to_instagram_customer(db, account, identifier[1:], reply_text)
-        return await _relay_to_whatsapp_customer(db, account, identifier, reply_text)
+            return await relay_to_instagram_customer(db, account.owner, identifier[1:], reply_text)
+        return await relay_to_whatsapp_customer(db, account, identifier, reply_text)
 
     if body.lower().startswith("/stock "):
         # Parse: /stock [Product_Name] +[Qty] or -[Qty]
@@ -130,113 +140,6 @@ async def handle_merchant_message(db: Session, account: WhatsAppAccount, message
             return "Invalid format. Example: `/price Shoes max:50000 min:40000`"
 
     return "Unknown command. Send `/manage` to see available commands."
-
-
-async def _relay_to_whatsapp_customer(db: Session, account: WhatsAppAccount, phone: str, reply_text: str) -> str:
-    """
-    Sends `reply_text` as the merchant's own manual reply to a WhatsApp
-    customer, via this same account's credentials — the WhatsApp-native
-    counterpart of the dashboard's POST /whatsapp/messages/send. Requires
-    prior message history with *this* account (Customer is global, not
-    merchant-scoped, in this schema — same safeguard as /resume) rather
-    than trusting an arbitrary typed phone number outright, since a raw
-    text command is far more typo-prone than a dashboard form.
-    """
-    from app.core.provider import WhatsAppProvider
-
-    has_history = (
-        db.query(Message)
-        .filter(Message.from_phone == phone, Message.account_id == account.id)
-        .first()
-    )
-    if not has_history:
-        return f"No conversation with {phone} found for this account."
-
-    provider = WhatsAppProvider(account.access_token, account.phone_number_id)
-    try:
-        resp = await provider.send_text(phone, reply_text)
-    except Exception as e:
-        return f"Failed to send reply to {phone}: {e}"
-
-    if not resp or "messages" not in resp:
-        error_detail = resp.get("error", {}).get("message", "unknown error") if resp else "unknown error"
-        return f"Failed to send reply to {phone}: {error_detail}"
-
-    crud_message.create_message(
-        db,
-        {
-            "whatsapp_message_id": resp["messages"][0].get("id"),
-            "to_phone": phone,
-            "type": "text",
-            "body": reply_text,
-            "direction": "outbound",
-            "status": "sent",
-            "raw": resp,
-        },
-        account.id,
-    )
-    return f"Sent to {phone}."
-
-
-async def _relay_to_instagram_customer(db: Session, account: WhatsAppAccount, ig_username: str, reply_text: str) -> str:
-    """
-    Lets a merchant reply to an Instagram DM customer from their WhatsApp
-    number — the whole point being that this WhatsApp account is how the
-    merchant talks *to* Amara/Taskflow, even for a conversation actually
-    happening on a different channel (see CLAUDE.md's Instagram section on
-    _notify_merchant_of_instagram_handoff, the read side of this same
-    cross-channel relay). Scoped to this merchant's own connected
-    InstagramAccount and an InstagramCustomer who has actually messaged it
-    — InstagramCustomer.account_id already scopes ownership directly, no
-    global-Customer ambiguity the way WhatsApp's ambiguity check needs.
-
-    `ig_username` also matches against ig_scoped_id as a fallback — the
-    handoff alert's own "/reply @..." instruction (llm.py's
-    _notify_merchant_of_instagram_handoff) uses whichever one it actually
-    has for that customer, which is the scoped id for a brand-new customer
-    whose display-name backfill hasn't run yet.
-    """
-    from app.core.instagram_provider import InstagramProvider
-
-    ig_account = (
-        db.query(InstagramAccount)
-        .filter(InstagramAccount.user_id == account.user_id, InstagramAccount.access_token != "")
-        .first()
-    )
-    if not ig_account:
-        return "No Instagram account connected."
-
-    ig_customer = (
-        db.query(InstagramCustomer)
-        .filter(
-            InstagramCustomer.account_id == ig_account.id,
-            (InstagramCustomer.username == ig_username) | (InstagramCustomer.ig_scoped_id == ig_username),
-        )
-        .first()
-    )
-    if not ig_customer:
-        return f"No Instagram conversation with @{ig_username} found."
-
-    provider = InstagramProvider(ig_account.access_token)
-    try:
-        resp = await provider.send_direct_message(
-            ig_account.ig_business_id, ig_customer.ig_scoped_id, reply_text, tag="HUMAN_AGENT"
-        )
-    except Exception as e:
-        return f"Failed to send reply to @{ig_username}: {e}"
-
-    if "error" in resp:
-        return f"Failed to send reply to @{ig_username}: {resp['error'].get('message', 'unknown error')}"
-
-    crud_instagram.create_direct_message(
-        db,
-        account_id=ig_account.id,
-        customer_id=ig_customer.id,
-        direction="outbound",
-        body=reply_text,
-        ig_message_id=resp.get("message_id"),
-    )
-    return f"Sent to @{ig_username}."
 
 
 async def _resume_instagram_conversation(db: Session, account: WhatsAppAccount, ig_username: str) -> str:

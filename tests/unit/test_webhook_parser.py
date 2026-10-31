@@ -240,3 +240,35 @@ def test_parses_raw_pin_location_message_falls_back_to_coordinates():
     assert item["body"] == "📍 -6.7924,39.2083"
     assert item["location"]["name"] is None
     assert item["location"]["address"] is None
+
+
+def test_parses_button_reply_payload_and_context_ids():
+    message = {
+        "from": "255700000099",
+        "id": "wamid.tap1",
+        "type": "interactive",
+        "interactive": {
+            "type": "button_reply",
+            "button_reply": {"id": "handoff_reply", "title": "Reply"},
+        },
+        "context": {"id": "wamid.alert1"},
+    }
+    parsed = WebhookParser.parse_inbound(_envelope(_base_value(messages=[message])))
+
+    assert parsed[0]["type"] == "interactive"
+    assert parsed[0]["body"] == "Reply"
+    assert parsed[0]["interactive_id"] == "handoff_reply"
+    assert parsed[0]["context_message_id"] == "wamid.alert1"
+
+
+def test_plain_messages_carry_no_interactive_keys():
+    message = {
+        "from": "255711111111",
+        "id": "wamid.text3",
+        "type": "text",
+        "text": {"body": "hi"},
+    }
+    parsed = WebhookParser.parse_inbound(_envelope(_base_value(messages=[message])))
+
+    assert "interactive_id" not in parsed[0]
+    assert "context_message_id" not in parsed[0]

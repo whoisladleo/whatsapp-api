@@ -628,7 +628,19 @@ class LLMService:
         if is_platform_account or not account.owner:
             return
 
-        await self._send_platform_alert_to_merchant(db, account.owner, from_phone, customer_message)
+        await self._send_platform_alert_to_merchant(
+            db,
+            account.owner,
+            from_phone,
+            customer_message,
+            alert_target={
+                "channel": "whatsapp",
+                "ref": from_phone,
+                "name": from_phone,
+                "account_id": str(account.id),
+                "customer_id": None,
+            },
+        )
 
         from app.tasks.handoff_reminders import (
             send_handoff_reminder,
@@ -697,10 +709,27 @@ class LLMService:
         # something the merchant can actually paste back in, even before
         # the display-name backfill has ever run for a brand-new customer.
         reply_identifier = customer.username or customer.ig_scoped_id
-        await self._send_platform_alert_to_merchant(db, merchant, f"@{reply_identifier}", customer_message)
+        await self._send_platform_alert_to_merchant(
+            db,
+            merchant,
+            f"@{reply_identifier}",
+            customer_message,
+            alert_target={
+                "channel": "instagram",
+                "ref": reply_identifier,
+                "name": f"@{reply_identifier}",
+                "account_id": None,
+                "customer_id": str(customer.id),
+            },
+        )
 
     async def _send_platform_alert_to_merchant(
-        self, db: Session, merchant: User, reply_identifier: str, customer_message: str
+        self,
+        db: Session,
+        merchant: User,
+        reply_identifier: str,
+        customer_message: str,
+        alert_target: dict | None = None,
     ) -> None:
         """
         Sends a handoff alert to the merchant's own personal WhatsApp
@@ -771,6 +800,16 @@ class LLMService:
         except Exception as alert_err:
             logger.error(f"Failed to send platform alert to merchant: {alert_err}")
             alert_resp = None
+
+        # Maps the sent alert to its customer so a button tap's context id
+        # resolves to the exact conversation (template button payloads are
+        # static — see app/services/handoff_flow.py).
+        if alert_target is not None and alert_resp and "messages" in alert_resp:
+            from app.services.handoff_flow import remember_alert
+
+            wamid = (alert_resp["messages"][0] or {}).get("id")
+            if wamid:
+                remember_alert(wamid, alert_target)
 
         # Only log this as a Message if the platform's own number is
         # actually connected as a real WhatsAppAccount (see CLAUDE.md) —
