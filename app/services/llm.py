@@ -24,6 +24,8 @@ from app.db.models import (
     OrderStatus,
     PaymentType,
     Product,
+    ProductSubscription,
+    ProductSubscriptionStatus,
     WhatsAppAccount,
     Message,
     User,
@@ -260,6 +262,73 @@ def _holding_reply(language: Optional[str]) -> str:
     return f"{_HOLDING_REPLIES['sw']}\n\n{_HOLDING_REPLIES['en']}"
 
 
+async def _complete_with_empty_retry(provider, **kwargs) -> str:
+    """
+    One inline retry when the model returns empty content — a blank
+    reply would otherwise end the conversation in silence (#101).
+    Exceptions from either attempt propagate to the caller's outage
+    handling unchanged.
+    """
+    text = await provider.complete(**kwargs)
+    if not (text or "").strip():
+        logger.warning("LLM returned empty content; retrying once.")
+        text = await provider.complete(**kwargs)
+    return text
+
+
+def _reclose_guard_note(db: Session, customer_id, product: Product, channel_filter) -> Optional[str]:
+    """
+    Fail-closed guard against duplicate closes (#101): the model
+    re-emits AGREEMENT_REACHED across turns (seen 3x in one sim
+    conversation), and every emission used to mint a fresh PENDING
+    order plus a fresh Tunzaa dispatch — duplicate charge prompts for
+    a single deal. Returns the customer-facing note when this close
+    must NOT proceed, else None. Any PENDING order blocks, even an
+    expired hold — the auto-cancel task cleans those up, and erring
+    toward not charging twice is the safe direction.
+    """
+    open_order = (
+        db.query(Order)
+        .filter(
+            Order.customer_id == customer_id,
+            Order.product_id == product.id,
+            channel_filter,
+            Order.status == OrderStatus.PENDING,
+        )
+        .first()
+    )
+    if open_order:
+        logger.warning(
+            "Duplicate close blocked: PENDING order %s already exists for customer %s / product %s.",
+            open_order.id,
+            customer_id,
+            product.id,
+        )
+        return (
+            f"A payment request for TZS {open_order.agreed_price:,.0f} is already on its way "
+            "to your phone — please approve it to complete your order."
+        )
+    if product.is_subscription:
+        active = (
+            db.query(ProductSubscription)
+            .filter(
+                ProductSubscription.customer_id == customer_id,
+                ProductSubscription.product_id == product.id,
+                ProductSubscription.status == ProductSubscriptionStatus.ACTIVE,
+            )
+            .first()
+        )
+        if active:
+            logger.warning(
+                "Duplicate close blocked: subscription %s already ACTIVE for customer %s / product %s.",
+                active.id,
+                customer_id,
+                product.id,
+            )
+            return f"Your {product.name} subscription is already active — no new payment needed."
+    return None
+
+
 class LLMUnavailable(Exception):
     """
     A transient LLM failure (connection error, 429, 5xx) that survived
@@ -451,6 +520,12 @@ class LLMService:
             PaymentType.INSTALLMENT if agreement["payment_type"] == "installment" else PaymentType.FULL
         )
 
+        # Duplicate-close guard — before the stock claim, so a re-close
+        # neither reserves a unit nor dispatches a second payment (#101).
+        reclose_note = _reclose_guard_note(db, customer.id, product, Order.account_id == account.id)
+        if reclose_note:
+            return reclose_note
+
         # Reserve: claim one unit atomically (conditional UPDATE, not a
         # read-modify-write) so two concurrent closes on the last unit
         # can't both succeed — the loser sees 0 rows and is rejected
@@ -531,7 +606,8 @@ class LLMService:
         # handling for that channel at all (unlike WhatsApp's
         # capture_customer_location task). Telling an Instagram customer to
         # use a feature we can't read would be actively misleading, so this
-        # asks for a plain text address there instead.
+        # asks for a plain text address there instead. Subscriptions skip
+        # the ask entirely — there is nothing to deliver (#101).
         location_note = (
             "reply here with your delivery address so we know where to deliver it."
             if order.instagram_account_id
@@ -546,10 +622,13 @@ class LLMService:
                 )
                 order.tunzaa_transaction_id = resp.get("transactionID")
                 db.commit()
-                return (
+                note = (
                     f"A payment request for TZS {order.agreed_price:,.0f} has been sent to your "
-                    f"phone — please approve it to complete your order. While you're at it, please {location_note}"
+                    "phone — please approve it to complete your order."
                 )
+                if not product.is_subscription:
+                    note += f" While you're at it, please {location_note}"
+                return note
             else:
                 resp = await tunzaa_service.create_installment_plan(order, product.name)
                 order.tunzaa_plan_id = str(resp.get("plan", {}).get("plan_id")) if resp.get("plan", {}).get("plan_id") else None
@@ -568,15 +647,22 @@ class LLMService:
                         )
                     )
                 db.commit()
-                return (
+                note = (
                     "Your installment plan has been created! We'll be in touch with payment "
-                    f"details. Please also {location_note}"
+                    "details."
                 )
+                if not product.is_subscription:
+                    note += f" Please also {location_note}"
+                return note
         except Exception as e:
             logger.error(f"Tunzaa dispatch failed for order {order.id}: {e}")
             # This order never got as far as an accepted payment attempt —
-            # release the reservation rather than leave it dangling.
-            product.quantity += order.quantity or 1
+            # release the reservation rather than leave it dangling. The
+            # claim above is skipped for subscriptions (no units), so there
+            # is nothing to release for them — restoring would mint phantom
+            # stock (#101).
+            if not product.is_subscription:
+                product.quantity = (product.quantity or 0) + (order.quantity or 1)
             order.status = OrderStatus.CANCELLED
             db.commit()
             # The release may flip availability back to in stock (including
@@ -1095,6 +1181,11 @@ Match the customer's language (Swahili or English). Keep both lines to one sente
             PaymentType.INSTALLMENT if agreement["payment_type"] == "installment" else PaymentType.FULL
         )
 
+        # Duplicate-close guard — same as _close_deal (#101).
+        reclose_note = _reclose_guard_note(db, customer.id, product, Order.instagram_account_id == account.id)
+        if reclose_note:
+            return reclose_note
+
         # Atomic stock claim — see _close_deal; a lost race rejects
         # exactly like the out-of-stock pre-check above (#54). Skipped
         # for subscriptions, which have no units (#89).
@@ -1213,7 +1304,8 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
 """
 
         try:
-            response_text = await self.provider.complete(
+            response_text = await _complete_with_empty_retry(
+                self.provider,
                 system=instruction,
                 messages=[
                     {
@@ -1229,6 +1321,14 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
             logger.error(f"DM-response LLM error; handing off: {e}")
             await self._hand_off_instagram(db, account, customer, context, message_body)
             return _outage_reply(None)
+
+        if not (response_text or "").strip():
+            # Empty even after the inline retry — don't end in silence:
+            # hand off (the holding line promises a human follows up) and
+            # send the same holding reply a failed close uses (#101).
+            logger.warning("DM-response LLM empty after retry; handing off.")
+            await self._hand_off_instagram(db, account, customer, context, message_body)
+            return _holding_reply(None)
 
         # Stripped up front so the marker can never leak through the early
         # handoff return below.
@@ -1548,7 +1648,8 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
             # live against the real API — not documented ahead of time) —
             # omitted rather than guessing at a replacement parameter.
             try:
-                response_text = await self.provider.complete(
+                response_text = await _complete_with_empty_retry(
+                    self.provider,
                     system=base_instruction,
                     messages=[
                         {
@@ -1566,6 +1667,15 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
                     db, account, context, from_phone, message_body, is_platform_account
                 )
                 return _outage_reply(customer.language)
+
+            if not (response_text or "").strip():
+                # Empty even after the inline retry — don't end in
+                # silence: hand off and send the holding reply (#101).
+                logger.warning("LLM empty after retry; handing off.")
+                await self._trigger_human_handoff(
+                    db, account, context, from_phone, message_body, is_platform_account
+                )
+                return _holding_reply(customer.language)
 
             # Post-process response for special triggers
 

@@ -1136,9 +1136,12 @@ async def test_repeated_subscription_agreement_reuses_pending_subscription_row(d
     """
     Regression test: a customer who negotiates a subscription product twice
     before ever completing payment (e.g. abandons the first Tunzaa prompt
-    and starts over) must not end up with two orphaned PENDING_PAYMENT
-    ProductSubscription rows for the same customer+product — see
-    product_subscription.get_or_create_pending_subscription.
+    and starts over) must not end up with a second PENDING order plus a
+    second Tunzaa dispatch for the same deal — the re-close is blocked
+    with an "already on its way" reminder instead (#101). The single
+    PENDING_PAYMENT ProductSubscription row still belongs to that one
+    order (row-level reuse now only matters on the pay_now path — see
+    product_subscription.get_or_create_pending_subscription).
     """
     subscription_product = Product(
         slug="taskflow-sub-2", name="Taskflow OS Subscription", max_price=100000, min_price=100000,
@@ -1159,22 +1162,30 @@ async def test_repeated_subscription_agreement_reuses_pending_subscription_row(d
 
     service = _service_with_fake_client(handler=handler)
 
-    for _ in range(2):
-        await service.generate_response(
-            message_body="sign me up",
-            from_phone="255711130060",
-            db=db_session,
-            account=shop_account,
-        )
+    first = await service.generate_response(
+        message_body="sign me up",
+        from_phone="255711130060",
+        db=db_session,
+        account=shop_account,
+    )
+    assert "payment request for TZS 100,000 has been sent" in first
+
+    second = await service.generate_response(
+        message_body="sign me up",
+        from_phone="255711130060",
+        db=db_session,
+        account=shop_account,
+    )
+    assert "already on its way" in second
 
     orders = db_session.query(Order).filter(Order.agreed_price == 100000, Order.product_id == subscription_product.id).all()
-    assert len(orders) == 2
+    assert len(orders) == 1
 
     subscriptions = (
         db_session.query(ProductSubscription).filter(ProductSubscription.product_id == subscription_product.id).all()
     )
     assert len(subscriptions) == 1
-    assert subscriptions[0].order_id == orders[-1].id
+    assert subscriptions[0].order_id == orders[0].id
 
 
 @respx.mock
