@@ -203,6 +203,60 @@ async def handle_webhook(
                 db, InstagramDirectMessage, dm.id,
             )
 
+    parsed_echoes = InstagramWebhookParser.parse_outbound_echoes(data)
+    print(f"Parsed {len(parsed_echoes)} echo(s) from payload")
+
+    for item in parsed_echoes:
+        account = crud_instagram.get_account_by_ig_business_id(
+            db, item["ig_business_id"]
+        )
+        if not account:
+            print(
+                f"No InstagramAccount found for ig_business_id={item['ig_business_id']!r} "
+                f"(ig_message_id={item.get('ig_message_id')!r})"
+            )
+            continue
+
+        _dispatch_token_refresh_if_stale(account)
+
+        # Echo of a message Amara (or the dashboard) sent via the API: its
+        # mid was already saved at send time, so there is nothing to do —
+        # same as when the parser dropped every echo. This check also
+        # dedupes redeliveries of the hand-typed echoes saved below.
+        if crud_instagram.dm_already_processed(db, item["ig_message_id"]):
+            continue
+
+        customer = crud_instagram.get_or_create_customer(
+            db, account.id, item["sender_id"]
+        )
+        if not customer.username:
+            fetched_username = await _fetch_instagram_display_name(account, item["sender_id"])
+            if fetched_username:
+                customer = crud_instagram.get_or_create_customer(
+                    db, account.id, item["sender_id"], username=fetched_username
+                )
+        # Read BEFORE the save below: the just-saved echo is itself
+        # outbound, so checking after would mistake every opener for a
+        # mid-chat takeover.
+        amara_replied = crud_instagram.conversation_has_outbound_message(db, customer.id)
+        crud_instagram.create_direct_message(
+            db,
+            account_id=account.id,
+            customer_id=customer.id,
+            direction="outbound",
+            body=item["body"],
+            ig_message_id=item["ig_message_id"],
+            attachments=item.get("attachments"),
+        )
+        if amara_replied:
+            # A person typed in the Instagram inbox after Amara already
+            # replied — the merchant is taking over this thread, so Amara
+            # goes silent until /resume.
+            crud_instagram.set_human_handoff(db, customer.id)
+        # Either way, no reply task is dispatched: a shop-side message is
+        # never answered — the opener is answered only when the customer
+        # replies to it, with the opener already in history.
+
     return {"status": "ok"}
 
 
