@@ -301,6 +301,8 @@ async def test_platform_prompt_shows_subscription_and_close_mechanics(
     # The dashboard link renders from settings, never hardcoded (#91).
     assert "https://business.taskflowos.dev" in instruction
     assert "dashboard-taskflow" not in instruction
+    # Same-language rule holds the welcome's language past turn 1 (#93).
+    assert "SAME language the customer just used" in instruction
 
 
 async def test_platform_prompt_without_plan_flag_has_no_catalog(
