@@ -193,6 +193,7 @@ def _seed_platform_product(db_session, slug="taskflow-os-subscription"):
     product = Product(
         slug=slug, name="Taskflow OS Subscription", max_price=100000, min_price=100000,
         quantity=999999, merchant_id=platform_owner.id, is_subscription=True,
+        is_platform_plan=True, monthly_reply_limit=2000,
     )
     db_session.add(product)
     db_session.commit()
@@ -203,7 +204,6 @@ def _seed_platform_product(db_session, slug="taskflow-os-subscription"):
 def test_callback_denies_ai_enabled_for_unsubscribed_merchant(client, db_session, auth_user, monkeypatch):
     user, _ = auth_user
     _seed_platform_product(db_session)
-    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", "taskflow-os-subscription")
     _mock_successful_exchange(ig_user_id="ig_user_1", username="shopowner")
 
     resp = client.get(
@@ -225,7 +225,6 @@ def test_callback_allows_ai_enabled_for_actively_subscribed_merchant(client, db_
     from app.db.models import Customer, Order, OrderStatus, PaymentType, ProductSubscription, ProductSubscriptionStatus
 
     user, _ = auth_user
-    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", "taskflow-os-subscription")
     product = _seed_platform_product(db_session)
 
     customer = Customer(phone_number=user.username)

@@ -81,6 +81,9 @@ class Settings(BaseSettings):
     # name-matching (e.g. account.name == "taskflow"): getting this wrong
     # would either lock out every merchant or gate nobody at all. Gating is
     # a no-op (nobody affected) while this is unset.
+    # Deprecated by #90 — plans are Product.is_platform_plan rows now, and
+    # nothing reads this at runtime. Kept because migration 7d2e9f1b4c08
+    # uses it to flag the pre-existing subscription product on deploy.
     PLATFORM_SUBSCRIPTION_PRODUCT_SLUG: Optional[str] = None
 
     # Shared platform-level access token used for numbers auto-assigned from

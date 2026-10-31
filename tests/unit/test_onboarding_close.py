@@ -11,7 +11,6 @@ import httpx
 import pytest
 import respx
 
-from app.core.config import settings
 from app.db.models import (
     ConversationContext,
     ConversationState,
@@ -118,17 +117,14 @@ def subscription_product(db_session, platform_owner):
         quantity=0,
         merchant_id=platform_owner.id,
         is_subscription=True,
+        is_platform_plan=True,
+        monthly_reply_limit=2000,
         description="Your 24/7 AI sales rep that closes.",
     )
     db_session.add(p)
     db_session.commit()
     db_session.refresh(p)
     return p
-
-
-@pytest.fixture
-def _platform_slug(monkeypatch):
-    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", PLATFORM_SLUG)
 
 
 def _mock_full_payment():
@@ -193,7 +189,7 @@ async def test_whatsapp_subscription_close_skips_stock(db_session, platform_acco
 
 @respx.mock
 async def test_instagram_subscription_close_provisions_user(
-    db_session, merchant, platform_owner, subscription_product, _platform_slug
+    db_session, merchant, platform_owner, subscription_product
 ):
     _mock_full_payment()
     ig_account = InstagramAccount(
@@ -265,7 +261,7 @@ async def test_instagram_ordinary_close_provisions_no_user(db_session, merchant)
 
 
 async def test_platform_prompt_shows_subscription_and_close_mechanics(
-    db_session, platform_account, subscription_product, _platform_slug
+    db_session, platform_account, subscription_product
 ):
     # A non-default price proves the prompt renders the product's price
     # rather than a hardcoded number.
@@ -298,15 +294,19 @@ async def test_platform_prompt_shows_subscription_and_close_mechanics(
     assert "No products currently available" not in instruction
     assert "CLOSING MECHANICS" in instruction
     assert "AGREEMENT_REACHED" in instruction
-    assert "150,000 TZS a month" in instruction
-    assert "price=150000" in instruction
+    assert "Max Price TZS 150,000" in instruction
+    assert "includes 2,000 Amara replies a month" in instruction
+    assert "price=<that plan's catalog Max Price>" in instruction
     assert "100,000" not in instruction
 
 
-async def test_platform_prompt_without_slug_has_no_catalog(
-    db_session, platform_account, subscription_product, monkeypatch
+async def test_platform_prompt_without_plan_flag_has_no_catalog(
+    db_session, platform_account, subscription_product
 ):
-    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", None)
+    # The product exists but isn't flagged as a plan — the pitch sees
+    # nothing, the same as the old unset-slug behavior.
+    subscription_product.is_platform_plan = False
+    db_session.commit()
     db_session.add(
         Message(
             to_phone="255722220003",

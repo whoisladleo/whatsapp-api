@@ -8,7 +8,6 @@ from app.core.config import settings
 from app.core.security import normalize_phone
 from app.db.models import Customer, Order, OrderStatus, PaymentType, Product, ProductSubscription, User
 from app.services import product_subscription
-from app.services.subscription_access import get_platform_subscription_product
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +18,15 @@ RESERVATION_WINDOW = timedelta(hours=48)
 
 
 class NoPlatformProductConfiguredError(Exception):
-    """PLATFORM_SUBSCRIPTION_PRODUCT_SLUG is unset or points at a missing Product."""
+    """No Product is flagged as a platform plan SKU."""
+
+
+class UnknownPlanError(Exception):
+    """The requested product_id isn't a platform plan SKU."""
+
+
+class PlanChoiceRequiredError(Exception):
+    """Several plans exist and the request didn't pick one."""
 
 
 class PhoneNumberRequiredError(Exception):
@@ -36,7 +43,9 @@ def get_my_subscription(db: Session, user: User) -> Optional[ProductSubscription
     return find_platform_subscription(db, user)
 
 
-async def pay_now(db: Session, user: User, phone_number: Optional[str]) -> dict:
+async def pay_now(
+    db: Session, user: User, phone_number: Optional[str], product_id=None
+) -> dict:
     """
     Dashboard-native "Pay Now" for Taskflow's own subscription — no AI
     negotiation needed since the price is fixed (product.max_price ==
@@ -48,11 +57,20 @@ async def pay_now(db: Session, user: User, phone_number: Optional[str]) -> dict:
     via the Tunzaa webhook's existing order-<id> COMPLETED handling
     (app/api/v1/tunzaa_webhook.py's _activate_subscription_if_linked).
     """
+    from app.services.subscription_access import get_platform_plans
     from app.services.tunzaa import tunzaa_service
 
-    product = get_platform_subscription_product(db)
-    if not product:
+    plans = get_platform_plans(db)
+    if not plans:
         raise NoPlatformProductConfiguredError()
+    if product_id is not None:
+        product = next((p for p in plans if str(p.id) == str(product_id)), None)
+        if not product:
+            raise UnknownPlanError()
+    elif len(plans) > 1:
+        raise PlanChoiceRequiredError()
+    else:
+        product = plans[0]
 
     phone = phone_number or user.phone_number or user.username
     if not phone:

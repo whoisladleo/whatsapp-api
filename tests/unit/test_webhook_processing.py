@@ -42,6 +42,77 @@ def test_process_inbound_message_missing_account():
 
 
 @respx.mock
+def test_quota_exhausted_sends_holding_without_llm(db_session, account, owner, monkeypatch):
+    """An over-limit plan gets the holding message: no model call, and the
+    holding send itself is never metered (#90)."""
+    from datetime import datetime, timedelta
+
+    import app.tasks.usage_alerts as usage_alerts
+    from app.db.models import (
+        AmaraEvent, AmaraEventKind, Customer, Order, OrderStatus, PaymentType,
+        Product, ProductSubscription, ProductSubscriptionStatus,
+    )
+    from app.services import usage
+
+    seller = User(username="255700000901")
+    db_session.add(seller)
+    db_session.commit()
+    db_session.refresh(seller)
+    plan = Product(
+        slug="plan-quota", name="Plan", max_price=100000, min_price=100000,
+        quantity=0, merchant_id=seller.id, is_subscription=True,
+        is_platform_plan=True, monthly_reply_limit=2,
+    )
+    customer = Customer(phone_number=owner.username)
+    db_session.add_all([plan, customer])
+    db_session.commit()
+    db_session.refresh(plan)
+    db_session.refresh(customer)
+    order = Order(
+        customer_id=customer.id, product_id=plan.id, quantity=1, agreed_price=100000,
+        payment_type=PaymentType.FULL, status=OrderStatus.PAID,
+    )
+    db_session.add(order)
+    db_session.commit()
+    db_session.refresh(order)
+    db_session.add(ProductSubscription(
+        order_id=order.id, customer_id=customer.id, product_id=plan.id,
+        status=ProductSubscriptionStatus.ACTIVE, monthly_amount=100000,
+        next_billing_at=datetime.utcnow() + timedelta(days=5),
+    ))
+    db_session.commit()
+    monkeypatch.setattr(usage_alerts.send_usage_warning, "apply_async", lambda args, **kw: None)
+    usage.record_reply(db_session, owner.id, "whatsapp")
+    usage.record_reply(db_session, owner.id, "whatsapp")
+
+    respx.post(url__regex=MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "wamid.quota1"}]})
+    )
+    llm_calls = []
+
+    async def fake_generate_response(**kwargs):
+        llm_calls.append(kwargs)
+        return "Hello!"
+
+    class FakeLLMService:
+        generate_response = staticmethod(fake_generate_response)
+
+    original = webhook_processing.llm_service
+    webhook_processing.llm_service = FakeLLMService()
+    try:
+        result = webhook_processing.process_inbound_message(account.id, "255711111111", "hi")
+    finally:
+        webhook_processing.llm_service = original
+
+    assert result == "Success"
+    assert llm_calls == []
+    outbound = db_session.query(Message).filter(Message.direction == "outbound").first()
+    assert outbound.body == usage.QUOTA_EXHAUSTED_HOLDING_MESSAGE
+    assert db_session.query(AmaraEvent).filter_by(kind=AmaraEventKind.REPLY).count() == 2
+    assert db_session.query(AmaraEvent).filter_by(kind=AmaraEventKind.LIMIT_BLOCKED).count() == 1
+
+
+@respx.mock
 def test_process_inbound_message_direct_call_runs_ai_path(db_session, account):
     respx.post(url__regex=MESSAGES_URL_RE).mock(
         return_value=httpx.Response(200, json={"messages": [{"id": "wamid.direct1"}]})

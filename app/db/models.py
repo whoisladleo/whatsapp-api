@@ -54,6 +54,7 @@ class AmaraEventKind(enum.Enum):
     HANDOFF = "HANDOFF"
     PAYMENT = "PAYMENT"
     USAGE_WARNING = "USAGE_WARNING"
+    LIMIT_BLOCKED = "LIMIT_BLOCKED"  # first Amara reply refused this period (#90)
 
 class SupportAccessKind(enum.Enum):
     START = "START"  # operator minted an impersonation token
@@ -414,6 +415,11 @@ class Product(Base):
     # tells _close_deal/_close_instagram_deal to also create the
     # ProductSubscription that drives billing from month 2 onward.
     is_subscription = Column(Boolean, default=False, nullable=False)
+    # A platform plan (Standard, Pro, …): one of the SKUs that gates Amara
+    # access and sets the monthly reply meter (#90). Admin-managed only —
+    # the flag and the limit are enforced in the product endpoints, not here.
+    is_platform_plan = Column(Boolean, default=False, nullable=False)
+    monthly_reply_limit = Column(Integer, nullable=True)
     # Whether Amara is allowed to offer installments for this product at
     # all — when False, she never brings it up, only full payment. Default
     # True preserves the pre-existing behavior (every product could always

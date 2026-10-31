@@ -1,10 +1,8 @@
-import logging
 from datetime import datetime, timedelta
 from typing import Optional
 
 from sqlalchemy.orm import Session
 
-from app.core.config import settings
 from app.core.security import normalize_phone
 from app.db.models import (
     Customer,
@@ -16,85 +14,69 @@ from app.db.models import (
     WhatsAppAccount,
 )
 
-logger = logging.getLogger(__name__)
-
 # See ProductSubscription.past_due_since — a subscription that's been
 # PAST_DUE this long (still short of the 10-retry/~15-day cancellation
 # point) already gets Amara paused, ahead of full cancellation.
 PAST_DUE_ACCESS_GRACE_DAYS = 7
 
 
-def get_platform_subscription_product(db: Session) -> Optional[Product]:
-    if not settings.PLATFORM_SUBSCRIPTION_PRODUCT_SLUG:
-        return None
+def get_platform_plans(db: Session) -> list[Product]:
+    """Every Product flagged as a platform plan SKU (#90), oldest first."""
     return (
         db.query(Product)
-        .filter(Product.slug == settings.PLATFORM_SUBSCRIPTION_PRODUCT_SLUG)
-        .first()
+        .filter(Product.is_platform_plan.is_(True))
+        .order_by(Product.created_at)
+        .all()
     )
 
 
-def find_platform_subscription(db: Session, user: User) -> Optional[ProductSubscription]:
-    product = get_platform_subscription_product(db)
-    if not product:
-        return None
+def get_platform_subscription_product(db: Session) -> Optional[Product]:
+    """First configured plan — compat default for single-plan flows."""
+    plans = get_platform_plans(db)
+    return plans[0] if plans else None
+
+
+def find_platform_subscriptions(db: Session, user: User) -> list[ProductSubscription]:
+    """Every platform-plan subscription for this merchant's paying identity,
+    across all plan SKUs, newest first."""
+    plans = get_platform_plans(db)
+    if not plans:
+        return []
 
     candidates = {
         p for p in (normalize_phone(user.username), normalize_phone(user.phone_number)) if p
     }
     if not candidates:
-        return None
+        return []
 
     customer = db.query(Customer).filter(Customer.phone_number.in_(candidates)).first()
     if not customer:
-        return None
+        return []
 
     return (
         db.query(ProductSubscription)
-        .filter(ProductSubscription.customer_id == customer.id, ProductSubscription.product_id == product.id)
+        .filter(
+            ProductSubscription.customer_id == customer.id,
+            ProductSubscription.product_id.in_([p.id for p in plans]),
+        )
         .order_by(ProductSubscription.created_at.desc())
-        .first()
+        .all()
     )
 
 
-def is_merchant_allowed_ai(db: Session, user: User) -> bool:
-    """
-    Whether this merchant's Amara should be active anywhere. Gating is a
-    no-op (everyone allowed) while PLATFORM_SUBSCRIPTION_PRODUCT_SLUG isn't
-    configured, or if that product can't be found (fail open — a
-    misconfigured slug shouldn't silently lock out every merchant). With it
-    configured: no subscription on file at all, a CANCELLED one, or a
-    first-payment PAYMENT_FAILED all deny access, the same as each other —
-    "never paid" and "stopped paying" are treated identically. A PAST_DUE
-    subscription still gets a grace period (see PAST_DUE_ACCESS_GRACE_DAYS)
-    before it denies too.
-    """
-    if not settings.PLATFORM_SUBSCRIPTION_PRODUCT_SLUG:
-        return True
+def find_platform_subscription(db: Session, user: User) -> Optional[ProductSubscription]:
+    """Newest platform-plan subscription — compat shim for single-sub flows."""
+    subs = find_platform_subscriptions(db, user)
+    return subs[0] if subs else None
 
-    product = get_platform_subscription_product(db)
-    if not product:
-        logger.error(
-            "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG is set but no matching Product "
-            "exists; failing open (not gating anyone) rather than locking out "
-            "every merchant over a config error."
-        )
-        return True
 
-    # The merchant who *sells* the platform subscription product can't also
-    # be gated by it — there's no one for Taskflow's own account(s) to
-    # subscribe to, and this is exactly the account that most needs to keep
-    # responding (it's the one pitching new merchants). Exempts every
-    # account this merchant owns, the same way llm.py's is_platform_account
-    # check exempts the WhatsApp "taskflow" account from being negotiated
-    # with as a customer.
-    if product.merchant_id == user.id:
-        return True
-
-    subscription = find_platform_subscription(db, user)
-    if not subscription:
-        return False
-
+def _subscription_allows(subscription: ProductSubscription) -> bool:
+    """One subscription's access verdict. CANCELLED or first-payment
+    PAYMENT_FAILED deny, the same as each other — "never paid" and
+    "stopped paying" are treated identically. A PAST_DUE subscription
+    still gets a grace period (see PAST_DUE_ACCESS_GRACE_DAYS) before it
+    denies too. ACTIVE, or PENDING_PAYMENT (first payment still in
+    flight), allow."""
     if subscription.status in (
         ProductSubscriptionStatus.CANCELLED,
         ProductSubscriptionStatus.PAYMENT_FAILED,
@@ -106,8 +88,57 @@ def is_merchant_allowed_ai(db: Session, user: User) -> bool:
             return True
         return (datetime.utcnow() - subscription.past_due_since) < timedelta(days=PAST_DUE_ACCESS_GRACE_DAYS)
 
-    # ACTIVE, or PENDING_PAYMENT (first payment still in flight) — allowed.
     return True
+
+
+def is_merchant_allowed_ai(db: Session, user: User) -> bool:
+    """
+    Whether this merchant's Amara should be active anywhere. Gating is a
+    no-op (everyone allowed) while no platform plan SKU exists — fail
+    open, the same as the old unset-slug behavior. With plans
+    configured: any one allowing subscription (across all plan SKUs)
+    grants access.
+    """
+    plans = get_platform_plans(db)
+    if not plans:
+        return True
+
+    # The merchant who *sells* a platform plan can't also be gated by it —
+    # there's no one for Taskflow's own account(s) to subscribe to, and
+    # this is exactly the account that most needs to keep responding
+    # (it's the one pitching new merchants). Exempts every account this
+    # merchant owns, the same way llm.py's is_platform_account check
+    # exempts the WhatsApp "taskflow" account from being negotiated with
+    # as a customer.
+    if any(plan.merchant_id == user.id for plan in plans):
+        return True
+
+    return any(
+        _subscription_allows(sub)
+        for sub in find_platform_subscriptions(db, user)
+    )
+
+
+def plan_reply_limit(db: Session, user: User) -> Optional[int]:
+    """
+    This merchant's monthly Amara-reply meter (#90): the highest
+    monthly_reply_limit across their access-granting plan subscriptions.
+    None means unlimited — no plans configured, seller-exempt, or at
+    least one granting plan with no limit set.
+    """
+    plans = get_platform_plans(db)
+    if not plans:
+        return None
+    if any(plan.merchant_id == user.id for plan in plans):
+        return None
+    limits = [
+        (sub.product.monthly_reply_limit if sub.product else None)
+        for sub in find_platform_subscriptions(db, user)
+        if _subscription_allows(sub)
+    ]
+    if not limits or any(limit is None for limit in limits):
+        return None
+    return max(limits)
 
 
 def sync_ai_access_for_merchant(db: Session, user: User) -> None:

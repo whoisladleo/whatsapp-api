@@ -391,14 +391,17 @@ PLATFORM_SLUG = "taskflow-os-subscription"
 def _seed_platform_product(db_session, slug=PLATFORM_SLUG, price=100000):
     from app.db.models import Product
 
-    platform_owner = User(username="255700000997")
-    db_session.add(platform_owner)
-    db_session.commit()
-    db_session.refresh(platform_owner)
+    platform_owner = db_session.query(User).filter(User.username == "255700000997").first()
+    if not platform_owner:
+        platform_owner = User(username="255700000997")
+        db_session.add(platform_owner)
+        db_session.commit()
+        db_session.refresh(platform_owner)
 
     product = Product(
         slug=slug, name="Taskflow OS Subscription", max_price=price, min_price=price,
         quantity=999999, merchant_id=platform_owner.id, is_subscription=True,
+        is_platform_plan=True, monthly_reply_limit=2000,
     )
     db_session.add(product)
     db_session.commit()
@@ -413,7 +416,6 @@ def test_get_my_subscription_requires_auth(client):
 
 
 def test_get_my_subscription_none_when_no_subscription(client, auth_user, db_session, monkeypatch):
-    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", PLATFORM_SLUG)
     _seed_platform_product(db_session)
     _, headers = auth_user
 
@@ -429,7 +431,6 @@ def test_get_my_subscription_none_when_no_subscription(client, auth_user, db_ses
 def test_get_my_subscription_returns_status_when_found(client, auth_user, db_session, monkeypatch):
     from app.db.models import Customer, Order, OrderStatus, PaymentType, ProductSubscription, ProductSubscriptionStatus
 
-    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", PLATFORM_SLUG)
     product = _seed_platform_product(db_session)
     user, headers = auth_user
 
@@ -471,7 +472,6 @@ def test_pay_now_requires_auth(client):
 
 
 def test_pay_now_503_when_not_configured(client, auth_user, monkeypatch):
-    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", None)
     _, headers = auth_user
 
     resp = client.post("/api/v1/auth/me/subscription/pay", json={}, headers=headers)
@@ -480,7 +480,6 @@ def test_pay_now_503_when_not_configured(client, auth_user, monkeypatch):
 
 
 def test_pay_now_400_when_no_phone_on_file_and_none_supplied(client, db_session, monkeypatch):
-    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", PLATFORM_SLUG)
     _seed_platform_product(db_session)
 
     fb_user = User(facebook_id="fb789")
@@ -496,7 +495,6 @@ def test_pay_now_400_when_no_phone_on_file_and_none_supplied(client, db_session,
 
 @respx.mock
 def test_pay_now_uses_existing_username_as_phone(client, auth_user, db_session, monkeypatch):
-    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", PLATFORM_SLUG)
     _seed_platform_product(db_session)
     user, headers = auth_user
 
@@ -517,7 +515,6 @@ def test_pay_now_uses_existing_username_as_phone(client, auth_user, db_session, 
 
 @respx.mock
 def test_pay_now_with_inline_phone_number_saves_it_to_user(client, auth_user, db_session, monkeypatch):
-    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", PLATFORM_SLUG)
     _seed_platform_product(db_session)
 
     fb_user = User(facebook_id="fb999")
@@ -543,7 +540,6 @@ def test_pay_now_with_inline_phone_number_saves_it_to_user(client, auth_user, db
 
 
 def test_pay_now_400_when_inline_phone_already_used_by_another_user(client, auth_user, db_session, monkeypatch):
-    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", PLATFORM_SLUG)
     _seed_platform_product(db_session)
     _, headers = auth_user
 
@@ -562,7 +558,6 @@ def test_pay_now_400_when_inline_phone_already_used_by_another_user(client, auth
 def test_pay_now_creates_order_and_pending_subscription(client, auth_user, db_session, monkeypatch):
     from app.db.models import Order, ProductSubscription, ProductSubscriptionStatus
 
-    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", PLATFORM_SLUG)
     _seed_platform_product(db_session)
     _, headers = auth_user
 
@@ -595,7 +590,6 @@ def test_pay_now_called_twice_reuses_pending_subscription_row(client, auth_user,
     """
     from app.db.models import Order, ProductSubscription
 
-    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", PLATFORM_SLUG)
     _seed_platform_product(db_session)
     _, headers = auth_user
 
@@ -625,7 +619,6 @@ def test_pay_now_called_twice_reuses_pending_subscription_row(client, auth_user,
 def test_pay_now_releases_reservation_on_dispatch_failure(client, auth_user, db_session, monkeypatch):
     from app.db.models import Order, OrderStatus
 
-    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", PLATFORM_SLUG)
     product = _seed_platform_product(db_session)
     quantity_before = product.quantity
     _, headers = auth_user
@@ -641,3 +634,77 @@ def test_pay_now_releases_reservation_on_dispatch_failure(client, auth_user, db_
 
     order = db_session.query(Order).filter(Order.product_id == product.id).first()
     assert order.status == OrderStatus.CANCELLED
+
+
+# --- plan choice (#90) ----------------------------------------------------------
+
+
+def test_pay_now_400_when_multiple_plans_and_no_choice(client, auth_user, db_session):
+    _seed_platform_product(db_session)
+    _seed_platform_product(db_session, slug="taskflow-os-pro", price=200000)
+    _, headers = auth_user
+
+    resp = client.post("/api/v1/auth/me/subscription/pay", json={}, headers=headers)
+
+    assert resp.status_code == 400
+    assert "plan" in resp.json()["detail"].lower()
+
+
+def test_pay_now_400_for_unknown_plan_id(client, auth_user, db_session):
+    _seed_platform_product(db_session)
+    _, headers = auth_user
+
+    resp = client.post(
+        "/api/v1/auth/me/subscription/pay",
+        json={"product_id": str(uuid.uuid4())},
+        headers=headers,
+    )
+
+    assert resp.status_code == 400
+
+
+def test_pay_now_400_when_product_id_is_not_a_plan(client, auth_user, db_session):
+    from app.db.models import Product
+
+    _seed_platform_product(db_session)
+    _, headers = auth_user
+    user, _ = auth_user
+    ordinary = Product(
+        slug="shoes", name="Shoes", max_price=50000, min_price=40000,
+        quantity=3, merchant_id=user.id,
+    )
+    db_session.add(ordinary)
+    db_session.commit()
+
+    resp = client.post(
+        "/api/v1/auth/me/subscription/pay",
+        json={"product_id": str(ordinary.id)},
+        headers=headers,
+    )
+
+    assert resp.status_code == 400
+
+
+@respx.mock
+def test_pay_now_with_product_id_charges_that_plan(client, auth_user, db_session):
+    from app.db.models import Order
+
+    _seed_platform_product(db_session)
+    pro = _seed_platform_product(db_session, slug="taskflow-os-pro", price=200000)
+    _, headers = auth_user
+
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "tok-1"}))
+    respx.post(PAYMENT_URL).mock(
+        return_value=httpx.Response(200, json={"statusCode": 202, "success": True, "transactionID": "MOCK_TXN_PAYNOW_PRO"})
+    )
+
+    resp = client.post(
+        "/api/v1/auth/me/subscription/pay",
+        json={"product_id": str(pro.id)},
+        headers=headers,
+    )
+
+    assert resp.status_code == 200
+    order = db_session.query(Order).filter(Order.id == uuid.UUID(resp.json()["order_id"])).one()
+    assert order.product_id == pro.id
+    assert order.agreed_price == 200000

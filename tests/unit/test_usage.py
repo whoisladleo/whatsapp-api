@@ -37,14 +37,14 @@ def merchant(db_session):
     return user
 
 
-def _platform_subscription(db_session, merchant, monkeypatch, status, next_billing_at):
-    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", "taskflow-os-subscription")
+def _platform_subscription(db_session, merchant, status, next_billing_at):
     taskflow = User(username="255700000001")
     db_session.add(taskflow)
     db_session.commit()
     product = Product(
         slug="taskflow-os-subscription", name="Taskflow OS Subscription", max_price=100000,
         min_price=100000, quantity=999, merchant_id=taskflow.id, is_subscription=True,
+        is_platform_plan=True, monthly_reply_limit=2000,
     )
     customer = Customer(phone_number=merchant.username)
     db_session.add_all([product, customer])
@@ -69,27 +69,27 @@ def test_period_without_subscription_is_calendar_month_in_eat(db_session, mercha
     assert end == datetime(2026, 11, 30, 21, 0)  # Dec 1 00:00 EAT
 
 
-def test_period_follows_active_platform_subscription(db_session, merchant, monkeypatch):
+def test_period_follows_active_platform_subscription(db_session, merchant):
     next_billing = datetime(2026, 11, 5, 9, 0)
-    _platform_subscription(db_session, merchant, monkeypatch, ProductSubscriptionStatus.ACTIVE, next_billing)
+    _platform_subscription(db_session, merchant, ProductSubscriptionStatus.ACTIVE, next_billing)
 
     start, end = usage.billing_period(db_session, merchant, now=datetime(2026, 10, 23))
 
     assert (start, end) == (next_billing - timedelta(days=30), next_billing)
 
 
-def test_past_due_period_rolls_forward_past_a_stale_billing_date(db_session, merchant, monkeypatch):
+def test_past_due_period_rolls_forward_past_a_stale_billing_date(db_session, merchant):
     stale = datetime(2026, 10, 1)
-    _platform_subscription(db_session, merchant, monkeypatch, ProductSubscriptionStatus.PAST_DUE, stale)
+    _platform_subscription(db_session, merchant, ProductSubscriptionStatus.PAST_DUE, stale)
 
     start, end = usage.billing_period(db_session, merchant, now=datetime(2026, 10, 23))
 
     assert (start, end) == (stale, stale + timedelta(days=30))
 
 
-def test_cancelled_subscription_falls_back_to_calendar_month(db_session, merchant, monkeypatch):
+def test_cancelled_subscription_falls_back_to_calendar_month(db_session, merchant):
     _platform_subscription(
-        db_session, merchant, monkeypatch, ProductSubscriptionStatus.CANCELLED, datetime(2026, 11, 5)
+        db_session, merchant, ProductSubscriptionStatus.CANCELLED, datetime(2026, 11, 5)
     )
 
     start, _ = usage.billing_period(db_session, merchant, now=datetime(2026, 10, 23))
@@ -180,3 +180,71 @@ def test_usage_warning_without_ops_phone_only_alerts_merchant(db_session, mercha
 
     assert route.call_count == 1  # a rejected send is logged, not raised
     assert result == "Sent to 1."
+
+
+# --- check_reply_quota (#90) -----------------------------------------------------
+
+
+def _meter(db_session, merchant, limit, used, monkeypatch):
+    """ACTIVE plan sub with `limit`, `used` REPLY rows, warning dispatch captured."""
+    _platform_subscription(
+        db_session, merchant, ProductSubscriptionStatus.ACTIVE, datetime.utcnow() + timedelta(days=5)
+    )
+    plan = db_session.query(Product).filter(Product.slug == "taskflow-os-subscription").one()
+    plan.monthly_reply_limit = limit
+    db_session.commit()
+    dispatched = []
+    monkeypatch.setattr(
+        usage_alerts.send_usage_warning, "apply_async", lambda args, **kw: dispatched.append(tuple(args))
+    )
+    for _ in range(used):
+        usage.record_reply(db_session, merchant.id, "whatsapp")
+    return dispatched
+
+
+def test_quota_allows_below_limit(db_session, merchant, monkeypatch):
+    _meter(db_session, merchant, 3, 2, monkeypatch)
+
+    assert usage.check_reply_quota(db_session, merchant) is None
+
+
+def test_quota_blocks_at_limit_and_records_once(db_session, merchant, monkeypatch):
+    dispatched = _meter(db_session, merchant, 3, 3, monkeypatch)
+
+    first = usage.check_reply_quota(db_session, merchant)
+    second = usage.check_reply_quota(db_session, merchant)
+
+    assert first == usage.QUOTA_EXHAUSTED_HOLDING_MESSAGE
+    assert second == usage.QUOTA_EXHAUSTED_HOLDING_MESSAGE
+    blocked = db_session.query(AmaraEvent).filter_by(kind=AmaraEventKind.LIMIT_BLOCKED).all()
+    assert len(blocked) == 1
+    # The 100% warning went out exactly once (during seeding, at the
+    # crossing) — the block itself doesn't re-dispatch it.
+    assert dispatched.count((str(merchant.id), 100)) == 1
+
+
+def test_quota_block_dispatches_warning_when_limit_lowered_mid_period(db_session, merchant, monkeypatch):
+    # 5 replies against a generous limit: no warning fired yet.
+    dispatched = _meter(db_session, merchant, 100, 5, monkeypatch)
+    assert dispatched == []
+    plan = db_session.query(Product).filter(Product.slug == "taskflow-os-subscription").one()
+    plan.monthly_reply_limit = 3
+    db_session.commit()
+
+    assert usage.check_reply_quota(db_session, merchant) == usage.QUOTA_EXHAUSTED_HOLDING_MESSAGE
+
+    assert dispatched == [(str(merchant.id), 100)]
+
+
+def test_quota_unlimited_for_plan_seller(db_session, merchant, monkeypatch):
+    _meter(db_session, merchant, 3, 10, monkeypatch)
+    seller = db_session.query(User).filter(User.username == "255700000001").one()
+
+    assert usage.check_reply_quota(db_session, seller) is None
+
+
+def test_quota_fails_open_on_ledger_error(db_session, merchant, monkeypatch):
+    _meter(db_session, merchant, 3, 3, monkeypatch)
+    monkeypatch.setattr(usage, "count_events", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("db down")))
+
+    assert usage.check_reply_quota(db_session, merchant) is None

@@ -11,7 +11,7 @@ from app.db.session import get_db
 from app.db.models import User
 from app.schemas.product import (
     ProductCreate, ProductUpdate, ProductStockUpdate, ProductResponse,
-    CatalogImportRequest,
+    CatalogImportRequest, ProductGenerateRequest,
 )
 from app.core.catalog_client import (
     IMPORT_MAX_ITEMS, MetaCatalogClient, catalog_item_to_product_data,
@@ -25,8 +25,25 @@ from app.crud.product import (
     import_catalog_products,
 )
 from app.api.deps import get_current_user
+from app.core.rate_limit import check_and_increment
+from app.services.product_generation import GenerationError, generate_drafts
+from app.services.support_access import is_support_operator
 
 router = APIRouter()
+
+# Platform plan SKUs (#90) are admin-managed: only a support operator's
+# identities may create, change, or delete them. Ordinary merchants see
+# the fields on responses but can never set them.
+_PLAN_FIELDS = {"is_platform_plan", "monthly_reply_limit"}
+
+
+def _require_plan_admin(db: Session, user: User, payload: dict) -> None:
+    if _PLAN_FIELDS & payload.keys() and not is_support_operator(db, user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only platform admins can manage plan products",
+        )
+
 
 @router.post("", response_model=ProductResponse, status_code=status.HTTP_201_CREATED)
 def create_new_product(
@@ -34,7 +51,34 @@ def create_new_product(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    _require_plan_admin(db, current_user, product_in.model_dump(exclude_unset=True))
     return create_product(db=db, product_in=product_in, merchant_id=current_user.id)
+
+@router.post("/generate", response_model=List[ProductResponse], status_code=status.HTTP_201_CREATED)
+async def generate_products_from_summary(
+    payload: ProductGenerateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    # 10 generations a day per merchant — each one is a paid model call
+    # plus up to 10 draft rows, so this is cost control, not punishment.
+    if not check_and_increment(f"product_generate:{current_user.id}", 10, 86400):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Daily AI generation limit reached. Try again tomorrow.",
+        )
+    try:
+        return await generate_drafts(db, current_user.id, payload.summary)
+    except RuntimeError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="AI generation isn't configured.",
+        )
+    except GenerationError:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="The AI returned nothing usable. Try rephrasing your summary.",
+        )
 
 @router.get("", response_model=List[ProductResponse])
 def read_products(
@@ -53,7 +97,8 @@ def update_existing_product(
     db_product = get_product_by_id(db=db, product_id=product_id, merchant_id=current_user.id)
     if not db_product:
         raise HTTPException(status_code=404, detail="Product not found")
-        
+
+    _require_plan_admin(db, current_user, product_in.model_dump(exclude_unset=True))
     return update_product(db=db, db_product=db_product, product_in=product_in)
 
 @router.patch("/{product_id}/stock", response_model=ProductResponse)
@@ -89,7 +134,12 @@ def delete_existing_product(
     db_product = get_product_by_id(db=db, product_id=product_id, merchant_id=current_user.id)
     if not db_product:
         raise HTTPException(status_code=404, detail="Product not found")
-        
+
+    if db_product.is_platform_plan and not is_support_operator(db, current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only platform admins can manage plan products",
+        )
     delete_product(db=db, db_product=db_product)
     return None
 

@@ -77,8 +77,7 @@ def test_upsert_creates_new_account(db_session, user):
     assert db_session.query(InstagramAccount).count() == 1
 
 
-def test_upsert_denies_ai_enabled_for_unsubscribed_merchant(db_session, user, monkeypatch):
-    from app.core.config import settings
+def test_upsert_denies_ai_enabled_for_unsubscribed_merchant(db_session, user):
     from app.db.models import Product
 
     platform_owner = User(username="255700000799")
@@ -89,10 +88,10 @@ def test_upsert_denies_ai_enabled_for_unsubscribed_merchant(db_session, user, mo
         Product(
             slug="taskflow-os-subscription", name="Taskflow OS Subscription", max_price=100000, min_price=100000,
             quantity=999999, merchant_id=platform_owner.id, is_subscription=True,
+            is_platform_plan=True, monthly_reply_limit=2000,
         )
     )
     db_session.commit()
-    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", "taskflow-os-subscription")
 
     account = crud_instagram.upsert_account(db_session, user.id, "ig_1", "tok_1", "shop_one")
 

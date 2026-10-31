@@ -17,6 +17,14 @@ logger = logging.getLogger(__name__)
 WARNING_THRESHOLDS_PERCENT = (80, 100)
 EAT_OFFSET = timedelta(hours=3)  # East Africa Time, no DST
 
+# Sent to the customer instead of an Amara reply once the merchant's
+# meter is exhausted (#90). Deliberately not metered itself — recording
+# it as a REPLY would inflate the count it's reporting.
+QUOTA_EXHAUSTED_HOLDING_MESSAGE = (
+    "This shop has used all of its Amara replies for this month, so I "
+    "can't respond right now — the owner has been notified."
+)
+
 
 def whatsapp_send_succeeded(resp) -> bool:
     return bool(resp) and "messages" in resp
@@ -77,15 +85,19 @@ def billing_period(db: Session, merchant: User, now: Optional[datetime] = None) 
     billed shops) on the calendar month in EAT.
     """
     from app.services.product_subscription import RENEWAL_PERIOD_DAYS
-    from app.services.subscription_access import find_platform_subscription
+    from app.services.subscription_access import find_platform_subscriptions
 
     now = now or datetime.utcnow()
-    subscription = find_platform_subscription(db, merchant)
-    if (
-        subscription
-        and subscription.next_billing_at
-        and subscription.status in (ProductSubscriptionStatus.ACTIVE, ProductSubscriptionStatus.PAST_DUE)
-    ):
+    # Oldest live plan anchors the meter — upgrading mid-period must not
+    # reset the window (find_platform_subscriptions returns newest first).
+    subscriptions = [
+        sub
+        for sub in reversed(find_platform_subscriptions(db, merchant))
+        if sub.next_billing_at
+        and sub.status in (ProductSubscriptionStatus.ACTIVE, ProductSubscriptionStatus.PAST_DUE)
+    ]
+    subscription = subscriptions[0] if subscriptions else None
+    if subscription:
         period = timedelta(days=RENEWAL_PERIOD_DAYS)
         end = subscription.next_billing_at
         # PAST_DUE leaves next_billing_at in the past until a retry succeeds;
@@ -113,29 +125,46 @@ def count_events(db: Session, merchant_id, kind: AmaraEventKind, start: datetime
     )
 
 
+def effective_reply_limit(db: Session, merchant: User) -> Optional[int]:
+    """This merchant's meter: their plan's limit, or the global default
+    while no plan SKUs exist yet. None means unlimited (seller-exempt,
+    or a plan with no limit set)."""
+    from app.services.subscription_access import get_platform_plans, plan_reply_limit
+
+    if not get_platform_plans(db):
+        return settings.PLAN_REPLY_LIMIT
+    return plan_reply_limit(db, merchant)
+
+
+def _event_fired_in_period(db: Session, merchant_id, kind: AmaraEventKind, detail: Optional[str], start: datetime, end: datetime) -> bool:
+    return (
+        db.query(AmaraEvent)
+        .filter(
+            AmaraEvent.merchant_id == merchant_id,
+            AmaraEvent.kind == kind,
+            AmaraEvent.detail == detail,
+            AmaraEvent.created_at >= start,
+            AmaraEvent.created_at < end,
+        )
+        .first()
+        is not None
+    )
+
+
 def _warn_if_threshold_crossed(db: Session, merchant_id) -> None:
     merchant = db.get(User, merchant_id)
     if not merchant:
         return
     start, end = billing_period(db, merchant)
     used = count_events(db, merchant_id, AmaraEventKind.REPLY, start, end)
-    limit = settings.PLAN_REPLY_LIMIT
+    limit = effective_reply_limit(db, merchant)
+    if not limit:
+        return
 
     for percent in WARNING_THRESHOLDS_PERCENT:
         if used * 100 < percent * limit:
             continue
-        already_warned = (
-            db.query(AmaraEvent)
-            .filter(
-                AmaraEvent.merchant_id == merchant_id,
-                AmaraEvent.kind == AmaraEventKind.USAGE_WARNING,
-                AmaraEvent.detail == str(percent),
-                AmaraEvent.created_at >= start,
-                AmaraEvent.created_at < end,
-            )
-            .first()
-        )
-        if already_warned:
+        if _event_fired_in_period(db, merchant_id, AmaraEventKind.USAGE_WARNING, str(percent), start, end):
             continue
         # shortcut: two replies landing at the same instant can both pass the
         # check above and send the alert twice; harmless (a duplicate alert),
@@ -147,3 +176,38 @@ def _warn_if_threshold_crossed(db: Session, merchant_id) -> None:
             send_usage_warning.apply_async(args=[str(merchant_id), percent])
         except Exception as e:
             logger.error(f"Failed to dispatch usage warning for merchant {merchant_id}: {e}")
+
+
+def check_reply_quota(db: Session, merchant: User) -> Optional[str]:
+    """
+    None if Amara may reply to this merchant's customer; otherwise the
+    holding message to send instead of generating a reply (#90). The
+    first refusal each period is recorded (LIMIT_BLOCKED, for audit and
+    the dashboard) and makes sure the merchant's 100% usage warning went
+    out — a limit lowered mid-period can strand usage above the cap with
+    no crossing ever firing to warn them.
+    """
+    try:
+        limit = effective_reply_limit(db, merchant)
+        if not limit:
+            return None
+        start, end = billing_period(db, merchant)
+        used = count_events(db, merchant.id, AmaraEventKind.REPLY, start, end)
+        if used < limit:
+            return None
+        if not _event_fired_in_period(db, merchant.id, AmaraEventKind.USAGE_WARNING, "100", start, end):
+            record_event(db, merchant.id, AmaraEventKind.USAGE_WARNING, detail="100")
+            from app.tasks.usage_alerts import send_usage_warning
+            try:
+                send_usage_warning.apply_async(args=[str(merchant.id), 100])
+            except Exception as e:
+                logger.error(f"Failed to dispatch usage warning for merchant {merchant.id}: {e}")
+        if not _event_fired_in_period(db, merchant.id, AmaraEventKind.LIMIT_BLOCKED, None, start, end):
+            record_event(db, merchant.id, AmaraEventKind.LIMIT_BLOCKED)
+        return QUOTA_EXHAUSTED_HOLDING_MESSAGE
+    except Exception:
+        # The ledger must never silence a merchant: any failure here fails
+        # open (reply as normal), logged loudly since it may be over-quota.
+        db.rollback()
+        logger.exception(f"Reply quota check failed for merchant {merchant.id}")
+        return None

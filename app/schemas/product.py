@@ -25,6 +25,11 @@ class ProductBase(BaseModel):
     # when this and is_subscription are both true (see InstallmentMode).
     allow_installments: bool = True
     installment_mode: InstallmentMode = InstallmentMode.BNPL
+    # Platform plan SKU (#90). CREATE/UPDATE payloads carrying either field
+    # are rejected for non-admins in the product endpoints; responses always
+    # carry both so owners can see their plan's meter.
+    is_platform_plan: bool = False
+    monthly_reply_limit: Optional[int] = None
 
 class ProductCreate(ProductBase):
     pass
@@ -46,6 +51,8 @@ class ProductUpdate(BaseModel):
     is_subscription: Optional[bool] = None
     allow_installments: Optional[bool] = None
     installment_mode: Optional[InstallmentMode] = None
+    is_platform_plan: Optional[bool] = None
+    monthly_reply_limit: Optional[int] = None
 
 class ProductStockUpdate(BaseModel):
     # Narrow PATCH body for PATCH /products/{id}/stock: only stock fields.
@@ -58,6 +65,13 @@ class CatalogImportRequest(BaseModel):
     # via Taskflow's system-user token once the merchant grants partner
     # access (see CATALOG_IMPORT_SETUP.md).
     catalog_id: str
+
+
+class ProductGenerateRequest(BaseModel):
+    # Free-text summary of what the merchant sells — the model turns it
+    # into draft rows (#90). Min length keeps one-word prompts (and their
+    # hallucinated catalogs) out; max bounds the model call.
+    summary: str = Field(min_length=10, max_length=2000)
 
 
 class ProductResponse(ProductBase):

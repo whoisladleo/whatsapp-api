@@ -407,3 +407,56 @@ def test_attachment_only_dm_reaches_llm_as_described_event(
         fake_llm_reply.called_with["message_body"]
         == "shared a post: https://ig.example/p/1"
     )
+
+
+def test_quota_exhausted_sends_holding_without_llm(
+    db_session, account, customer, inbound_dm, fake_llm_reply, monkeypatch
+):
+    """Same meter as WhatsApp: holding DM, no model call, nothing metered (#90)."""
+    from datetime import datetime, timedelta
+
+    import app.tasks.usage_alerts as usage_alerts
+    from app.db.models import (
+        AmaraEvent, AmaraEventKind, Customer, Order, OrderStatus, PaymentType,
+        Product, ProductSubscription, ProductSubscriptionStatus,
+    )
+    from app.services import usage
+
+    owner = db_session.query(User).filter(User.id == account.user_id).one()
+    seller = User(username="255700000901")
+    db_session.add(seller)
+    db_session.commit()
+    plan = Product(
+        slug="plan-quota", name="Plan", max_price=100000, min_price=100000,
+        quantity=0, merchant_id=seller.id, is_subscription=True,
+        is_platform_plan=True, monthly_reply_limit=2,
+    )
+    buyer = Customer(phone_number=owner.username)
+    db_session.add_all([plan, buyer])
+    db_session.commit()
+    order = Order(
+        customer_id=buyer.id, product_id=plan.id, quantity=1, agreed_price=100000,
+        payment_type=PaymentType.FULL, status=OrderStatus.PAID,
+    )
+    db_session.add(order)
+    db_session.commit()
+    db_session.add(ProductSubscription(
+        order_id=order.id, customer_id=buyer.id, product_id=plan.id,
+        status=ProductSubscriptionStatus.ACTIVE, monthly_amount=100000,
+        next_billing_at=datetime.utcnow() + timedelta(days=5),
+    ))
+    db_session.commit()
+    monkeypatch.setattr(usage_alerts.send_usage_warning, "apply_async", lambda args, **kw: None)
+    usage.record_reply(db_session, owner.id, "instagram_dm")
+    usage.record_reply(db_session, owner.id, "instagram_dm")
+
+    fake_provider = _FakeProvider("ig-tok")
+    monkeypatch.setattr(task_module, "InstagramProvider", lambda access_token: fake_provider)
+
+    result = task_module.process_inbound_dm(account.id, customer.id, inbound_dm.id)
+
+    assert result == "Processed."
+    assert fake_provider.calls == [("ig_biz_1", "igsid_1", usage.QUOTA_EXHAUSTED_HOLDING_MESSAGE)]
+    assert fake_llm_reply.called_with is None
+    assert db_session.query(AmaraEvent).filter_by(kind=AmaraEventKind.REPLY).count() == 2
+    assert db_session.query(AmaraEvent).filter_by(kind=AmaraEventKind.LIMIT_BLOCKED).count() == 1

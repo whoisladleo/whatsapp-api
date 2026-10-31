@@ -41,6 +41,11 @@ async def _process(db, account_id: str, comment_row_id: str) -> str:
         logger.warning("llm_service unavailable; skipping comment %s.", comment.comment_id)
         return "LLM unavailable."
 
+    if account.owner and usage.check_reply_quota(db, account.owner) is not None:
+        # Meter exhausted: stay silent rather than post a public holding
+        # message — the merchant already got their 100% warning.
+        return "Reply quota exhausted; staying silent."
+
     provider = InstagramProvider(account.access_token)
 
     # Best-effort parent-post fetch (B1): a failed lookup (deleted media,

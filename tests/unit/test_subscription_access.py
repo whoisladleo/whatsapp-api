@@ -2,7 +2,6 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from app.core.config import settings
 from app.db.models import (
     Customer,
     InstagramAccount,
@@ -20,11 +19,6 @@ from app.services import subscription_access
 PRODUCT_SLUG = "taskflow-os-subscription"
 
 
-@pytest.fixture(autouse=True)
-def _configure_platform_product(monkeypatch):
-    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", PRODUCT_SLUG)
-
-
 @pytest.fixture
 def platform_owner(db_session):
     """Taskflow itself — the merchant who owns the platform subscription product."""
@@ -40,6 +34,7 @@ def platform_product(db_session, platform_owner):
     p = Product(
         slug=PRODUCT_SLUG, name="Taskflow OS Subscription", max_price=100000, min_price=100000,
         quantity=999999, merchant_id=platform_owner.id, is_subscription=True,
+        is_platform_plan=True, monthly_reply_limit=2000,
     )
     db_session.add(p)
     db_session.commit()
@@ -90,14 +85,15 @@ def _make_subscription(db_session, platform_product, merchant_customer, **overri
 # --- is_merchant_allowed_ai ----------------------------------------------------
 
 
-def test_allowed_when_gating_not_configured(db_session, merchant, monkeypatch):
-    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", None)
-
+def test_allowed_when_no_plan_exists(db_session, merchant):
     assert subscription_access.is_merchant_allowed_ai(db_session, merchant) is True
 
 
-def test_allowed_fail_open_when_configured_product_missing(db_session, merchant, monkeypatch):
-    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", "does-not-exist")
+def test_allowed_when_no_product_flagged_as_plan(db_session, merchant, platform_product):
+    # A subscription-shaped product that isn't a plan SKU gates nobody —
+    # the flag, not the product's existence, switches gating on.
+    platform_product.is_platform_plan = False
+    db_session.commit()
 
     assert subscription_access.is_merchant_allowed_ai(db_session, merchant) is True
 
@@ -268,9 +264,7 @@ def test_sync_skips_disconnected_instagram_account(db_session, merchant, platfor
     assert instagram_account.access_token == ""
 
 
-def test_sync_is_a_no_op_without_gating_configured(db_session, merchant, whatsapp_account, monkeypatch):
-    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", None)
-
+def test_sync_is_a_no_op_without_any_plan(db_session, merchant, whatsapp_account):
     subscription_access.sync_ai_access_for_merchant(db_session, merchant)
 
     db_session.refresh(whatsapp_account)
@@ -306,3 +300,82 @@ def test_sync_enables_ai_for_platform_product_seller_with_no_subscription(
     db_session.refresh(instagram_account)
     assert whatsapp_account.ai_enabled is True
     assert instagram_account.ai_enabled is True
+
+
+# --- multiple plan SKUs (#90) --------------------------------------------------
+
+
+@pytest.fixture
+def pro_plan(db_session, platform_owner):
+    p = Product(
+        slug="taskflow-os-pro", name="Taskflow OS Pro", max_price=200000, min_price=200000,
+        quantity=999999, merchant_id=platform_owner.id, is_subscription=True,
+        is_platform_plan=True, monthly_reply_limit=10000,
+    )
+    db_session.add(p)
+    db_session.commit()
+    db_session.refresh(p)
+    return p
+
+
+def test_allowed_by_any_allowing_plan_subscription(db_session, merchant, merchant_customer, platform_product, pro_plan):
+    # Standard lapsed, Pro active — access holds via Pro.
+    _make_subscription(db_session, platform_product, merchant_customer, status=ProductSubscriptionStatus.CANCELLED)
+    _make_subscription(db_session, pro_plan, merchant_customer, status=ProductSubscriptionStatus.ACTIVE)
+
+    assert subscription_access.is_merchant_allowed_ai(db_session, merchant) is True
+
+
+def test_denied_when_every_plan_subscription_lapsed(db_session, merchant, merchant_customer, platform_product, pro_plan):
+    _make_subscription(db_session, platform_product, merchant_customer, status=ProductSubscriptionStatus.CANCELLED)
+    _make_subscription(db_session, pro_plan, merchant_customer, status=ProductSubscriptionStatus.PAYMENT_FAILED)
+
+    assert subscription_access.is_merchant_allowed_ai(db_session, merchant) is False
+
+
+def test_find_platform_subscriptions_spans_plans_newest_first(
+    db_session, merchant, merchant_customer, platform_product, pro_plan
+):
+    old = _make_subscription(db_session, platform_product, merchant_customer, status=ProductSubscriptionStatus.ACTIVE)
+    new = _make_subscription(db_session, pro_plan, merchant_customer, status=ProductSubscriptionStatus.ACTIVE)
+
+    subs = subscription_access.find_platform_subscriptions(db_session, merchant)
+
+    assert [s.id for s in subs] == [new.id, old.id]
+
+
+def test_plan_reply_limit_is_highest_granting_plan(db_session, merchant, merchant_customer, platform_product, pro_plan):
+    _make_subscription(db_session, platform_product, merchant_customer, status=ProductSubscriptionStatus.ACTIVE)
+    _make_subscription(db_session, pro_plan, merchant_customer, status=ProductSubscriptionStatus.ACTIVE)
+
+    assert subscription_access.plan_reply_limit(db_session, merchant) == 10000
+
+
+def test_plan_reply_limit_ignores_lapsed_subscriptions(db_session, merchant, merchant_customer, platform_product, pro_plan):
+    _make_subscription(db_session, platform_product, merchant_customer, status=ProductSubscriptionStatus.ACTIVE)
+    _make_subscription(db_session, pro_plan, merchant_customer, status=ProductSubscriptionStatus.CANCELLED)
+
+    assert subscription_access.plan_reply_limit(db_session, merchant) == 2000
+
+
+def test_plan_reply_limit_unlimited_when_a_granting_plan_has_no_limit(
+    db_session, merchant, merchant_customer, platform_product, pro_plan
+):
+    pro_plan.monthly_reply_limit = None
+    db_session.commit()
+    _make_subscription(db_session, platform_product, merchant_customer, status=ProductSubscriptionStatus.ACTIVE)
+    _make_subscription(db_session, pro_plan, merchant_customer, status=ProductSubscriptionStatus.ACTIVE)
+
+    assert subscription_access.plan_reply_limit(db_session, merchant) is None
+
+
+def test_plan_reply_limit_unlimited_without_any_plan(db_session, merchant):
+    assert subscription_access.plan_reply_limit(db_session, merchant) is None
+
+
+def test_plan_reply_limit_unlimited_for_seller_or_unsubscribed(db_session, merchant, platform_owner, platform_product):
+    # No subscription rows at all here — the seller is exempt, and an
+    # unsubscribed merchant is denied access outright, so neither gets a
+    # meter (None would also mean "unlimited" for the seller's Amara).
+    assert subscription_access.plan_reply_limit(db_session, merchant) is None
+    assert subscription_access.plan_reply_limit(db_session, platform_owner) is None

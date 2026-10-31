@@ -1082,19 +1082,12 @@ Match the customer's language (Swahili or English). Keep both lines to one sente
             db.commit()
             db.refresh(customer)
 
-        # An Instagram prospect buying the platform subscription becomes a
-        # merchant: without a User row, activation can't sync their AI
-        # access and they can't log into the dashboard (see
+        # An Instagram prospect buying a platform plan becomes a merchant:
+        # without a User row, activation can't sync their AI access and
+        # they can't log into the dashboard (see
         # _resolve_merchant_for_platform_subscription). Ordinary shoppers
-        # deliberately get no User — only this product confers it (#89).
-        from app.services.subscription_access import get_platform_subscription_product
-
-        platform_product = get_platform_subscription_product(db)
-        if (
-            platform_product is not None
-            and product.id == platform_product.id
-            and not db.query(User).filter(User.username == normalized_phone).first()
-        ):
+        # deliberately get no User — only a plan confers it (#89, #90).
+        if product.is_platform_plan and not db.query(User).filter(User.username == normalized_phone).first():
             db.add(User(username=normalized_phone))
             db.commit()
 
@@ -1174,7 +1167,14 @@ Match the customer's language (Swahili or English). Keep both lines to one sente
             for p in products:
                 installments_note = "" if p.allow_installments else " (full payment only — installments not offered)"
                 stock_note = " (OUT OF STOCK)" if _is_out_of_stock(p) else ""
-                catalog_str += f"- {p.name}: Max Price TZS {p.max_price:,.0f}, Lowest Price You May Offer TZS {_negotiation_floor(p):,.0f}, Stock: {p.quantity}{stock_note}{installments_note}\n"
+                plan_note = ""
+                if p.is_platform_plan:
+                    plan_note = (
+                        f", includes {p.monthly_reply_limit:,} Amara replies a month"
+                        if p.monthly_reply_limit is not None
+                        else ", includes unlimited Amara replies"
+                    )
+                catalog_str += f"- {p.name}: Max Price TZS {p.max_price:,.0f}, Lowest Price You May Offer TZS {_negotiation_floor(p):,.0f}, Stock: {p.quantity}{plan_note}{stock_note}{installments_note}\n"
                 if p.description:
                     catalog_str += f"  {p.description}\n"
 
@@ -1336,14 +1336,9 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
         # is the Taskflow subscription itself — without this Amara pitches
         # a product she can't see and can never close (#89).
         if is_platform_account:
-            from app.services.subscription_access import get_platform_subscription_product
+            from app.services.subscription_access import get_platform_plans
 
-            platform_product = get_platform_subscription_product(db)
-            products = (
-                [platform_product]
-                if platform_product is not None and not platform_product.is_draft
-                else []
-            )
+            products = [p for p in get_platform_plans(db) if not p.is_draft]
         else:
             products = (
                 db.query(Product)
@@ -1360,7 +1355,14 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
                 stock_display = (
                     "available now, billed monthly" if p.is_subscription else f"Stock: {p.quantity}"
                 )
-                catalog_str += f"- {p.name}: Max Price TZS {p.max_price:,.0f}, Lowest Price You May Offer TZS {_negotiation_floor(p):,.0f}, {stock_display}{stock_note}{installments_note}\n"
+                plan_note = ""
+                if p.is_platform_plan:
+                    plan_note = (
+                        f", includes {p.monthly_reply_limit:,} Amara replies a month"
+                        if p.monthly_reply_limit is not None
+                        else ", includes unlimited Amara replies"
+                    )
+                catalog_str += f"- {p.name}: Max Price TZS {p.max_price:,.0f}, Lowest Price You May Offer TZS {_negotiation_floor(p):,.0f}, {stock_display}{plan_note}{stock_note}{installments_note}\n"
                 if p.description:
                     catalog_str += f"  {p.description}\n"
 
@@ -1395,15 +1397,19 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
         # 4. Build system instruction
         
         if is_platform_account:
-            # The subscription price lives on the product, not in this
-            # prompt — it changes with plans (see #89). Falls back to the
-            # launch price only when no platform product is configured.
-            platform_price = int(products[0].max_price) if products else 100000
-            platform_price_display = f"{platform_price:,.0f} TZS a month"
+            # Every price and reply allowance below comes from the plan
+            # catalog above — nothing is hardcoded, so new SKUs (Standard,
+            # Pro, …) are pitched correctly the moment an admin adds them.
+            choice_note = (
+                "\nThere is more than one plan in the catalog — help them pick the right one (match the reply allowance to how busy their shop is) before closing."
+                if len(products) > 1
+                else ""
+            )
             base_instruction = f"""You are Amara, the 24/7 AI Sales Agent for Taskflow OS.
 Your goal is to onboard new merchants and explain the value of having an AI agent handle their WhatsApp sales.
 
 {catalog_str}
+{choice_note}
 """
             
             if is_first_message:
@@ -1455,17 +1461,17 @@ THE CLOSE, once they seem ready:
 "Want to try me on your shop and see what happens? I'll start with your last batch of messages so you can see exactly how I'd have handled them, before anything changes for your customers."
 
 CLOSING MECHANICS — how a yes becomes a subscription:
-- The price is fixed at exactly {platform_price_display} — never negotiate it, never state any other number.
+- Each plan's price is fixed at exactly its catalog Max Price — never negotiate it, never state any other number for that plan.
 - This is a subscription, not a physical good: never ask about pickup or delivery, and never offer installments — full payment only.
-- Once they explicitly agree to subscribe at {platform_price}, confirm it back naturally, then end your response with the exact marker [AGREEMENT_REACHED: product=<exact product name from the catalog above> price={platform_price} payment=full]. Only include this marker once the yes is explicit — never guess or assume it. Emitting it sends them the mobile-money payment request automatically.
+- Once they explicitly agree to subscribe to a specific plan at its catalog price, confirm it back naturally, then end your response with the exact marker [AGREEMENT_REACHED: product=<exact plan name from the catalog above> price=<that plan's catalog Max Price> payment=full]. Only include this marker once the yes is explicit — never guess or assume it. Emitting it sends them the mobile-money payment request automatically.
 
 OPERATIONAL RULES:
-1. Pricing: fixed and simple — state it plainly and confidently whenever directly asked, do not deflect to the dashboard for it: *{platform_price_display}*, one flat price, *no commission* on their sales. They pay it as a mobile-money payment request to their phone, not taken out of their sales. Their first month starts the day you go live on their shop, not the day they pay, and they get a full refund if they change their mind before then. Never say there's no upfront payment, never say the fee is deducted from sales, and never mention a commission.
+1. Pricing: fixed and simple — state the chosen plan's catalog price plainly and confidently whenever directly asked, do not deflect to the dashboard for it. One flat price per month, *no commission* on their sales. They pay it as a mobile-money payment request to their phone, not taken out of their sales. Their first month starts the day you go live on their shop, not the day they pay, and they get a full refund if they change their mind before then. Never say there's no upfront payment, never say the fee is deducted from sales, and never mention a commission.
 2. Onboarding & Setup: You CANNOT add products or register businesses via WhatsApp. If the user asks you to register their business, add a product, or set up their store, you MUST tell them that you cannot do this here and they MUST use the merchant dashboard: https://dashboard-taskflow.whoisladleo.dev/ . Do NOT pretend or hallucinate that you have added their products or business.
 3. How payment actually works — this is real and automatic, state it confidently, never say you have no payment process of your own: once a customer agrees to buy something, a payment request is sent automatically straight to their phone via mobile money for them to approve — no manual bank transfer, cash negotiation, or collection work for the shop owner. Installment plans (Lipa kwa Awamu) are also available if the shop wants to offer them. This is a fixed platform capability, the same for every shop, not something the shop configures.
 4. Delivery — this is genuinely NOT automatic, unlike payment: it depends entirely on how the shop already handles delivery. Only state a delivery cost, timeframe, or process the shop has actually told you; otherwise say it follows however the shop currently does it and you'll confirm the details.
 5. Human Handoff: If the customer is unreasonable, has complex technical questions, or explicitly asks for a human, you must include the exact phrase [HUMAN_HANDOFF] in your response.
-6. Currency: the {platform_price_display} above is Tanzanian Shillings, never any other currency. Never say "$", "USD", "dollars", or imply this price is in another currency, and never convert it.
+6. Currency: every catalog price above is Tanzanian Shillings, never any other currency. Never say "$", "USD", "dollars", or imply any price is in another currency, and never convert one.
 """
         else:
             base_instruction = f"""You are Amara, the 24/7 AI Sales Agent for {account.name}.

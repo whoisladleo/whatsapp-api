@@ -71,20 +71,15 @@ def _resolve_merchant_for_platform_subscription(db: Session, subscription: Produ
     """
     A ProductSubscription can belong to *any* merchant's subscription
     product — most only need the billing mechanics above. Access gating
-    (app/services/subscription_access.py) only applies to the one specific
-    product identified by settings.PLATFORM_SUBSCRIPTION_PRODUCT_SLUG (a
-    merchant paying *Taskflow* for the platform itself), so this resolves
-    "which Taskflow dashboard User does this subscription's paying customer
-    correspond to" — and returns None for every other merchant's
-    subscription products, which must never affect anyone's ai_enabled.
+    (app/services/subscription_access.py) only applies to platform plan
+    SKUs (Product.is_platform_plan — a merchant paying *Taskflow* for the
+    platform itself), so this resolves "which Taskflow dashboard User does
+    this subscription's paying customer correspond to" — and returns None
+    for every other merchant's subscription products, which must never
+    affect anyone's ai_enabled.
     """
-    from app.core.config import settings
-
-    if not settings.PLATFORM_SUBSCRIPTION_PRODUCT_SLUG:
-        return None
-
     product = subscription.product or db.query(Product).filter(Product.id == subscription.product_id).first()
-    if not product or product.slug != settings.PLATFORM_SUBSCRIPTION_PRODUCT_SLUG:
+    if not product or not product.is_platform_plan:
         return None
 
     customer = subscription.customer

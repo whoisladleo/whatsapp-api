@@ -36,13 +36,16 @@ def send_usage_warning(merchant_id: str, percent: int):
         if not merchant:
             return "Merchant not found."
 
+        from app.services.usage import effective_reply_limit
+
+        total = effective_reply_limit(db, merchant) or settings.PLAN_REPLY_LIMIT
         components = [
             {
                 "type": "body",
                 "parameters": [
                     {"type": "text", "parameter_name": "account", "text": _account_label(merchant)},
                     {"type": "text", "parameter_name": "percent", "text": f"{percent}%"},
-                    {"type": "text", "parameter_name": "total", "text": f"{settings.PLAN_REPLY_LIMIT:,}"},
+                    {"type": "text", "parameter_name": "total", "text": f"{total:,}"},
                 ],
             }
         ]

@@ -520,9 +520,15 @@ async def pay_now(
     app/services/self_service_billing.py.
     """
     try:
-        result = await self_service_billing.pay_now(db, current_user, payload.phone_number)
+        result = await self_service_billing.pay_now(
+            db, current_user, payload.phone_number, payload.product_id
+        )
     except self_service_billing.NoPlatformProductConfiguredError:
         raise HTTPException(status_code=503, detail="Subscription billing isn't configured yet.")
+    except self_service_billing.UnknownPlanError:
+        raise HTTPException(status_code=400, detail="That isn't a platform plan.")
+    except self_service_billing.PlanChoiceRequiredError:
+        raise HTTPException(status_code=400, detail="Choose a plan to pay for.")
     except self_service_billing.PhoneNumberRequiredError:
         raise HTTPException(status_code=400, detail="A phone number is required to pay.")
     except self_service_billing.PhoneNumberInUseError:

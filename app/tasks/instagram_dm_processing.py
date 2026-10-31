@@ -95,24 +95,33 @@ async def _process(
         # described event instead of seeing an empty message (#87).
         message_body = describe_attachments(latest.attachments)
 
-    try:
-        reply_text = await llm_service.generate_dm_response(
-            message_body=message_body or "",
-            db=db,
-            account=account,
-            customer=customer,
-            context=context,
-            conversation_history=history,
-            account_name=account.username or "the shop",
-            retry_on_outage=llm_attempt < len(LLM_RETRY_COUNTDOWNS_SECONDS),
-        )
-    except LLMUnavailable as e:
-        logger.warning("Claude unavailable for DM %s (attempt %s); retrying: %s", dm_row_uuid, llm_attempt, e)
-        process_inbound_dm.apply_async(
-            args=[account_id, customer_id, dm_row_id, llm_attempt + 1, now.isoformat()],
-            countdown=LLM_RETRY_COUNTDOWNS_SECONDS[llm_attempt],
-        )
-        return "Retrying: LLM unavailable."
+    # Reply meter (#90): an exhausted plan gets the holding message
+    # instead of a generated reply — and the holding message itself is
+    # never metered, so this path skips record_reply below.
+    quota_blocked = False
+    holding = usage.check_reply_quota(db, account.owner) if account.owner else None
+    if holding is not None:
+        reply_text = holding
+        quota_blocked = True
+    else:
+        try:
+            reply_text = await llm_service.generate_dm_response(
+                message_body=message_body or "",
+                db=db,
+                account=account,
+                customer=customer,
+                context=context,
+                conversation_history=history,
+                account_name=account.username or "the shop",
+                retry_on_outage=llm_attempt < len(LLM_RETRY_COUNTDOWNS_SECONDS),
+            )
+        except LLMUnavailable as e:
+            logger.warning("Claude unavailable for DM %s (attempt %s); retrying: %s", dm_row_uuid, llm_attempt, e)
+            process_inbound_dm.apply_async(
+                args=[account_id, customer_id, dm_row_id, llm_attempt + 1, now.isoformat()],
+                countdown=LLM_RETRY_COUNTDOWNS_SECONDS[llm_attempt],
+            )
+            return "Retrying: LLM unavailable."
     if not reply_text:
         logger.warning("No usable DM reply generated for customer %s.", customer.id)
         return "No reply generated."
@@ -138,6 +147,7 @@ async def _process(
         body=reply_text,
         ig_message_id=response.get("message_id"),
     )
-    usage.record_reply(db, account.user_id, "instagram_dm", instagram_account_id=account.id)
+    if not quota_blocked:
+        usage.record_reply(db, account.user_id, "instagram_dm", instagram_account_id=account.id)
 
     return "Processed."

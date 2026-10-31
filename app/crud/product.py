@@ -155,7 +155,7 @@ def bulk_upsert_products(db: Session, merchant_id: uuid.UUID, products_data: Lis
                 stats["duplicate_skus"].append(sku)
             if not dry_run:
                 for key, value in p_data.items():
-                    if hasattr(db_product, key) and key not in ['id', 'merchant_id', 'slug', 'created_at', 'is_draft']:
+                    if hasattr(db_product, key) and key not in ['id', 'merchant_id', 'slug', 'created_at', 'is_draft', 'is_platform_plan', 'monthly_reply_limit']:
                         setattr(db_product, key, value)
                 # A bulk row can only clear the flag via the completion rule,
                 # never set or clear it directly (see excluded keys above).
@@ -167,10 +167,13 @@ def bulk_upsert_products(db: Session, merchant_id: uuid.UUID, products_data: Lis
             if not dry_run:
                 name = p_data.get("name", "Unnamed")
                 slug = generate_slug(db, name)
+                # CSV rows can carry any column — plan fields are never
+                # writable in bulk (#90), not even for admins.
+                clean = {k: v for k, v in p_data.items() if k not in ('is_platform_plan', 'monthly_reply_limit')}
                 new_product = Product(
                     merchant_id=merchant_id,
                     slug=slug,
-                    **p_data
+                    **clean
                 )
                 db.add(new_product)
                 new_products.append(new_product)

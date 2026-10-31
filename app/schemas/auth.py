@@ -103,6 +103,9 @@ class PayNowRequest(BaseModel):
     # — entered inline in the dashboard's Pay Now flow rather than requiring
     # a separate trip to set it first.
     phone_number: Optional[str] = None
+    # Which plan SKU to pay for. Optional while exactly one plan exists;
+    # required once there are several to choose from (#90).
+    product_id: Optional[uuid.UUID] = None
 
 class PayNowResponse(BaseModel):
     order_id: uuid.UUID

@@ -182,6 +182,7 @@ def platform_product(db_session, platform_seller):
     p = Product(
         slug="sub-product", name="Taskflow OS Subscription", max_price=100000, min_price=100000,
         quantity=999999, merchant_id=platform_seller.id, is_subscription=True,
+        is_platform_plan=True, monthly_reply_limit=2000,
     )
     db_session.add(p)
     db_session.commit()
@@ -210,14 +211,11 @@ def self_paying_merchant_order(db_session, owner, account, platform_product):
 
 
 def test_grace_expired_disables_ai_when_still_past_due(
-    db_session, self_paying_merchant_order, account, monkeypatch
+    db_session, self_paying_merchant_order, account
 ):
     from datetime import datetime, timedelta
 
-    from app.core.config import settings
-
     order, customer = self_paying_merchant_order
-    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", "sub-product")
     account.ai_enabled = True
     db_session.commit()
 
@@ -238,12 +236,9 @@ def test_grace_expired_disables_ai_when_still_past_due(
 
 
 def test_grace_expired_no_op_if_already_recovered(
-    db_session, self_paying_merchant_order, account, monkeypatch
+    db_session, self_paying_merchant_order, account
 ):
-    from app.core.config import settings
-
     order, customer = self_paying_merchant_order
-    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", "sub-product")
     account.ai_enabled = True
     db_session.commit()
 

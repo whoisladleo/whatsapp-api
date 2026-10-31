@@ -455,10 +455,9 @@ def test_get_number_subscription_404_when_none(client, auth_user):
 
 
 def _seed_platform_product(db_session):
-    """The gating check fails open when no Product matches
-    PLATFORM_SUBSCRIPTION_PRODUCT_SLUG — these tests are about a merchant
-    with no *subscription*, not a missing product, so the product itself
-    must actually exist."""
+    """The gating check fails open when no Product is flagged as a plan —
+    these tests are about a merchant with no *subscription*, not missing
+    plans, so a flagged plan SKU must actually exist."""
     from app.db.models import Product
 
     platform_owner = User(username="255700000998")
@@ -469,6 +468,7 @@ def _seed_platform_product(db_session):
     product = Product(
         slug="taskflow-os-subscription", name="Taskflow OS Subscription", max_price=100000, min_price=100000,
         quantity=999999, merchant_id=platform_owner.id, is_subscription=True,
+        is_platform_plan=True, monthly_reply_limit=2000,
     )
     db_session.add(product)
     db_session.commit()
@@ -477,7 +477,6 @@ def _seed_platform_product(db_session):
 @respx.mock
 def test_create_account_denies_ai_enabled_for_unsubscribed_merchant(client, auth_user, db_session, monkeypatch):
     _seed_platform_product(db_session)
-    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", "taskflow-os-subscription")
     _, headers = auth_user
     respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
 
@@ -494,7 +493,6 @@ def test_update_account_denies_ai_enabled_for_unsubscribed_merchant(client, auth
     created = client.post(BASE, json=_account_payload(), headers=headers).json()
 
     _seed_platform_product(db_session)
-    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", "taskflow-os-subscription")
 
     resp = client.put(
         f"{BASE}/{created['id']}", json={"ai_enabled": True}, headers=headers
@@ -511,7 +509,6 @@ def test_create_account_allows_ai_enabled_for_actively_subscribed_merchant(
     from app.db.models import Customer, Order, OrderStatus, PaymentType, Product, ProductSubscription, ProductSubscriptionStatus
 
     user, headers = auth_user
-    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", "taskflow-os-subscription")
 
     platform_owner = User(username="255700000999")
     db_session.add(platform_owner)
@@ -521,6 +518,7 @@ def test_create_account_allows_ai_enabled_for_actively_subscribed_merchant(
     product = Product(
         slug="taskflow-os-subscription", name="Taskflow OS Subscription", max_price=100000, min_price=100000,
         quantity=999999, merchant_id=platform_owner.id, is_subscription=True,
+        is_platform_plan=True, monthly_reply_limit=2000,
     )
     db_session.add(product)
     db_session.commit()

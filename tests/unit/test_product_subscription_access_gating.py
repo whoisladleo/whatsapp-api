@@ -2,7 +2,6 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from app.core.config import settings
 from app.db.models import (
     Customer,
     InstagramAccount,
@@ -20,11 +19,6 @@ from app.services import product_subscription
 PRODUCT_SLUG = "taskflow-os-subscription"
 
 
-@pytest.fixture(autouse=True)
-def _configure_platform_product(monkeypatch):
-    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", PRODUCT_SLUG)
-
-
 @pytest.fixture
 def platform_owner(db_session):
     u = User(username="255700009100")
@@ -39,6 +33,7 @@ def platform_product(db_session, platform_owner):
     p = Product(
         slug=PRODUCT_SLUG, name="Taskflow OS Subscription", max_price=100000, min_price=100000,
         quantity=999999, merchant_id=platform_owner.id, is_subscription=True,
+        is_platform_plan=True, monthly_reply_limit=2000,
     )
     db_session.add(p)
     db_session.commit()

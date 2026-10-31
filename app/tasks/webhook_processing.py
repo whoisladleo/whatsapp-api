@@ -232,6 +232,7 @@ async def _process(
 
     response_text = None
     is_merchant = False
+    quota_blocked = False
 
     if interactive_id:
         # Handoff template button tap — lands on the platform number, where
@@ -260,35 +261,43 @@ async def _process(
         if is_merchant:
             response_text = await handle_merchant_message(db, account, message_body, from_phone)
         elif llm_service:
-            rate_limit_key = f"ai_reply:{account.id}:{normalize_phone(from_phone)}"
-            # An outage retry is the same message, already counted once.
-            if llm_attempt == 0 and not check_and_increment(
-                rate_limit_key, AI_REPLY_RATE_LIMIT, AI_REPLY_RATE_LIMIT_WINDOW_SECONDS
-            ):
-                logger.warning(
-                    f"AI reply rate limit exceeded for {from_phone} on account {account.id}; "
-                    "dropping this message without a reply."
-                )
-                return "Rate limited."
+            # Reply meter (#90): an exhausted plan gets the holding
+            # message instead of a generated reply — checked before the
+            # rate limiter so a blocked shop doesn't burn sender budget.
+            holding = usage.check_reply_quota(db, account.owner) if account.owner else None
+            if holding is not None:
+                response_text = holding
+                quota_blocked = True
+            else:
+                rate_limit_key = f"ai_reply:{account.id}:{normalize_phone(from_phone)}"
+                # An outage retry is the same message, already counted once.
+                if llm_attempt == 0 and not check_and_increment(
+                    rate_limit_key, AI_REPLY_RATE_LIMIT, AI_REPLY_RATE_LIMIT_WINDOW_SECONDS
+                ):
+                    logger.warning(
+                        f"AI reply rate limit exceeded for {from_phone} on account {account.id}; "
+                        "dropping this message without a reply."
+                    )
+                    return "Rate limited."
 
-            knowledge_content = None
-            if account.product_slug:
-                kb = crud_knowledge.get_knowledge_base_by_slug(
-                    db, account.product_slug, account.user_id
-                )
-                if kb:
-                    knowledge_content = kb.content
+                knowledge_content = None
+                if account.product_slug:
+                    kb = crud_knowledge.get_knowledge_base_by_slug(
+                        db, account.product_slug, account.user_id
+                    )
+                    if kb:
+                        knowledge_content = kb.content
 
-            response_text = await llm_service.generate_response(
-                message_body=message_body,
-                product_slug=account.product_slug,
-                knowledge_content=knowledge_content,
-                system_prompt=account.system_prompt,
-                from_phone=from_phone,
-                db=db,
-                account=account,
-                retry_on_outage=llm_attempt < len(LLM_RETRY_COUNTDOWNS_SECONDS),
-            )
+                response_text = await llm_service.generate_response(
+                    message_body=message_body,
+                    product_slug=account.product_slug,
+                    knowledge_content=knowledge_content,
+                    system_prompt=account.system_prompt,
+                    from_phone=from_phone,
+                    db=db,
+                    account=account,
+                    retry_on_outage=llm_attempt < len(LLM_RETRY_COUNTDOWNS_SECONDS),
+                )
 
     if response_text:
         provider = WhatsAppProvider(account.access_token, account.phone_number_id)
@@ -297,7 +306,7 @@ async def _process(
         if resp and "messages" in resp:
             msg_id = resp["messages"][0].get("id")
             status = "sent"
-            if not is_merchant:
+            if not is_merchant and not quota_blocked:
                 usage.record_reply(db, account.user_id, "whatsapp", account_id=account.id)
         else:
             msg_id = f"failed_{uuid.uuid4().hex[:8]}"

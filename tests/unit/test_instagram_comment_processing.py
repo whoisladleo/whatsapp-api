@@ -199,3 +199,56 @@ def test_both_comment_replies_metered_when_both_succeed(db_session, account, com
     task_module.process_inbound_comment(account.id, comment.id)
 
     assert db_session.query(AmaraEvent).filter_by(kind=AmaraEventKind.REPLY).count() == 2
+
+
+def test_quota_exhausted_stays_silent_on_comments(db_session, account, comment, fake_llm_reply, monkeypatch):
+    """No public holding message — an exhausted meter stays silent on
+    comments rather than advertising the limit. The merchant already got
+    their 100% warning (#90)."""
+    from datetime import datetime, timedelta
+
+    import app.tasks.usage_alerts as usage_alerts
+    from app.db.models import (
+        AmaraEvent, AmaraEventKind, Customer, Order, OrderStatus, PaymentType,
+        Product, ProductSubscription, ProductSubscriptionStatus,
+    )
+    from app.services import usage
+
+    owner = db_session.query(User).filter(User.id == account.user_id).one()
+    seller = User(username="255700000901")
+    db_session.add(seller)
+    db_session.commit()
+    plan = Product(
+        slug="plan-quota", name="Plan", max_price=100000, min_price=100000,
+        quantity=0, merchant_id=seller.id, is_subscription=True,
+        is_platform_plan=True, monthly_reply_limit=2,
+    )
+    buyer = Customer(phone_number=owner.username)
+    db_session.add_all([plan, buyer])
+    db_session.commit()
+    order = Order(
+        customer_id=buyer.id, product_id=plan.id, quantity=1, agreed_price=100000,
+        payment_type=PaymentType.FULL, status=OrderStatus.PAID,
+    )
+    db_session.add(order)
+    db_session.commit()
+    db_session.add(ProductSubscription(
+        order_id=order.id, customer_id=buyer.id, product_id=plan.id,
+        status=ProductSubscriptionStatus.ACTIVE, monthly_amount=100000,
+        next_billing_at=datetime.utcnow() + timedelta(days=5),
+    ))
+    db_session.commit()
+    monkeypatch.setattr(usage_alerts.send_usage_warning, "apply_async", lambda args, **kw: None)
+    usage.record_reply(db_session, owner.id, "whatsapp")
+    usage.record_reply(db_session, owner.id, "whatsapp")
+
+    fake_provider = _FakeProvider("ig-tok")
+    monkeypatch.setattr(task_module, "InstagramProvider", lambda access_token: fake_provider)
+
+    result = task_module.process_inbound_comment(account.id, comment.id)
+
+    assert result == "Reply quota exhausted; staying silent."
+    assert fake_provider.public_calls == []
+    assert fake_provider.private_calls == []
+    assert fake_llm_reply.called_with is None
+    assert db_session.query(AmaraEvent).filter_by(kind=AmaraEventKind.REPLY).count() == 2

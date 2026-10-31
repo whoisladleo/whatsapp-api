@@ -423,3 +423,191 @@ def test_patch_stock_nonexistent_id(client, auth_user):
     )
 
     assert resp.status_code == 404
+
+
+# --- platform plan SKUs are admin-managed (#90) ---------------------------------
+
+
+def _as_operator(monkeypatch):
+    from app.core.config import settings
+
+    # auth_user's username is 255700000001 — allow-listing it makes every
+    # request in the test operator-authorized.
+    monkeypatch.setattr(settings, "SUPPORT_OPERATOR_PHONES", "255700000001")
+
+
+def test_create_plan_product_denied_for_merchant(client, auth_user):
+    _, headers = auth_user
+
+    resp = client.post(
+        BASE, json=_product_payload(is_platform_plan=True, monthly_reply_limit=5000), headers=headers
+    )
+
+    assert resp.status_code == 403
+
+
+def test_create_limit_alone_denied_for_merchant(client, auth_user):
+    _, headers = auth_user
+
+    resp = client.post(BASE, json=_product_payload(monthly_reply_limit=5000), headers=headers)
+
+    assert resp.status_code == 403
+
+
+def test_create_plan_product_allowed_for_operator(client, auth_user, monkeypatch, db_session):
+    _as_operator(monkeypatch)
+    _, headers = auth_user
+
+    resp = client.post(
+        BASE, json=_product_payload(is_platform_plan=True, monthly_reply_limit=5000), headers=headers
+    )
+
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["is_platform_plan"] is True
+    assert body["monthly_reply_limit"] == 5000
+
+
+def test_update_adding_plan_flag_denied_for_merchant(client, auth_user):
+    _, headers = auth_user
+    created = client.post(BASE, json=_product_payload(), headers=headers).json()
+
+    resp = client.put(f"{BASE}/{created['id']}", json={"is_platform_plan": True}, headers=headers)
+
+    assert resp.status_code == 403
+
+
+def test_update_plan_limit_allowed_for_operator(client, auth_user, monkeypatch):
+    _as_operator(monkeypatch)
+    _, headers = auth_user
+    created = client.post(
+        BASE, json=_product_payload(is_platform_plan=True, monthly_reply_limit=1000), headers=headers
+    ).json()
+
+    resp = client.put(f"{BASE}/{created['id']}", json={"monthly_reply_limit": 9000}, headers=headers)
+
+    assert resp.status_code == 200
+    assert resp.json()["monthly_reply_limit"] == 9000
+
+
+def test_delete_plan_product_denied_for_merchant(client, auth_user, db_session):
+    user, headers = auth_user
+    plan = Product(
+        slug="plan-seeded", name="Seeded Plan", max_price=100000, min_price=100000,
+        quantity=0, merchant_id=user.id, is_subscription=True, is_platform_plan=True,
+    )
+    db_session.add(plan)
+    db_session.commit()
+
+    resp = client.delete(f"{BASE}/{plan.id}", headers=headers)
+
+    assert resp.status_code == 403
+
+
+def test_delete_plan_product_allowed_for_operator(client, auth_user, monkeypatch, db_session):
+    _as_operator(monkeypatch)
+    user, headers = auth_user
+    plan = Product(
+        slug="plan-seeded", name="Seeded Plan", max_price=100000, min_price=100000,
+        quantity=0, merchant_id=user.id, is_subscription=True, is_platform_plan=True,
+    )
+    db_session.add(plan)
+    db_session.commit()
+
+    resp = client.delete(f"{BASE}/{plan.id}", headers=headers)
+
+    assert resp.status_code == 204
+
+
+def test_bulk_upload_strips_plan_columns(client, auth_user, db_session):
+    _, headers = auth_user
+    csv_content = (
+        "name,max_price,min_price,quantity,sku,is_platform_plan,monthly_reply_limit\n"
+        "Shirt,20000,15000,3,SKU-1,true,5000\n"
+    )
+    files = {"file": ("products.csv", io.BytesIO(csv_content.encode()), "text/csv")}
+
+    resp = client.post(f"{BASE}/bulk/upload?confirm=true", files=files, headers=headers)
+
+    assert resp.status_code == 200
+    row = db_session.query(Product).filter(Product.sku == "SKU-1").one()
+    assert row.is_platform_plan is False
+    assert row.monthly_reply_limit is None
+
+
+# --- POST /generate (#90) ----------------------------------------------------------
+
+
+def _fake_llm(monkeypatch, reply):
+    class FakeProvider:
+        async def complete(self, **kwargs):
+            return reply
+
+    class FakeLLMService:
+        provider = FakeProvider()
+
+    monkeypatch.setattr("app.services.llm.llm_service", FakeLLMService())
+
+
+def test_generate_requires_auth(client):
+    resp = client.post(f"{BASE}/generate", json={"summary": "a long enough summary here"})
+
+    assert resp.status_code in (401, 403)
+
+
+def test_generate_rejects_short_summary(client, auth_user):
+    _, headers = auth_user
+
+    resp = client.post(f"{BASE}/generate", json={"summary": "shoes"}, headers=headers)
+
+    assert resp.status_code == 422
+
+
+def test_generate_returns_drafts(client, auth_user, monkeypatch, db_session):
+    _fake_llm(monkeypatch, '[{"name": "iPhone 12", "max_price": 850000, "min_price": 800000}]')
+    _, headers = auth_user
+
+    resp = client.post(
+        f"{BASE}/generate", json={"summary": "I sell used iPhones from 800k"}, headers=headers
+    )
+
+    assert resp.status_code == 201
+    body = resp.json()
+    assert len(body) == 1
+    assert body[0]["name"] == "iPhone 12"
+    assert body[0]["is_draft"] is True
+    row = db_session.query(Product).filter(Product.merchant_id == auth_user[0].id).one()
+    assert row.is_draft is True
+
+
+def test_generate_503_without_llm_client(client, auth_user, monkeypatch):
+    monkeypatch.setattr("app.services.llm.llm_service", None)
+    _, headers = auth_user
+
+    resp = client.post(
+        f"{BASE}/generate", json={"summary": "I sell used iPhones from 800k"}, headers=headers
+    )
+
+    assert resp.status_code == 503
+
+
+def test_generate_502_on_unusable_reply(client, auth_user, monkeypatch):
+    _fake_llm(monkeypatch, "sorry, I cannot help with that")
+    _, headers = auth_user
+
+    resp = client.post(
+        f"{BASE}/generate", json={"summary": "I sell used iPhones from 800k"}, headers=headers
+    )
+
+    assert resp.status_code == 502
+
+
+def test_generate_429_when_daily_limit_hit(client, auth_user, monkeypatch):
+    monkeypatch.setattr("app.api.v1.products.check_and_increment", lambda *a, **kw: False)
+    _, headers = auth_user
+
+    resp = client.post(
+        f"{BASE}/generate", json={"summary": "I sell used iPhones from 800k"}, headers=headers
+    )
+
+    assert resp.status_code == 429

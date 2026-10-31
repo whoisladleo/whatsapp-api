@@ -476,6 +476,7 @@ def _seed_platform_product(db_session, slug="taskflow-sub"):
     p = Product(
         slug=slug, name="Taskflow OS Subscription", max_price=100000, min_price=100000,
         quantity=999, merchant_id=owner.id, is_subscription=True,
+        is_platform_plan=True, monthly_reply_limit=2000,
     )
     db_session.add(p)
     db_session.commit()
@@ -486,7 +487,6 @@ def _seed_platform_product(db_session, slug="taskflow-sub"):
 async def test_pay_now_dispatches_upsert(db_session, catalog_creds, dispatched, monkeypatch):
     from app.services import self_service_billing
 
-    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", "taskflow-sub")
     platform_product = _seed_platform_product(db_session)
     user = User(username="255744444444")
     db_session.add(user)
@@ -508,7 +508,6 @@ async def test_pay_now_dispatches_upsert(db_session, catalog_creds, dispatched, 
 async def test_pay_now_release_on_failure_dispatches_again(db_session, catalog_creds, dispatched, monkeypatch):
     from app.services import self_service_billing
 
-    monkeypatch.setattr(settings, "PLATFORM_SUBSCRIPTION_PRODUCT_SLUG", "taskflow-sub")
     platform_product = _seed_platform_product(db_session)
     user = User(username="255755555555")
     db_session.add(user)
