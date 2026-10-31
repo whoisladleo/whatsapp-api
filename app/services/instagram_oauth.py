@@ -10,16 +10,35 @@ class InstagramOAuthError(Exception):
     """Raised when a step of the Business Login for Instagram exchange fails."""
 
 
+# Channel-connect scopes: same approved-only pair as LOGIN_SCOPES.
+# manage_comments was stripped (#79) — Meta denied it, and requesting an
+# unapproved scope fails the whole authorize for live merchants. Re-add it
+# here (only) if Meta ever approves it.
+CONNECT_SCOPES = "instagram_business_basic,instagram_business_manage_messages"
+
+
+def _require_oauth_config(redirect_uri: str | None, setting_name: str) -> str:
+    """
+    Fails fast with a named setting instead of sending Meta a literal
+    "None" client_id/redirect_uri and surfacing its cryptic
+    Invalid redirect_uri error (#84 — observed live).
+    """
+    if not settings.INSTAGRAM_APP_ID:
+        raise InstagramOAuthError("INSTAGRAM_APP_ID is not configured.")
+    if not redirect_uri:
+        raise InstagramOAuthError(f"{setting_name} is not configured.")
+    return redirect_uri
+
+
 def build_authorize_url(state: str) -> str:
+    redirect_uri = _require_oauth_config(
+        settings.INSTAGRAM_REDIRECT_URI, "INSTAGRAM_REDIRECT_URI"
+    )
     params = {
         "client_id": settings.INSTAGRAM_APP_ID,
-        "redirect_uri": settings.INSTAGRAM_REDIRECT_URI,
+        "redirect_uri": redirect_uri,
         "response_type": "code",
-        "scope": (
-            "instagram_business_basic,"
-            "instagram_business_manage_comments,"
-            "instagram_business_manage_messages"
-        ),
+        "scope": CONNECT_SCOPES,
         "state": state,
     }
     return f"{settings.INSTAGRAM_OAUTH_AUTHORIZE_URL}?{urlencode(params)}"
@@ -37,9 +56,12 @@ LOGIN_SCOPES = "instagram_business_basic,instagram_business_manage_messages"
 def build_login_authorize_url(state: str) -> str:
     """Authorize URL for Instagram Login (/auth/instagram/start) — same app
     as the channel-connect flow, but its own redirect URI and scopes."""
+    redirect_uri = _require_oauth_config(
+        settings.INSTAGRAM_LOGIN_REDIRECT_URI, "INSTAGRAM_LOGIN_REDIRECT_URI"
+    )
     params = {
         "client_id": settings.INSTAGRAM_APP_ID,
-        "redirect_uri": settings.INSTAGRAM_LOGIN_REDIRECT_URI,
+        "redirect_uri": redirect_uri,
         "response_type": "code",
         "scope": LOGIN_SCOPES,
         "state": state,
@@ -83,6 +105,23 @@ async def exchange_for_long_lived_token(short_lived_token: str) -> str:
     token = data.get("access_token")
     if not token:
         raise InstagramOAuthError(f"Long-lived token exchange failed: {data}")
+    return token
+
+
+async def refresh_long_lived_token(access_token: str) -> str:
+    """Refreshes a long-lived token before its ~60-day expiry (#80)."""
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"{settings.INSTAGRAM_GRAPH_BASE_URL}/refresh_access_token",
+            params={
+                "grant_type": "ig_refresh_token",
+                "access_token": access_token,
+            },
+        )
+    data = response.json()
+    token = data.get("access_token")
+    if not token:
+        raise InstagramOAuthError(f"Token refresh failed: {data}")
     return token
 
 

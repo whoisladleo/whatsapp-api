@@ -107,6 +107,11 @@ async def request_otp(
     db: Session = Depends(get_db)
 ):
     phone_number = normalize_phone(otp_data.username.strip())
+    if not phone_number:
+        # Blank or non-numeric input normalizes to "" — reject before the
+        # lookup, or every garbage request shares one User(username="")
+        # junk row (#83).
+        raise HTTPException(status_code=422, detail="Phone number is required")
 
     if not check_and_increment(f"otp_req:{phone_number}", limit=3, window_seconds=300):
         raise HTTPException(
@@ -215,7 +220,11 @@ async def start_instagram_login(request: Request):
         settings.SECRET_KEY,
         algorithm=settings.ALGORITHM,
     )
-    return {"authorize_url": instagram_oauth.build_login_authorize_url(state)}
+    try:
+        authorize_url = instagram_oauth.build_login_authorize_url(state)
+    except instagram_oauth.InstagramOAuthError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"authorize_url": authorize_url}
 
 
 @router.get("/instagram/callback")

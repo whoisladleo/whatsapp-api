@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+from datetime import datetime, timedelta
 
 import httpx
 import pytest
@@ -71,6 +72,22 @@ def merchant_owner(db_session):
     db_session.commit()
     db_session.refresh(owner)
     return owner
+
+
+@pytest.fixture(autouse=True)
+def _no_eager_token_refresh(monkeypatch):
+    """
+    Fixture accounts have no token_refreshed_at (stale by definition), so
+    without this every webhook post would run the refresh task inline in
+    eager mode and attempt real HTTP. Neutralize it file-wide; the two
+    trigger tests below override with their own recorder.
+    """
+    import app.tasks.instagram_token_refresh as refresh_module
+
+    monkeypatch.setattr(
+        refresh_module.refresh_account_token, "apply_async",
+        lambda args=None, **kw: None,
+    )
 
 
 # --- GET /webhook verify-token handshake ------------------------------------
@@ -195,6 +212,55 @@ def test_known_account_ai_enabled_stores_comment_and_dispatches_task(
     assert calls[0] == [str(account.id), str(comment.id)]
 
 
+def test_comment_dispatch_failure_rolls_back_and_retry_replays(
+    client, db_session, merchant_owner
+):
+    account = InstagramAccount(
+        ig_business_id="ig_business_rb",
+        access_token="ig-tok",
+        ai_enabled=True,
+        user_id=merchant_owner.id,
+    )
+    db_session.add(account)
+    db_session.commit()
+    db_session.refresh(account)
+
+    import app.tasks.instagram_comment_processing as task_module
+
+    calls = []
+    original = task_module.process_inbound_comment.apply_async
+
+    def flaky(args=None, **kw):
+        if not calls:
+            calls.append("boom")
+            raise RuntimeError("broker down")
+        calls.append(args)
+
+    task_module.process_inbound_comment.apply_async = flaky
+    try:
+        payload = _comment_payload("ig_business_rb", "comment_rb")
+        with pytest.raises(RuntimeError, match="broker down"):
+            client.post(WEBHOOK_URL, json=payload)
+        assert (
+            db_session.query(InstagramComment)
+            .filter(InstagramComment.comment_id == "comment_rb")
+            .count()
+            == 0
+        )
+        resp = client.post(WEBHOOK_URL, json=payload)
+    finally:
+        task_module.process_inbound_comment.apply_async = original
+
+    assert resp.status_code == 200
+    comment = (
+        db_session.query(InstagramComment)
+        .filter(InstagramComment.comment_id == "comment_rb")
+        .first()
+    )
+    assert comment is not None
+    assert calls[1] == [str(account.id), str(comment.id)]
+
+
 def test_known_account_ai_disabled_stores_comment_without_dispatch(
     client, db_session, merchant_owner
 ):
@@ -316,6 +382,59 @@ def test_known_account_ai_enabled_stores_dm_and_dispatches_task(
 
     assert len(calls) == 1
     assert calls[0] == [str(account.id), str(customer.id), str(dm.id)]
+
+
+def test_dm_dispatch_failure_rolls_back_and_retry_replays(
+    client, db_session, merchant_owner, monkeypatch
+):
+    account = InstagramAccount(
+        ig_business_id="ig_business_dm_rb",
+        access_token="ig-tok",
+        ai_enabled=True,
+        user_id=merchant_owner.id,
+    )
+    db_session.add(account)
+    db_session.commit()
+    db_session.refresh(account)
+
+    import app.api.v1.instagram as instagram_router
+    monkeypatch.setattr(instagram_router, "_fetch_instagram_display_name", _no_display_name)
+
+    import app.tasks.instagram_dm_processing as task_module
+
+    calls = []
+    original = task_module.process_inbound_dm.apply_async
+
+    def flaky(args=None, **kw):
+        if not calls:
+            calls.append("boom")
+            raise RuntimeError("broker down")
+        calls.append(args)
+
+    task_module.process_inbound_dm.apply_async = flaky
+    try:
+        payload = _dm_payload("ig_business_dm_rb", "mid_rb")
+        with pytest.raises(RuntimeError, match="broker down"):
+            client.post(WEBHOOK_URL, json=payload)
+        assert (
+            db_session.query(InstagramDirectMessage)
+            .filter(InstagramDirectMessage.ig_message_id == "mid_rb")
+            .count()
+            == 0
+        )
+        resp = client.post(WEBHOOK_URL, json=payload)
+    finally:
+        task_module.process_inbound_dm.apply_async = original
+
+    assert resp.status_code == 200
+    dm = (
+        db_session.query(InstagramDirectMessage)
+        .filter(InstagramDirectMessage.ig_message_id == "mid_rb")
+        .first()
+    )
+    assert dm is not None
+    assert calls[1][0] == str(account.id)
+    assert calls[1][2] == str(dm.id)
 
 
 def test_known_account_ai_disabled_stores_dm_without_dispatch(
@@ -453,3 +572,113 @@ def test_display_name_lookup_failure_does_not_block_dm_processing(client, db_ses
     ).first()
     assert customer is not None
     assert customer.username is None
+
+
+# --- lazy token refresh dispatch (#80) ----------------------------------------
+
+
+def _stale_and_fresh_accounts(db_session, merchant_owner, prefix):
+    stale = InstagramAccount(
+        ig_business_id=f"{prefix}_stale",
+        access_token="ig-tok",
+        ai_enabled=True,
+        user_id=merchant_owner.id,
+        token_refreshed_at=datetime.utcnow() - timedelta(days=51),
+    )
+    fresh = InstagramAccount(
+        ig_business_id=f"{prefix}_fresh",
+        access_token="ig-tok",
+        ai_enabled=True,
+        user_id=merchant_owner.id,
+        token_refreshed_at=datetime.utcnow(),
+    )
+    db_session.add(stale)
+    db_session.add(fresh)
+    db_session.commit()
+    db_session.refresh(stale)
+    db_session.refresh(fresh)
+    return stale, fresh
+
+
+def test_comment_inbound_dispatches_refresh_only_when_stale(
+    client, db_session, merchant_owner
+):
+    stale, fresh = _stale_and_fresh_accounts(db_session, merchant_owner, "ig_trig_c")
+    null_stamp = InstagramAccount(
+        ig_business_id="ig_trig_c_null",
+        access_token="ig-tok",
+        ai_enabled=True,
+        user_id=merchant_owner.id,
+        token_refreshed_at=None,
+    )
+    db_session.add(null_stamp)
+    db_session.commit()
+    db_session.refresh(null_stamp)
+
+    import app.tasks.instagram_comment_processing as task_module
+    import app.tasks.instagram_token_refresh as refresh_module
+
+    refresh_calls = []
+    orig_refresh = refresh_module.refresh_account_token.apply_async
+    refresh_module.refresh_account_token.apply_async = (
+        lambda args=None, **kw: refresh_calls.append(args)
+    )
+    orig_task = task_module.process_inbound_comment.apply_async
+    task_module.process_inbound_comment.apply_async = lambda args=None, **kw: None
+    try:
+        assert client.post(
+            WEBHOOK_URL, json=_comment_payload("ig_trig_c_stale", "c_trig_1")
+        ).status_code == 200
+        assert client.post(
+            WEBHOOK_URL, json=_comment_payload("ig_trig_c_fresh", "c_trig_2")
+        ).status_code == 200
+        assert client.post(
+            WEBHOOK_URL, json=_comment_payload("ig_trig_c_null", "c_trig_3")
+        ).status_code == 200
+    finally:
+        refresh_module.refresh_account_token.apply_async = orig_refresh
+        task_module.process_inbound_comment.apply_async = orig_task
+
+    assert refresh_calls == [[str(stale.id)], [str(null_stamp.id)]]
+
+
+def test_dm_inbound_dispatches_refresh_only_when_stale(
+    client, db_session, merchant_owner, monkeypatch
+):
+    stale, fresh = _stale_and_fresh_accounts(db_session, merchant_owner, "ig_trig_d")
+
+    import app.api.v1.instagram as instagram_router
+    monkeypatch.setattr(instagram_router, "_fetch_instagram_display_name", _no_display_name)
+
+    import app.tasks.instagram_dm_processing as task_module
+    import app.tasks.instagram_token_refresh as refresh_module
+
+    refresh_calls = []
+    orig_refresh = refresh_module.refresh_account_token.apply_async
+    refresh_module.refresh_account_token.apply_async = (
+        lambda args=None, **kw: refresh_calls.append(args)
+    )
+    orig_task = task_module.process_inbound_dm.apply_async
+    task_module.process_inbound_dm.apply_async = lambda args=None, **kw: None
+    try:
+        assert client.post(
+            WEBHOOK_URL, json=_dm_payload("ig_trig_d_stale", "mid_trig_1")
+        ).status_code == 200
+        assert client.post(
+            WEBHOOK_URL, json=_dm_payload("ig_trig_d_fresh", "mid_trig_2")
+        ).status_code == 200
+    finally:
+        refresh_module.refresh_account_token.apply_async = orig_refresh
+        task_module.process_inbound_dm.apply_async = orig_task
+
+    assert refresh_calls == [[str(stale.id)]]
+
+
+def test_unsigned_webhook_rejected_when_secret_unset_and_flag_off(client, monkeypatch):
+    monkeypatch.setattr(settings, "INSTAGRAM_APP_SECRET", None)
+    monkeypatch.setattr(settings, "ALLOW_UNSIGNED_WEBHOOKS", False)
+
+    resp = client.post(WEBHOOK_URL, json=_comment_payload("ig_x", "c_x"))
+
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "Webhook signature verification is not configured"

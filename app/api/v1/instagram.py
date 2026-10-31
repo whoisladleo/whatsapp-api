@@ -14,7 +14,7 @@ from app.core.instagram_provider import InstagramProvider
 from app.core.instagram_webhook_parser import InstagramWebhookParser
 from app.core.security import verify_meta_signature
 from app.crud import instagram as crud_instagram
-from app.db.models import InstagramAccount, User
+from app.db.models import InstagramAccount, InstagramComment, InstagramDirectMessage, User
 from app.db.session import get_db
 from app.schemas.instagram import (
     InstagramAccountRead,
@@ -26,6 +26,8 @@ from app.schemas.instagram import (
 from app.services import instagram_oauth
 from app.tasks.instagram_comment_processing import process_inbound_comment
 from app.tasks.instagram_dm_processing import process_inbound_dm
+from app.tasks.instagram_token_refresh import refresh_account_token
+from app.tasks.webhook_processing import apply_async_or_rollback
 
 router = APIRouter()
 
@@ -89,6 +91,20 @@ async def verify_webhook(
     raise HTTPException(status_code=403, detail="Verification failed")
 
 
+def _dispatch_token_refresh_if_stale(account: InstagramAccount) -> None:
+    """
+    Best-effort lazy token refresh (#80). Refresh is auxiliary — its
+    failure (or the broker's) must never break the message path, so this
+    never raises.
+    """
+    if not crud_instagram.token_needs_refresh(account):
+        return
+    try:
+        refresh_account_token.apply_async(args=[str(account.id)])
+    except Exception as e:
+        print(f"Failed to dispatch token refresh for account {account.id}: {e}")
+
+
 @router.post("/webhook")
 async def handle_webhook(
     request: Request,
@@ -104,10 +120,12 @@ async def handle_webhook(
             raw_body, x_hub_signature_256, app_secret=settings.INSTAGRAM_APP_SECRET
         ):
             raise HTTPException(status_code=403, detail="Invalid webhook signature")
+    elif not settings.ALLOW_UNSIGNED_WEBHOOKS:
+        raise HTTPException(status_code=403, detail="Webhook signature verification is not configured")
     else:
         print(
-            "WARNING: INSTAGRAM_APP_SECRET is not configured; skipping webhook "
-            "signature verification. Set it to prevent spoofed webhook payloads."
+            "WARNING: INSTAGRAM_APP_SECRET is not configured and "
+            "ALLOW_UNSIGNED_WEBHOOKS=true; accepting unsigned webhook payloads."
         )
 
     data = await request.json()
@@ -126,13 +144,19 @@ async def handle_webhook(
             )
             continue
 
+        _dispatch_token_refresh_if_stale(account)
+
         if crud_instagram.comment_already_processed(db, item["comment_id"]):
             continue
 
         comment = crud_instagram.create_comment(db, account.id, item)
 
         if account.ai_enabled:
-            process_inbound_comment.apply_async(args=[str(account.id), str(comment.id)])
+            apply_async_or_rollback(
+                process_inbound_comment,
+                [str(account.id), str(comment.id)],
+                db, InstagramComment, comment.id,
+            )
 
     parsed_messages = InstagramWebhookParser.parse_inbound_messages(data)
     print(f"Parsed {len(parsed_messages)} DM(s) from payload")
@@ -147,6 +171,8 @@ async def handle_webhook(
                 f"(ig_message_id={item.get('ig_message_id')!r})"
             )
             continue
+
+        _dispatch_token_refresh_if_stale(account)
 
         if crud_instagram.dm_already_processed(db, item["ig_message_id"]):
             continue
@@ -170,7 +196,11 @@ async def handle_webhook(
         )
 
         if account.ai_enabled:
-            process_inbound_dm.apply_async(args=[str(account.id), str(customer.id), str(dm.id)])
+            apply_async_or_rollback(
+                process_inbound_dm,
+                [str(account.id), str(customer.id), str(dm.id)],
+                db, InstagramDirectMessage, dm.id,
+            )
 
     return {"status": "ok"}
 
@@ -218,7 +248,13 @@ async def start_oauth(current_user: User = Depends(get_current_user)):
     state = security.create_access_token(
         current_user.id, expires_delta=timedelta(minutes=OAUTH_STATE_EXPIRE_MINUTES)
     )
-    return {"authorize_url": instagram_oauth.build_authorize_url(state)}
+    try:
+        authorize_url = instagram_oauth.build_authorize_url(state)
+    except instagram_oauth.InstagramOAuthError as e:
+        # Missing app id / redirect env — say so plainly instead of sending
+        # Meta a broken URL (#84).
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"authorize_url": authorize_url}
 
 
 @router.get("/oauth/callback")

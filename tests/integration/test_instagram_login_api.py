@@ -74,6 +74,15 @@ def test_start_requires_no_auth_and_returns_login_authorize_url(client):
     assert "sub" not in payload
 
 
+def test_start_missing_login_redirect_is_plain_500(client, monkeypatch):
+    monkeypatch.setattr(settings, "INSTAGRAM_LOGIN_REDIRECT_URI", None)
+
+    resp = client.get("/api/v1/auth/instagram/start")
+
+    assert resp.status_code == 500
+    assert resp.json()["detail"] == "INSTAGRAM_LOGIN_REDIRECT_URI is not configured."
+
+
 def test_start_rate_limits_per_ip(client):
     for _ in range(30):
         assert client.get("/api/v1/auth/instagram/start").status_code == 200

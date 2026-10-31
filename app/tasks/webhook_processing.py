@@ -48,6 +48,28 @@ LLM_RETRY_COUNTDOWNS_SECONDS = (15, 45, 60)
 SEND_RETRY_DELAYS_SECONDS = (1, 3)
 
 
+def apply_async_or_rollback(task, args, db, model, row_id):
+    """
+    Queues a webhook-triggered task, deleting the just-stored row when the
+    broker is unreachable (#78). Without this, the row stays stored while
+    the webhook 500s, and Meta's retry hits the already-processed check and
+    no-ops — the message is dropped forever with no reply (observed live).
+    With it, the retry finds no row and replays fully. The original error
+    is re-raised so the webhook still 500s and Meta does retry; a failing
+    rollback is logged, never masking it.
+    """
+    try:
+        task.apply_async(args=args)
+    except Exception:
+        logger.exception("Task dispatch failed; rolling back stored row")
+        try:
+            db.query(model).filter(model.id == row_id).delete()
+            db.commit()
+        except Exception:
+            logger.exception("Dispatch rollback failed")
+        raise
+
+
 def _run_async(coro):
     """
     Runs a coroutine to completion from this (sync) Celery task, whether or

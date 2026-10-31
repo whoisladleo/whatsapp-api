@@ -57,12 +57,10 @@ async def handle_tunzaa_webhook(
          "timestamp": "..."}
 
     Every real callback is signed via an X-Signature header (HMAC-SHA256 of
-    the payload re-serialized with alphabetically sorted keys). This moves
-    real money, so unlike the more lenient Meta-webhook precedent
-    (app/api/v1/whatsapp.py), an unsigned/mismatched request is always
-    rejected whenever TUNZAA_SECRET_KEY is configured — verification is only
-    skipped (with a loud warning) when the secret genuinely isn't set, e.g.
-    local dev.
+    the payload re-serialized with alphabetically sorted keys). An
+    unsigned/mismatched request is always rejected whenever
+    TUNZAA_SECRET_KEY is configured; with no secret, requests are still
+    rejected unless ALLOW_UNSIGNED_WEBHOOKS is explicitly true (local dev).
     """
     try:
         data = await request.json()
@@ -72,11 +70,12 @@ async def handle_tunzaa_webhook(
     if settings.TUNZAA_SECRET_KEY:
         if not verify_tunzaa_signature(data, x_signature):
             raise HTTPException(status_code=403, detail="Invalid webhook signature")
+    elif not settings.ALLOW_UNSIGNED_WEBHOOKS:
+        raise HTTPException(status_code=403, detail="Webhook signature verification is not configured")
     else:
         logger.warning(
-            "TUNZAA_SECRET_KEY is not configured; skipping Tunzaa webhook "
-            "signature verification. Set it to prevent spoofed payment "
-            "confirmations."
+            "TUNZAA_SECRET_KEY is not configured and ALLOW_UNSIGNED_WEBHOOKS=true; "
+            "accepting unsigned payment confirmations."
         )
 
     logger.info(f"Received Tunzaa Webhook: {data}")
@@ -112,6 +111,29 @@ async def handle_tunzaa_webhook(
         return {"status": "ignored", "reason": "Already processed"}
 
     if status_value == "COMPLETED":
+        if order.status == OrderStatus.PAID:
+            # A second COMPLETED with a new transaction_id (genuine double
+            # payment, not a retry — retries share the id and are caught
+            # above). The cash is real, so record it, but the order is
+            # already paid: don't rewrite state or re-notify. (#77)
+            _record_payment_event(db, order, _parse_float(data.get("amount")))
+            return {"status": "success", "message": "Order already PAID; payment recorded"}
+
+        if order.status == OrderStatus.FAILED:
+            # Customer paid after an earlier attempt failed — and FAILED
+            # restores the stock reservation. Re-claim before marking paid,
+            # or the sale completes without decrementing. (#77)
+            if not _try_reclaim_stock(db, order):
+                if transaction_id:
+                    order.tunzaa_transaction_id = transaction_id
+                db.commit()
+                logger.error(
+                    f"COMPLETED for order {order.id} but no stock to reclaim; "
+                    f"leaving FAILED for merchant review."
+                )
+                return {"status": "success", "message": "Payment arrived but stock unavailable"}
+            order.status = OrderStatus.PENDING
+
         if transaction_id:
             order.tunzaa_transaction_id = transaction_id
 
@@ -167,6 +189,11 @@ async def handle_tunzaa_webhook(
         return {"status": "success", "message": f"Order status: {order.status.value}"}
 
     elif status_value in ("FAILED", "CANCELLED"):
+        if order.status != OrderStatus.PENDING:
+            # A FAILED for an already-resolved order (e.g. an abandoned
+            # duplicate attempt after the real one paid) must never regress
+            # it — or restore stock twice. (#77)
+            return {"status": "ignored", "reason": "Order already resolved"}
         order.status = OrderStatus.FAILED
         if transaction_id:
             order.tunzaa_transaction_id = transaction_id
@@ -493,6 +520,31 @@ def _release_reservation(db: Session, order: Order) -> Optional[uuid.UUID]:
         product.quantity += order.quantity or 1
         return product.id
     return None
+
+
+def _try_reclaim_stock(db: Session, order: Order) -> bool:
+    """
+    Re-decrements stock for a COMPLETED that arrives after FAILED restored
+    the reservation (#77). Conditional UPDATE like _try_claim_stock: the
+    rowcount decides, so two racing callbacks can't both claim the last
+    unit. True when stock was (re)taken or there's nothing to track.
+    """
+    if not order.product_id:
+        return True
+    product = db.query(Product).filter(Product.id == order.product_id).first()
+    if product is None:
+        return True
+    units = order.quantity or 1
+    claimed = (
+        db.query(Product)
+        .filter(Product.id == order.product_id, Product.quantity >= units)
+        .update(
+            {Product.quantity: Product.quantity - units},
+            synchronize_session=False,
+        )
+    )
+    db.commit()
+    return claimed > 0
 
 
 def _payment_notification_body(kind: str) -> str:

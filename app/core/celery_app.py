@@ -14,6 +14,7 @@ celery_app = Celery(
         "app.tasks.webhook_processing",
         "app.tasks.instagram_comment_processing",
         "app.tasks.instagram_dm_processing",
+        "app.tasks.instagram_token_refresh",
         "app.tasks.location_capture",
         "app.tasks.quote_nudges",
         "app.tasks.number_billing",

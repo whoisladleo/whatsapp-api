@@ -657,3 +657,121 @@ def test_inbound_location_message_dispatches_even_when_ai_disabled(client, db_se
 
     assert resp.status_code == 200
     assert len(calls) == 1
+
+
+# --- dispatch rollback on broker failure (#78) ----------------------------------
+
+
+def test_text_dispatch_failure_rolls_back_and_retry_replays(
+    client, db_session, merchant_owner
+):
+    account = WhatsAppAccount(
+        name="Rollback Shop",
+        phone_number_id="PHONE_RB",
+        access_token="tok",
+        ai_enabled=True,
+        user_id=merchant_owner.id,
+    )
+    db_session.add(account)
+    db_session.commit()
+    db_session.refresh(account)
+
+    import app.tasks.webhook_processing as task_module
+
+    calls = []
+    original = task_module.process_inbound_message.apply_async
+
+    def flaky(args=None, **kw):
+        if not calls:
+            calls.append("boom")
+            raise RuntimeError("broker down")
+        calls.append(args)
+
+    task_module.process_inbound_message.apply_async = flaky
+    try:
+        payload = _text_webhook_payload("PHONE_RB", "255711116666", "hi", msg_id="wamid.rb1")
+        with pytest.raises(RuntimeError, match="broker down"):
+            client.post(WEBHOOK_URL, json=payload)
+        assert (
+            db_session.query(Message)
+            .filter(Message.whatsapp_message_id == "wamid.rb1")
+            .count()
+            == 0
+        )
+        resp = client.post(WEBHOOK_URL, json=payload)
+    finally:
+        task_module.process_inbound_message.apply_async = original
+
+    assert resp.status_code == 200
+    stored = (
+        db_session.query(Message)
+        .filter(Message.whatsapp_message_id == "wamid.rb1")
+        .first()
+    )
+    assert stored is not None
+    assert stored.body == "hi"
+    assert calls[1] == [str(account.id), "255711116666", "hi"]
+
+
+def test_location_dispatch_failure_rolls_back_and_retry_replays(
+    client, db_session, merchant_owner
+):
+    account = WhatsAppAccount(
+        name="Rollback Loc Shop",
+        phone_number_id="PHONE_RB_LOC",
+        access_token="tok",
+        ai_enabled=True,
+        user_id=merchant_owner.id,
+    )
+    db_session.add(account)
+    db_session.commit()
+    db_session.refresh(account)
+
+    import app.tasks.location_capture as location_capture_module
+
+    calls = []
+    original = location_capture_module.capture_customer_location.apply_async
+
+    def flaky(args=None, **kw):
+        if not calls:
+            calls.append("boom")
+            raise RuntimeError("broker down")
+        calls.append(args)
+
+    location_capture_module.capture_customer_location.apply_async = flaky
+    try:
+        payload = _location_webhook_payload("PHONE_RB_LOC", "255711117777", msg_id="wamid.rbloc1")
+        with pytest.raises(RuntimeError, match="broker down"):
+            client.post(WEBHOOK_URL, json=payload)
+        assert (
+            db_session.query(Message)
+            .filter(Message.whatsapp_message_id == "wamid.rbloc1")
+            .count()
+            == 0
+        )
+        resp = client.post(WEBHOOK_URL, json=payload)
+    finally:
+        location_capture_module.capture_customer_location.apply_async = original
+
+    assert resp.status_code == 200
+    stored = (
+        db_session.query(Message)
+        .filter(Message.whatsapp_message_id == "wamid.rbloc1")
+        .first()
+    )
+    assert stored is not None
+    assert stored.type == "location"
+    assert calls[1][0] == str(account.id)
+    assert calls[1][1] == "255711117777"
+
+
+def test_unsigned_webhook_rejected_when_secret_unset_and_flag_off(client, monkeypatch):
+    monkeypatch.setattr(settings, "WHATSAPP_APP_SECRET", None)
+    monkeypatch.setattr(settings, "ALLOW_UNSIGNED_WEBHOOKS", False)
+
+    resp = client.post(
+        WEBHOOK_URL, json=_text_webhook_payload("PHONE_X", "255700000000", "hi")
+    )
+
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "Webhook signature verification is not configured"

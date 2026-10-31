@@ -1,5 +1,16 @@
 # Decisions
 
+## Audit fixes: money-state guards, dispatch rollback, lazy token refresh (2026-10-31, #77-#84)
+
+**Chose:** (1) Tunzaa FAILED/CANCELLED only acts from PENDING — never regresses PAID; a second COMPLETED with a new txn id records the cash event but skips state rewrite and re-notify; COMPLETED-after-FAILED re-claims stock first and stays FAILED (logged, txn recorded) when stock is gone. (2) All four webhook dispatches roll back the stored row when the queue call throws, so Meta's retry replays fully instead of no-op-ing on already-processed. (3) Channel-connect scope stripped to approved basic + manage_messages; OAuth builders fail fast naming the missing setting. (4) Lazy IG token refresh (no Beat in repo): webhooks dispatch a refresh task when the token is 50+ days old, task claims via conditional stamp, restores the stamp on API failure. (5) Webhooks fail closed without secrets unless explicit ALLOW_UNSIGNED_WEBHOOKS=true. (6) RUN_MODE=production is an ops setting, no code. (7) Blank OTP usernames 422 before lookup. Full suite 1046 passed.
+
+**Considered and rejected:**
+- *Ignoring second-COMPLETED cash entirely.* Rejected: the money really arrived; dropping the event falsifies revenue. Recording without state change keeps cash truthful.
+- *Treating FAILED-after-PAID as a refund signal.* Rejected: a failed duplicate attempt is not a refund; auto-refund semantics would need Tunzaa reversal support that doesn't exist.
+- *Eager token refresh via new Celery Beat process.* Rejected: new always-on process for one job; lazy refresh covers every account active enough to matter, and dormant-account expiry surfaces loudly in logs.
+- *Retrying dispatch in-process instead of rolling back.* Rejected: blocking the webhook on broker reconnects risks Meta timeouts; rollback + Meta retry reuses the existing delivery machinery.
+- *Per-file unsigned-webhook test flags instead of conftest-wide.* Rejected: the whole suite is the dev case; one pin with explicit opt-outs in the three fail-closed tests is less machinery.
+
 Production-tier decisions only — what was chosen, what was considered and rejected, and why. Project-specific prior-art/incident history lives in CLAUDE.md instead; this file is for the choice itself, not the surrounding system detail.
 
 ## Reply metering: append-only event ledger, all automated buyer sends, billing-cycle periods, warn-only (2026-10-23, #41)

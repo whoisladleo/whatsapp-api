@@ -7,6 +7,8 @@ import pytest
 
 from app.core.config import settings
 from app.db.models import (
+    AmaraEvent,
+    AmaraEventKind,
     Customer,
     Installment,
     InstallmentMode,
@@ -126,6 +128,18 @@ def test_missing_signature_rejected_when_secret_configured(client):
     )
 
     assert resp.status_code == 403
+
+
+def test_unsigned_rejected_when_secret_unset_and_flag_off(client, monkeypatch):
+    monkeypatch.setattr(settings, "TUNZAA_SECRET_KEY", None)
+    monkeypatch.setattr(settings, "ALLOW_UNSIGNED_WEBHOOKS", False)
+
+    resp = client.post(
+        URL, json={"status": "COMPLETED", "reference_id": "order-1", "transaction_id": "T1"}
+    )
+
+    assert resp.status_code == 403
+    assert resp.json() == {"detail": "Webhook signature verification is not configured"}
 
 
 def test_wrong_signature_rejected(client):
@@ -586,6 +600,114 @@ def test_payment_failed_without_product_link_does_not_crash(client, db_session, 
     assert resp.status_code == 200
     db_session.refresh(o)
     assert o.status == OrderStatus.FAILED
+
+
+# --- out-of-order / new-transaction repeats (#77) -------------------------------
+
+
+def _complete(client, order_id, txn, **extra):
+    return _post(client, {
+        "status": "COMPLETED", "reference_id": f"order-{order_id}",
+        "transaction_id": txn, **extra,
+    })
+
+
+def _fail(client, order_id, txn):
+    return _post(client, {
+        "status": "FAILED", "reference_id": f"order-{order_id}",
+        "transaction_id": txn,
+    })
+
+
+def test_failed_after_paid_does_not_regress(client, db_session, order, product, monkeypatch):
+    _mock_send_text(monkeypatch)
+    _mock_send_template(monkeypatch)
+    _complete(client, order.id, "T-PAID-1")
+    db_session.refresh(order)
+    db_session.refresh(product)
+    assert order.status == OrderStatus.PAID
+    qty_paid = product.quantity
+
+    resp = _fail(client, order.id, "T-ABANDONED-2")
+
+    assert resp.json() == {"status": "ignored", "reason": "Order already resolved"}
+    db_session.refresh(order)
+    db_session.refresh(product)
+    assert order.status == OrderStatus.PAID
+    assert product.quantity == qty_paid
+    assert order.tunzaa_transaction_id == "T-PAID-1"
+
+
+def test_failed_twice_restores_stock_once(client, db_session, order, product):
+    _fail(client, order.id, "T-F-1")
+    db_session.refresh(product)
+    assert product.quantity == 3  # 2 + 1 restored
+
+    resp = _fail(client, order.id, "T-F-2")
+
+    assert resp.json() == {"status": "ignored", "reason": "Order already resolved"}
+    db_session.refresh(product)
+    assert product.quantity == 3
+
+
+def test_completed_after_paid_records_cash_without_renotify(
+    client, db_session, order, product, monkeypatch
+):
+    _mock_send_text(monkeypatch)
+    calls = []
+    _mock_send_template(monkeypatch, calls=calls)
+    _complete(client, order.id, "T-PAID-1")
+    assert len(calls) == 1
+
+    resp = _complete(client, order.id, "T-PAID-2", amount="45000")
+
+    assert resp.json() == {"status": "success", "message": "Order already PAID; payment recorded"}
+    db_session.refresh(order)
+    assert order.status == OrderStatus.PAID
+    assert order.tunzaa_transaction_id == "T-PAID-1"
+    assert len(calls) == 1
+    payments = (
+        db_session.query(AmaraEvent)
+        .filter(AmaraEvent.kind == AmaraEventKind.PAYMENT)
+        .all()
+    )
+    assert len(payments) == 2
+    assert sum(p.amount or 0 for p in payments) == 90000.0
+
+
+def test_failed_then_completed_reclaims_stock(client, db_session, order, product, monkeypatch):
+    _mock_send_text(monkeypatch)
+    _mock_send_template(monkeypatch)
+    _fail(client, order.id, "T-F-1")
+    db_session.refresh(product)
+    assert product.quantity == 3
+
+    resp = _complete(client, order.id, "T-PAID-RETRY")
+
+    assert resp.status_code == 200
+    db_session.refresh(order)
+    db_session.refresh(product)
+    assert order.status == OrderStatus.PAID
+    assert product.quantity == 2
+
+
+def test_failed_then_completed_without_stock_stays_failed(
+    client, db_session, order, product, monkeypatch
+):
+    _mock_send_text(monkeypatch)
+    _mock_send_template(monkeypatch)
+    _fail(client, order.id, "T-F-1")
+    product.quantity = 0  # sold out while the customer retried
+    db_session.commit()
+
+    resp = _complete(client, order.id, "T-PAID-RETRY")
+
+    assert resp.json() == {"status": "success", "message": "Payment arrived but stock unavailable"}
+    db_session.refresh(order)
+    db_session.refresh(product)
+    assert order.status == OrderStatus.FAILED
+    assert product.quantity == 0
+    assert order.tunzaa_transaction_id == "T-PAID-RETRY"
 
 
 # --- misc ---------------------------------------------------------------------

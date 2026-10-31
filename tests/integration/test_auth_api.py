@@ -35,6 +35,19 @@ def test_request_otp_creates_user_and_sends_message(client, db_session):
 
 
 @respx.mock
+def test_request_otp_rejects_blank_and_garbage_username(client, db_session):
+    route = _mock_send_text()
+
+    for bad in ("", "   ", "abc", "+--"):
+        resp = client.post("/api/v1/auth/request-otp", json={"username": bad})
+        assert resp.status_code == 422
+        assert resp.json() == {"detail": "Phone number is required"}
+
+    assert db_session.query(User).count() == 0
+    assert not route.called
+
+
+@respx.mock
 def test_request_otp_reuses_existing_user(client, db_session):
     _mock_send_text()
     existing = User(username=PHONE)

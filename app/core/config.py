@@ -44,9 +44,15 @@ class Settings(BaseSettings):
     WHATSAPP_BASE_URL: str = "https://graph.facebook.com"
     WEBHOOK_VERIFY_TOKEN: Optional[str] = None
     # Meta App Secret, used to verify the X-Hub-Signature-256 header on
-    # incoming webhook POSTs. If unset, signature verification is skipped
-    # (with a warning) rather than rejecting all webhook traffic.
+    # incoming webhook POSTs. If unset, webhooks are rejected unless
+    # ALLOW_UNSIGNED_WEBHOOKS is explicitly true (local dev only).
     WHATSAPP_APP_SECRET: Optional[str] = None
+    # Local-dev escape hatch for all three signed webhooks (WhatsApp,
+    # Instagram, Tunzaa): when a webhook's secret is unset AND this is true,
+    # unsigned payloads are accepted with a loud warning. Default false —
+    # a partially-configured deploy must fail closed, not accept forged
+    # payment/inbound callbacks (#81).
+    ALLOW_UNSIGNED_WEBHOOKS: bool = False
 
     # Instagram (Instagram API with Instagram Login / "Business Login for
     # Instagram") — a separate Meta App from the WhatsApp one above, so it

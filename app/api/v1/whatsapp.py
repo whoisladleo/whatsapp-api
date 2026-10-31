@@ -13,7 +13,7 @@ from app.core.security import is_safe_external_url, verify_meta_signature
 import httpx
 from app.core.webhook_parser import WebhookParser
 from app.crud import message as crud_message
-from app.tasks.webhook_processing import process_inbound_message
+from app.tasks.webhook_processing import apply_async_or_rollback, process_inbound_message
 from app.tasks.location_capture import capture_customer_location
 from app.schemas.whatsapp import (
     ConversationSummary,
@@ -93,10 +93,12 @@ async def handle_webhook(
     if settings.WHATSAPP_APP_SECRET:
         if not verify_meta_signature(raw_body, x_hub_signature_256):
             raise HTTPException(status_code=403, detail="Invalid webhook signature")
+    elif not settings.ALLOW_UNSIGNED_WEBHOOKS:
+        raise HTTPException(status_code=403, detail="Webhook signature verification is not configured")
     else:
         print(
-            "WARNING: WHATSAPP_APP_SECRET is not configured; skipping webhook "
-            "signature verification. Set it to prevent spoofed webhook payloads."
+            "WARNING: WHATSAPP_APP_SECRET is not configured and "
+            "ALLOW_UNSIGNED_WEBHOOKS=true; accepting unsigned webhook payloads."
         )
 
     data = await request.json()
@@ -146,7 +148,7 @@ async def handle_webhook(
                 if already_processed:
                     continue
 
-            crud_message.create_message(db, item, account_id)
+            stored = crud_message.create_message(db, item, account_id)
 
             # 2. Routing logic — dispatched to a background task rather than
             # awaited here, so a slow Claude call or WhatsApp send can't
@@ -158,8 +160,10 @@ async def handle_webhook(
                 and account_ai_enabled
                 and item.get("type") == "text"
             ):
-                process_inbound_message.apply_async(
-                    args=[str(account_id), item.get("from_phone"), item.get("body")]
+                apply_async_or_rollback(
+                    process_inbound_message,
+                    [str(account_id), item.get("from_phone"), item.get("body")],
+                    db, Message, stored.id,
                 )
             elif (
                 item.get("direction") == "inbound"
@@ -170,15 +174,17 @@ async def handle_webhook(
                 # location is a fulfillment signal, not an AI/merchant
                 # conversation action, so it's accepted regardless.
                 loc = item["location"]
-                capture_customer_location.apply_async(
-                    args=[
+                apply_async_or_rollback(
+                    capture_customer_location,
+                    [
                         str(account_id),
                         item.get("from_phone"),
                         loc.get("latitude"),
                         loc.get("longitude"),
                         loc.get("name"),
                         loc.get("address"),
-                    ]
+                    ],
+                    db, Message, stored.id,
                 )
 
         # 3. Forward to callback if configured

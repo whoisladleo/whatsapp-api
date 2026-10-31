@@ -71,6 +71,14 @@ def _no_real_external_credentials(monkeypatch):
     # (eager in tests), which must silently no-op rather than hit Meta.
     monkeypatch.setattr(settings, "CATALOG_ID", None)
     monkeypatch.setattr(settings, "CATALOG_ACCESS_TOKEN", None)
+    # Webhook signature secrets stay unset in tests, and webhooks now fail
+    # closed without them (#81) — the suite is the dev case, so allow
+    # unsigned payloads file-wide. Tests for the fail-closed behavior itself
+    # pin this back to False explicitly.
+    monkeypatch.setattr(settings, "ALLOW_UNSIGNED_WEBHOOKS", True)
+    monkeypatch.setattr(settings, "WHATSAPP_APP_SECRET", None)
+    monkeypatch.setattr(settings, "INSTAGRAM_APP_SECRET", None)
+    monkeypatch.setattr(settings, "TUNZAA_SECRET_KEY", None)
 
 
 @pytest.fixture(autouse=True)

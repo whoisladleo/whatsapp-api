@@ -285,6 +285,9 @@ class InstagramAccount(Base):
     ai_enabled = Column(Boolean, default=True)
     user_id = Column(UUIDType, ForeignKey("users.id"))
     created_at = Column(DateTime, default=datetime.utcnow)
+    # Last time access_token was (re)issued. NULL for pre-#80 rows — treated
+    # as stale so the first inbound triggers one refresh, then it's stamped.
+    token_refreshed_at = Column(DateTime, nullable=True)
 
     owner = relationship("User", back_populates="instagram_accounts")
     comments = relationship("InstagramComment", back_populates="account")

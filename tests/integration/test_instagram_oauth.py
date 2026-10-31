@@ -60,6 +60,16 @@ def test_start_oauth_returns_authorize_url_with_signed_state(client, auth_user):
     assert uuid.UUID(payload["sub"]) == user.id
 
 
+def test_start_oauth_missing_redirect_is_plain_500(client, auth_user, monkeypatch):
+    user, headers = auth_user
+    monkeypatch.setattr(settings, "INSTAGRAM_REDIRECT_URI", None)
+
+    resp = client.get("/api/v1/instagram/oauth/start", headers=headers)
+
+    assert resp.status_code == 500
+    assert resp.json()["detail"] == "INSTAGRAM_REDIRECT_URI is not configured."
+
+
 def test_callback_missing_code_redirects_to_error(client):
     resp = client.get(
         "/api/v1/instagram/oauth/callback", params={"state": "x"}, follow_redirects=False

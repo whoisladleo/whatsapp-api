@@ -26,8 +26,28 @@ def test_build_authorize_url_includes_client_id_redirect_and_scopes():
     assert url.startswith(settings.INSTAGRAM_OAUTH_AUTHORIZE_URL)
     assert "client_id=APPID123" in url
     assert "state=state123" in url
-    assert "instagram_business_manage_comments" in url
+    assert "instagram_business_basic" in url
     assert "instagram_business_manage_messages" in url
+    # Stripped (#79): Meta denied manage_comments, and requesting it fails
+    # the whole authorize for live merchants.
+    assert "instagram_business_manage_comments" not in url
+
+
+def test_build_authorize_url_fails_fast_on_missing_config(monkeypatch):
+    monkeypatch.setattr(settings, "INSTAGRAM_REDIRECT_URI", None)
+    with pytest.raises(InstagramOAuthError, match="INSTAGRAM_REDIRECT_URI"):
+        instagram_oauth.build_authorize_url("state123")
+
+    monkeypatch.setattr(settings, "INSTAGRAM_REDIRECT_URI", "https://api.example.com/cb")
+    monkeypatch.setattr(settings, "INSTAGRAM_APP_ID", None)
+    with pytest.raises(InstagramOAuthError, match="INSTAGRAM_APP_ID"):
+        instagram_oauth.build_authorize_url("state123")
+
+
+def test_build_login_authorize_url_fails_fast_on_missing_config(monkeypatch):
+    monkeypatch.setattr(settings, "INSTAGRAM_LOGIN_REDIRECT_URI", None)
+    with pytest.raises(InstagramOAuthError, match="INSTAGRAM_LOGIN_REDIRECT_URI"):
+        instagram_oauth.build_login_authorize_url("state123")
 
 
 def test_build_login_authorize_url_uses_login_redirect_and_dm_only_scopes():
@@ -101,6 +121,28 @@ async def test_exchange_for_long_lived_token_failure():
 
     with pytest.raises(InstagramOAuthError):
         await instagram_oauth.exchange_for_long_lived_token("short-tok")
+
+
+@respx.mock
+async def test_refresh_long_lived_token_success():
+    route = respx.get(url__regex=r"https://graph\.instagram\.com/refresh_access_token").mock(
+        return_value=httpx.Response(200, json={"access_token": "refreshed-tok"})
+    )
+
+    token = await instagram_oauth.refresh_long_lived_token("old-tok")
+
+    assert token == "refreshed-tok"
+    assert route.calls.last.request.url.params["grant_type"] == "ig_refresh_token"
+
+
+@respx.mock
+async def test_refresh_long_lived_token_failure():
+    respx.get(url__regex=r"https://graph\.instagram\.com/refresh_access_token").mock(
+        return_value=httpx.Response(400, json={"error": {"message": "expired"}})
+    )
+
+    with pytest.raises(InstagramOAuthError):
+        await instagram_oauth.refresh_long_lived_token("dead-tok")
 
 
 @respx.mock

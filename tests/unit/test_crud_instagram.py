@@ -109,6 +109,19 @@ def test_upsert_reconnecting_same_account_updates_in_place(db_session, user):
     assert db_session.query(InstagramAccount).count() == 1
 
 
+def test_upsert_stamps_token_refreshed_at_on_create_and_reconnect(db_session, user):
+    from datetime import datetime, timedelta
+
+    created = crud_instagram.upsert_account(db_session, user.id, "ig_1", "tok_1", "shop_one")
+    assert created.token_refreshed_at is not None
+    assert datetime.utcnow() - created.token_refreshed_at < timedelta(minutes=5)
+
+    created.token_refreshed_at = datetime.utcnow() - timedelta(days=51)
+    db_session.commit()
+    reconnected = crud_instagram.upsert_account(db_session, user.id, "ig_1", "tok_2", "shop_one")
+    assert datetime.utcnow() - reconnected.token_refreshed_at < timedelta(minutes=5)
+
+
 def test_upsert_reconnecting_with_different_ig_account_replaces_not_duplicates(
     db_session, user
 ):

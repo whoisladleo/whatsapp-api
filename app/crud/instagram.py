@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
@@ -54,6 +55,24 @@ def disconnect_account(db: Session, account: InstagramAccount) -> None:
     account.access_token = ""
     account.ai_enabled = False
     db.commit()
+
+
+# Long-lived tokens die ~60 days after issue; refresh from 50 days on. No
+# Celery Beat in this repo, so refresh is lazy: webhook handlers dispatch
+# the refresh task when this says stale, and the task claims via
+# compare-and-swap so concurrent webhooks refresh once (#80).
+TOKEN_REFRESH_AFTER_DAYS = 50
+
+
+def token_needs_refresh(account: InstagramAccount) -> bool:
+    """True when a refresh task should be dispatched for this account."""
+    if not account.access_token:
+        return False
+    if account.token_refreshed_at is None:
+        return True
+    return datetime.utcnow() - account.token_refreshed_at > timedelta(
+        days=TOKEN_REFRESH_AFTER_DAYS
+    )
 
 
 def comment_already_processed(db: Session, comment_id: str) -> bool:
@@ -115,12 +134,14 @@ def upsert_account(
         # turn Amara back on for this account, and there's no UI to flip it
         # separately, so it has to happen here.
         account.ai_enabled = True
+        account.token_refreshed_at = datetime.utcnow()
     else:
         account = InstagramAccount(
             ig_business_id=ig_business_id,
             access_token=access_token,
             username=username,
             user_id=user_id,
+            token_refreshed_at=datetime.utcnow(),
         )
         db.add(account)
 
