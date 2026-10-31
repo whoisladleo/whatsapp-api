@@ -333,12 +333,15 @@ def impersonate_merchant(
             detail="Too many impersonation attempts. Try again later.",
         )
 
-    digits = normalize_phone((payload.target_phone or "").strip())
     target = None
-    if digits:
-        target = crud_user.get_user_by_username(db, digits)
-    if target is None and digits:
-        target = crud_user.get_user_by_phone_number(db, digits)
+    if payload.target_user_id is not None:
+        target = crud_user.get_user(db, payload.target_user_id)
+    else:
+        digits = normalize_phone((payload.target_phone or "").strip())
+        if digits:
+            target = crud_user.get_user_by_username(db, digits)
+        if target is None and digits:
+            target = crud_user.get_user_by_phone_number(db, digits)
     if target is None:
         raise HTTPException(status_code=404, detail="Merchant not found")
     if target.id == current_user.id:

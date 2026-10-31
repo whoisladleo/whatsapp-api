@@ -1,5 +1,5 @@
 import uuid
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 from typing import List, Optional
 from datetime import datetime
 
@@ -29,9 +29,19 @@ class InstagramExchangeRequest(BaseModel):
     code: str
 
 class ImpersonateRequest(BaseModel):
+    # Merchant ID as listed by GET /auth/merchants — the primary key, and
+    # the only one that reaches phoneless IG-signup merchants.
+    target_user_id: Optional[uuid.UUID] = None
     # Merchant phone as support knows it (any format — normalized before
-    # matching username first, then self-reported phone_number).
-    target_phone: str
+    # matching username first, then self-reported phone_number). Fallback
+    # for callers without the ID; ignored when target_user_id is present.
+    target_phone: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _require_a_target(self):
+        if self.target_user_id is None and not (self.target_phone or "").strip():
+            raise ValueError("Provide target_user_id or target_phone.")
+        return self
 
 class ImpersonatorRef(BaseModel):
     id: uuid.UUID

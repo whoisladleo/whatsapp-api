@@ -200,6 +200,91 @@ def test_mint_rate_limited(client, db_session, operator, target):
     assert _mint(client, headers).status_code == 429
 
 
+# Mint by ID (#76)
+
+
+def _mint_by_id(client, operator_headers, user_id):
+    return client.post(
+        "/api/v1/auth/impersonate", json={"target_user_id": str(user_id)},
+        headers=operator_headers,
+    )
+
+
+def test_mint_by_id_reaches_phoneless_merchant(client, db_session, operator):
+    phoneless = User(username=None, phone_number=None, name="divinebundles_")
+    db_session.add(phoneless)
+    db_session.commit()
+
+    resp = _mint_by_id(client, _headers(operator), phoneless.id)
+
+    assert resp.status_code == 200
+    payload = jwt.decode(
+        resp.json()["access_token"], settings.SECRET_KEY,
+        algorithms=[settings.ALGORITHM],
+    )
+    assert payload["sub"] == str(phoneless.id)
+    starts = _audit_rows(db_session, SupportAccessKind.START)
+    assert len(starts) == 1
+    assert starts[0].target_id == phoneless.id
+
+
+def test_mint_by_unknown_id_is_404(client, db_session, operator):
+    resp = _mint_by_id(client, _headers(operator), uuid.uuid4())
+
+    assert resp.status_code == 404
+    assert _audit_rows(db_session) == []
+
+
+def test_mint_with_no_target_is_422(client, db_session, operator, target):
+    assert _mint(client, _headers(operator), phone="   ").status_code == 422
+    resp = client.post(
+        "/api/v1/auth/impersonate", json={}, headers=_headers(operator)
+    )
+    assert resp.status_code == 422
+    assert _audit_rows(db_session) == []
+
+
+def test_mint_by_malformed_id_is_422(client, db_session, operator, target):
+    resp = client.post(
+        "/api/v1/auth/impersonate", json={"target_user_id": "not-a-uuid"},
+        headers=_headers(operator),
+    )
+
+    assert resp.status_code == 422
+    assert _audit_rows(db_session) == []
+
+
+def test_mint_prefers_id_over_phone(client, db_session, operator, target):
+    other = User(username="255700000007")
+    db_session.add(other)
+    db_session.commit()
+
+    resp = client.post(
+        "/api/v1/auth/impersonate",
+        json={"target_user_id": str(target.id), "target_phone": "255700000007"},
+        headers=_headers(operator),
+    )
+
+    assert resp.status_code == 200
+    payload = jwt.decode(
+        resp.json()["access_token"], settings.SECRET_KEY,
+        algorithms=[settings.ALGORITHM],
+    )
+    assert payload["sub"] == str(target.id)
+
+
+def test_mint_by_id_self_and_operator_rejected(
+    client, db_session, operator, target, monkeypatch
+):
+    assert _mint_by_id(client, _headers(operator), operator.id).status_code == 400
+
+    monkeypatch.setattr(
+        settings, "SUPPORT_OPERATOR_PHONES", f"{OPERATOR_PHONE},{TARGET_PHONE}"
+    )
+    assert _mint_by_id(client, _headers(operator), target.id).status_code == 400
+    assert _audit_rows(db_session) == []
+
+
 # Session shapes, revocation, expiry
 
 
