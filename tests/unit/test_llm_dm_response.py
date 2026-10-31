@@ -312,6 +312,34 @@ async def test_generate_dm_response_catalog_in_stock_line_wording_unchanged_and_
     assert "suggest an in-stock alternative" in captured["system"]
 
 
+async def test_generate_dm_response_catalog_shows_subscription_without_stock_units(
+    db_session, ig_account, ig_customer, ig_context
+):
+    # A plan must never render "Stock: 0" — the model reads it as
+    # out-of-stock and refuses the close (#92).
+    p = Product(
+        slug="ig-dm-plan", name="Taskflow Standard", max_price=100000, min_price=100000,
+        quantity=0, merchant_id=ig_account.user_id, is_subscription=True,
+        is_platform_plan=True, monthly_reply_limit=2000,
+    )
+    db_session.add(p)
+    db_session.commit()
+
+    captured = {}
+    service = _service_with_fake_client(captured=captured)
+
+    await service.generate_dm_response(
+        "how much?", db=db_session, account=ig_account, customer=ig_customer, context=ig_context, conversation_history=[]
+    )
+
+    line = next(l for l in captured["system"].splitlines() if l.startswith("- Taskflow Standard:"))
+    assert line == (
+        "- Taskflow Standard: Max Price TZS 100,000, Lowest Price You May Offer TZS 100,000, "
+        "available now, billed monthly, includes 2,000 Amara replies a month"
+    )
+    assert "SAME language the customer just used" in captured["system"]
+
+
 async def test_generate_dm_response_no_products_says_so_in_catalog(db_session, ig_account, ig_customer, ig_context):
     captured = {}
     service = _service_with_fake_client(captured=captured)

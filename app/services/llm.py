@@ -1167,6 +1167,12 @@ Match the customer's language (Swahili or English). Keep both lines to one sente
             for p in products:
                 installments_note = "" if p.allow_installments else " (full payment only — installments not offered)"
                 stock_note = " (OUT OF STOCK)" if _is_out_of_stock(p) else ""
+                # Subscriptions have no units — a raw "Stock: 0" invites
+                # out-of-stock claims on plans (#92). Mirrors the WhatsApp
+                # catalog builder's wording.
+                stock_display = (
+                    "available now, billed monthly" if p.is_subscription else f"Stock: {p.quantity}"
+                )
                 plan_note = ""
                 if p.is_platform_plan:
                     plan_note = (
@@ -1174,7 +1180,7 @@ Match the customer's language (Swahili or English). Keep both lines to one sente
                         if p.monthly_reply_limit is not None
                         else ", includes unlimited Amara replies"
                     )
-                catalog_str += f"- {p.name}: Max Price TZS {p.max_price:,.0f}, Lowest Price You May Offer TZS {_negotiation_floor(p):,.0f}, Stock: {p.quantity}{plan_note}{stock_note}{installments_note}\n"
+                catalog_str += f"- {p.name}: Max Price TZS {p.max_price:,.0f}, Lowest Price You May Offer TZS {_negotiation_floor(p):,.0f}, {stock_display}{plan_note}{stock_note}{installments_note}\n"
                 if p.description:
                     catalog_str += f"  {p.description}\n"
 
@@ -1197,7 +1203,7 @@ RULES:
 3. Closing: once the customer has clearly agreed on a specific product and price, ask whether they'd like to pay in full or in installments — unless the catalog marks that product "full payment only", in which case don't offer installments at all; if the customer asks for installments on such a product, tell them this one is full-payment only. Instagram doesn't give us their phone number automatically, so if you don't already have it from earlier in this conversation, ask for it too — explain it's needed to send the mobile-money payment request. Once you have a specific agreed price, a payment method choice, AND a phone number, confirm the deal and end your response with the exact marker [AGREEMENT_REACHED: product=<product name> price=<agreed price> payment=<full|installment> phone=<phone number>] (e.g. [AGREEMENT_REACHED: product=Shoes price=45000 payment=full phone=255700000000]). Only include this marker once all four are explicit — never guess or assume any of them.
 4. Payment: describe it accurately — a payment request gets sent directly to the given phone number for them to approve, not a menu of payment apps to choose from. Don't name specific mobile money providers.
 5. Human Handoff: if the customer is unreasonable, has complex questions you can't answer from the catalog/knowledge above, or explicitly asks for a human, include the exact marker [HUMAN_HANDOFF]. Don't include this for a normal close — that's handled by AGREEMENT_REACHED instead.
-6. Keep replies SHORT and natural, like a real Instagram DM — usually 1-3 sentences. Match the customer's language (Swahili or English).
+6. Keep replies SHORT and natural, like a real Instagram DM — usually 1-3 sentences. Reply in the SAME language the customer just used — English message gets an English reply, Swahili gets Swahili. Never default to Swahili for an English message.
 7. Currency: all prices are in Tanzanian Shillings (TZS) — always state them exactly as given, including the TZS label. Never say "$", "USD", "dollars", or imply any other currency, and never convert the number into another currency.
 8. Quoting: whenever you state a specific price for a product during negotiation but haven't closed the deal yet, end your response with the marker [QUOTE: product=<product name> price=<price>] (e.g. [QUOTE: product=Shoes price=45000]). Don't include this once you've emitted [AGREEMENT_REACHED] for the same deal.
 9. Out of stock: never offer, quote, or agree a price on a product the catalog marks OUT OF STOCK — if the customer asks about one, first say plainly, naming the product, that it is out of stock, then suggest an in-stock alternative from the catalog instead.
