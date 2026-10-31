@@ -38,6 +38,7 @@ BUTTON_TITLES = {
     "Reply": BUTTON_REPLY,
     "Done": BUTTON_DONE,
     "Amara, take over.": BUTTON_TAKEOVER,
+    "Amara, take over": BUTTON_TAKEOVER,
     # Emoji variants, accepted as aliases.
     "✏️ Reply": BUTTON_REPLY,
     "✅ Done": BUTTON_DONE,
