@@ -1,7 +1,14 @@
 name: Docker Publish
 
+# Publishes images only for green master builds (#85): this workflow runs
+# when the "Tests" workflow completes on master, and skips unless it
+# succeeded. Manual dispatch always runs (re-ships current master — used
+# for pipeline proving and for re-deploying without a code push).
 on:
-  push:
+  workflow_run:
+    workflows: ["Tests"]
+    types:
+      - completed
     branches:
       - master
   workflow_dispatch:
@@ -12,6 +19,9 @@ concurrency:
 
 jobs:
   build-and-push:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -31,6 +41,10 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          # On workflow_run, build the exact commit Tests just passed —
+          # not whatever master points at when this job starts.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -60,3 +74,24 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build-and-push
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Coolify redeploys
+        run: |
+          set -euo pipefail
+          for var in COOLIFY_API_DEPLOY_WEBHOOK COOLIFY_WORKER_DEPLOY_WEBHOOK; do
+            echo "Deploying ${var} ..."
+            resp=$(curl -fsS -X POST "${!var}" \
+              -H "Authorization: Bearer ${COOLIFY_API_TOKEN}")
+            echo "${resp}"
+          done
+        env:
+          COOLIFY_API_DEPLOY_WEBHOOK: ${{ secrets.COOLIFY_API_DEPLOY_WEBHOOK }}
+          COOLIFY_WORKER_DEPLOY_WEBHOOK: ${{ secrets.COOLIFY_WORKER_DEPLOY_WEBHOOK }}
+          COOLIFY_API_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
