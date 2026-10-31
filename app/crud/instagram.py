@@ -2,6 +2,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db.models import (
@@ -195,19 +196,32 @@ def get_or_create_customer(
         .filter(InstagramCustomer.ig_scoped_id == ig_scoped_id)
         .first()
     )
-    if customer:
-        if username and customer.username != username:
-            customer.username = username
+    if customer is None:
+        customer = InstagramCustomer(
+            account_id=account_id, ig_scoped_id=ig_scoped_id, username=username
+        )
+        db.add(customer)
+        try:
             db.commit()
+        except IntegrityError:
+            # Lost a concurrent insert race (two webhook deliveries for
+            # the same new sender both missed the SELECT above); fall
+            # back to the winner's row (#86).
+            db.rollback()
+            customer = (
+                db.query(InstagramCustomer)
+                .filter(InstagramCustomer.ig_scoped_id == ig_scoped_id)
+                .first()
+            )
+            if customer is None:
+                raise
+        else:
             db.refresh(customer)
-        return customer
-
-    customer = InstagramCustomer(
-        account_id=account_id, ig_scoped_id=ig_scoped_id, username=username
-    )
-    db.add(customer)
-    db.commit()
-    db.refresh(customer)
+            return customer
+    if username and customer.username != username:
+        customer.username = username
+        db.commit()
+        db.refresh(customer)
     return customer
 
 
@@ -224,7 +238,22 @@ def get_or_create_conversation(
 
     context = InstagramConversationContext(customer_id=customer_id)
     db.add(context)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # Lost a concurrent insert race (two DM tasks for the same new
+        # customer both missed the SELECT above — observed live as
+        # UniqueViolation on instagram_conversation_contexts_customer_id_key);
+        # fall back to the winner's row (#86).
+        db.rollback()
+        context = (
+            db.query(InstagramConversationContext)
+            .filter(InstagramConversationContext.customer_id == customer_id)
+            .first()
+        )
+        if context is None:
+            raise
+        return context
     db.refresh(context)
     return context
 

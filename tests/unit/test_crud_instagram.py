@@ -251,6 +251,69 @@ def test_get_or_create_conversation_returns_existing(db_session, account):
     assert db_session.query(InstagramConversationContext).count() == 1
 
 
+def _miss_first_select(db_session, model, monkeypatch):
+    """Force get_or_create past its initial SELECT so the test exercises the
+    concurrent-INSERT fallback against a pre-existing row (#86)."""
+    real_query = db_session.query
+    missed = False
+
+    class _MissFirstFilter:
+        def __init__(self, real):
+            self._real = real
+
+        def first(self):
+            nonlocal missed
+            if not missed:
+                missed = True
+                return None
+            return self._real.first()
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    class _MissFirstQuery:
+        def __init__(self, real):
+            self._real = real
+
+        def filter(self, *args, **kwargs):
+            return _MissFirstFilter(self._real.filter(*args, **kwargs))
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    def query_spy(*args, **kwargs):
+        query = real_query(*args, **kwargs)
+        if args and args[0] is model:
+            return _MissFirstQuery(query)
+        return query
+
+    monkeypatch.setattr(db_session, "query", query_spy)
+
+
+def test_get_or_create_customer_survives_concurrent_insert(db_session, account, monkeypatch):
+    winner = crud_instagram.get_or_create_customer(db_session, account.id, "igsid_1")
+    _miss_first_select(db_session, InstagramCustomer, monkeypatch)
+
+    customer = crud_instagram.get_or_create_customer(
+        db_session, account.id, "igsid_1", username="late_name"
+    )
+
+    assert customer.id == winner.id
+    assert customer.username == "late_name"
+    assert db_session.query(InstagramCustomer).count() == 1
+
+
+def test_get_or_create_conversation_survives_concurrent_insert(db_session, account, monkeypatch):
+    customer = crud_instagram.get_or_create_customer(db_session, account.id, "igsid_1")
+    winner = crud_instagram.get_or_create_conversation(db_session, customer.id)
+    _miss_first_select(db_session, InstagramConversationContext, monkeypatch)
+
+    context = crud_instagram.get_or_create_conversation(db_session, customer.id)
+
+    assert context.id == winner.id
+    assert db_session.query(InstagramConversationContext).count() == 1
+
+
 def test_dm_already_processed(db_session, account):
     customer = crud_instagram.get_or_create_customer(db_session, account.id, "igsid_1")
     assert crud_instagram.dm_already_processed(db_session, "mid_1") is False
