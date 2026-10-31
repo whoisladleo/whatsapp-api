@@ -1,6 +1,6 @@
 import uuid
 from pydantic import BaseModel
-from typing import Optional
+from typing import Any, Optional
 from datetime import datetime
 
 
@@ -20,6 +20,7 @@ class InstagramMessageRead(BaseModel):
     ig_message_id: Optional[str]
     direction: str
     body: Optional[str]
+    attachments: Optional[Any] = None
     created_at: datetime
 
     class Config:

@@ -250,3 +250,32 @@ def test_merchant_lock_renders_for_update_on_postgres_only():
 
     assert "FOR UPDATE" in pg_sql
     assert "FOR UPDATE" not in sqlite_sql
+
+
+def test_crud_message_create_message_stores_attachments(db_session):
+    user = User(username="255700000703")
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+    account = WhatsAppAccount(
+        name="Shop", phone_number_id="MISC_PH3", access_token="tok", user_id=user.id
+    )
+    db_session.add(account)
+    db_session.commit()
+    db_session.refresh(account)
+
+    stored = crud_message.create_message(
+        db_session,
+        {
+            "whatsapp_message_id": "wamid.att1",
+            "from_phone": "255711111111",
+            "type": "image",
+            "body": "",
+            "direction": "inbound",
+            "attachments": [{"type": "image", "media_id": "MEDIA-1"}],
+        },
+        account.id,
+    )
+
+    assert stored.attachments == [{"type": "image", "media_id": "MEDIA-1"}]
+    assert stored.body == ""

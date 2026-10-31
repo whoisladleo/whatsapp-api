@@ -46,6 +46,26 @@ class InstagramWebhookParser:
         return parsed_comments
 
     @staticmethod
+    def parse_attachments(message: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Normalizes Meta's IG `message.attachments` (forwards, shares,
+        photos, stickers — none of which carry `text`) into the shared
+        attachment shape (app/core/attachments.py). Unknown entries are
+        kept with their raw type so they still render as *something*.
+        """
+        normalized = []
+        for attachment in message.get("attachments", []) or []:
+            payload = attachment.get("payload", {}) or {}
+            kind = attachment.get("type", "file")
+            if kind == "image" and payload.get("sticker_id") and not payload.get("url"):
+                kind = "sticker"
+            entry: Dict[str, Any] = {"type": kind}
+            if payload.get("url"):
+                entry["url"] = payload["url"]
+            normalized.append(entry)
+        return normalized
+
+    @staticmethod
     def parse_inbound_messages(data: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
         Parses Meta's Instagram webhook JSON for DM events — a different
@@ -69,13 +89,15 @@ class InstagramWebhookParser:
                 if not sender_id or sender_id == ig_business_id:
                     continue
 
-                parsed_messages.append(
-                    {
-                        "ig_business_id": ig_business_id,
-                        "sender_id": sender_id,
-                        "ig_message_id": message.get("mid"),
-                        "body": message.get("text", ""),
-                    }
-                )
+                item = {
+                    "ig_business_id": ig_business_id,
+                    "sender_id": sender_id,
+                    "ig_message_id": message.get("mid"),
+                    "body": message.get("text", ""),
+                }
+                attachments = InstagramWebhookParser.parse_attachments(message)
+                if attachments:
+                    item["attachments"] = attachments
+                parsed_messages.append(item)
 
         return parsed_messages

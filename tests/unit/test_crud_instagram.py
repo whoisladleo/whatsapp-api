@@ -463,3 +463,21 @@ def test_resume_conversation_raises_if_not_in_handoff(db_session, account):
 
     with pytest.raises(crud_instagram.ConversationNotInHandoffError):
         crud_instagram.resume_conversation(db_session, customer.id)
+
+
+def test_create_direct_message_stores_attachments(db_session, account):
+    customer = crud_instagram.get_or_create_customer(db_session, account.id, "igsid_1")
+
+    dm = crud_instagram.create_direct_message(
+        db_session,
+        account.id,
+        customer.id,
+        "inbound",
+        "",
+        ig_message_id="mid_att1",
+        attachments=[{"type": "share", "url": "https://ig.example/p/1"}],
+    )
+
+    assert dm.attachments == [{"type": "share", "url": "https://ig.example/p/1"}]
+    history = crud_instagram.get_dm_history(db_session, customer.id)
+    assert history[0].attachments == [{"type": "share", "url": "https://ig.example/p/1"}]

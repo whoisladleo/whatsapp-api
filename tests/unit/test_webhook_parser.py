@@ -75,7 +75,7 @@ def test_parses_interactive_button_reply():
     assert parsed[0]["body"] == "Option One"
 
 
-def test_parses_media_message_id_by_type():
+def test_parses_media_message_into_attachments_not_body():
     for msg_type in ["image", "document", "audio", "video"]:
         message = {
             "from": "255711111111",
@@ -86,7 +86,60 @@ def test_parses_media_message_id_by_type():
         parsed = WebhookParser.parse_inbound(_envelope(_base_value(messages=[message])))
 
         assert parsed[0]["type"] == msg_type
-        assert parsed[0]["body"] == f"MEDIA-{msg_type}"
+        assert parsed[0]["body"] == ""
+        assert parsed[0]["attachments"] == [
+            {"type": msg_type, "media_id": f"MEDIA-{msg_type}", "mime_type": "application/octet-stream"}
+        ]
+
+
+def test_parses_media_caption_as_body():
+    message = {
+        "from": "255711111111",
+        "id": "wamid.imgcap1",
+        "type": "image",
+        "image": {"id": "MEDIA-1", "mime_type": "image/jpeg", "caption": "How much for this?"},
+    }
+    parsed = WebhookParser.parse_inbound(_envelope(_base_value(messages=[message])))
+
+    assert parsed[0]["body"] == "How much for this?"
+    assert parsed[0]["attachments"] == [
+        {"type": "image", "media_id": "MEDIA-1", "mime_type": "image/jpeg"}
+    ]
+
+
+def test_parses_sticker_and_contacts_as_attachments():
+    sticker = {
+        "from": "255711111111",
+        "id": "wamid.sticker1",
+        "type": "sticker",
+        "sticker": {"id": "STICKER-1", "mime_type": "image/webp"},
+    }
+    contacts = {
+        "from": "255711111111",
+        "id": "wamid.contacts1",
+        "type": "contacts",
+        "contacts": [{"name": {"formatted_name": "Jane"}}],
+    }
+    parsed = WebhookParser.parse_inbound(
+        _envelope(_base_value(messages=[sticker, contacts]))
+    )
+
+    assert parsed[0]["body"] == ""
+    assert parsed[0]["attachments"] == [{"type": "sticker", "media_id": "STICKER-1"}]
+    assert parsed[1]["body"] == ""
+    assert parsed[1]["attachments"] == [{"type": "contacts"}]
+
+
+def test_text_messages_carry_no_attachments_key():
+    message = {
+        "from": "255711111111",
+        "id": "wamid.text2",
+        "type": "text",
+        "text": {"body": "hi"},
+    }
+    parsed = WebhookParser.parse_inbound(_envelope(_base_value(messages=[message])))
+
+    assert "attachments" not in parsed[0]
 
 
 def test_parses_status_update():

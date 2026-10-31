@@ -259,6 +259,7 @@ class Message(Base):
     type = Column(String, nullable=False)  # text, image, template, etc.
     body = Column(String, nullable=True)  # Message content or summary
     raw_data = Column(JSON, nullable=True)  # Full raw payload from Meta
+    attachments = Column(JSON, nullable=True)  # Normalized media (#87)
     direction = Column(String, nullable=False)  # inbound, outbound
     status = Column(String, default="sent")  # sent, delivered, read, failed
     account_id = Column(UUIDType, ForeignKey("whatsapp_accounts.id"))
@@ -368,6 +369,7 @@ class InstagramDirectMessage(Base):
     customer_id = Column(UUIDType, ForeignKey("instagram_customers.id"), nullable=False)
     direction = Column(String, nullable=False)  # inbound, outbound
     body = Column(String, nullable=True)
+    attachments = Column(JSON, nullable=True)  # Normalized media (#87)
     created_at = Column(DateTime, default=datetime.utcnow)
     # Only ever set on an inbound row, by process_inbound_dm's atomic claim
     # (app/tasks/instagram_dm_processing.py) before it does any

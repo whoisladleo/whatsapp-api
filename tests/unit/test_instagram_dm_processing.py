@@ -381,3 +381,29 @@ def test_undelivered_dm_reply_is_not_metered(db_session, account, customer, inbo
     task_module.process_inbound_dm(account.id, customer.id, inbound_dm.id)
 
     assert db_session.query(AmaraEvent).count() == 0
+
+
+def test_attachment_only_dm_reaches_llm_as_described_event(
+    db_session, account, customer, fake_llm_reply, monkeypatch
+):
+    fake_provider = _FakeProvider("ig-tok")
+    monkeypatch.setattr(task_module, "InstagramProvider", lambda access_token: fake_provider)
+    dm = InstagramDirectMessage(
+        account_id=account.id,
+        customer_id=customer.id,
+        direction="inbound",
+        body="",
+        ig_message_id="mid_share1",
+        attachments=[{"type": "share", "url": "https://ig.example/p/1"}],
+    )
+    db_session.add(dm)
+    db_session.commit()
+    db_session.refresh(dm)
+
+    result = task_module.process_inbound_dm(account.id, customer.id, dm.id)
+
+    assert result == "Processed."
+    assert (
+        fake_llm_reply.called_with["message_body"]
+        == "shared a post: https://ig.example/p/1"
+    )

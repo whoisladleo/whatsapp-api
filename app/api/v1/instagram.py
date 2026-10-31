@@ -193,6 +193,7 @@ async def handle_webhook(
             direction="inbound",
             body=item["body"],
             ig_message_id=item["ig_message_id"],
+            attachments=item.get("attachments"),
         )
 
         if account.ai_enabled:

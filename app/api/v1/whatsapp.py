@@ -11,6 +11,7 @@ from app.core.config import settings
 from app.core.provider import WhatsAppProvider
 from app.core.security import is_safe_external_url, verify_meta_signature
 import httpx
+from app.core.attachments import describe_attachments
 from app.core.webhook_parser import WebhookParser
 from app.crud import message as crud_message
 from app.tasks.webhook_processing import apply_async_or_rollback, process_inbound_message
@@ -158,11 +159,14 @@ async def handle_webhook(
             if (
                 item.get("direction") == "inbound"
                 and account_ai_enabled
-                and item.get("type") == "text"
+                and item.get("type") in ("text", "image", "video", "audio", "document", "sticker", "contacts")
             ):
+                # Media without a caption carries no text — describe the
+                # attachment so Amara acknowledges it instead of seeing "".
+                message_body = item.get("body") or describe_attachments(item.get("attachments"))
                 apply_async_or_rollback(
                     process_inbound_message,
-                    [str(account_id), item.get("from_phone"), item.get("body")],
+                    [str(account_id), item.get("from_phone"), message_body],
                     db, Message, stored.id,
                 )
             elif (
@@ -252,7 +256,19 @@ def get_message_history(
     account: WhatsAppAccount = Depends(get_whatsapp_account),
     db: Session = Depends(get_db),
 ):
-    return crud_message.get_messages_by_account(db, account.id, limit, customer_phone=phone)
+    messages = crud_message.get_messages_by_account(db, account.id, limit, customer_phone=phone)
+    # Pre-#87 rows stored only raw_data — derive the same normalized shape
+    # on read so old media renders instead of showing a bare media id.
+    for message in messages:
+        if message.attachments is None and isinstance(message.raw_data, dict):
+            derived = WebhookParser.extract_attachments(message.type, message.raw_data)
+            if derived:
+                message.attachments = derived
+                # Pre-#87 bodies for these types are always the bare media
+                # id — the attachment placeholder replaces them. Read-path
+                # only; nothing is committed.
+                message.body = ""
+    return messages
 
 
 @router.post("/messages/send")

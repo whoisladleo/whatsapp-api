@@ -188,3 +188,80 @@ def test_parses_multiple_dms_across_entries():
 
     assert [p["ig_message_id"] for p in parsed] == ["m1", "m2"]
     assert [p["ig_business_id"] for p in parsed] == ["ig_business_1", "ig_business_2"]
+
+
+def test_dm_parses_shared_post_attachments():
+    data = _dm_envelope(
+        "ig_business_1",
+        {
+            "sender": {"id": "igsid_1"},
+            "recipient": {"id": "ig_business_1"},
+            "message": {
+                "mid": "mid_share1",
+                "attachments": [
+                    {
+                        "type": "share",
+                        "payload": {"url": "https://www.instagram.com/p/ABC123/"},
+                    }
+                ],
+            },
+        },
+    )
+
+    parsed = InstagramWebhookParser.parse_inbound_messages(data)
+
+    assert parsed == [
+        {
+            "ig_business_id": "ig_business_1",
+            "sender_id": "igsid_1",
+            "ig_message_id": "mid_share1",
+            "body": "",
+            "attachments": [{"type": "share", "url": "https://www.instagram.com/p/ABC123/"}],
+        }
+    ]
+
+
+def test_dm_parses_photo_and_sticker_attachments():
+    data = _dm_envelope(
+        "ig_business_1",
+        {
+            "sender": {"id": "igsid_1"},
+            "recipient": {"id": "ig_business_1"},
+            "message": {
+                "mid": "mid_media1",
+                "attachments": [
+                    {
+                        "type": "image",
+                        "payload": {"url": "https://cdn.example/photo.jpg"},
+                    },
+                    {
+                        "type": "image",
+                        "payload": {"sticker_id": "12345"},
+                    },
+                ],
+            },
+        },
+    )
+
+    parsed = InstagramWebhookParser.parse_inbound_messages(data)
+
+    assert parsed[0]["body"] == ""
+    assert parsed[0]["attachments"] == [
+        {"type": "image", "url": "https://cdn.example/photo.jpg"},
+        {"type": "sticker"},
+    ]
+
+
+def test_dm_text_messages_carry_no_attachments_key():
+    data = _dm_envelope(
+        "ig_business_1",
+        {
+            "sender": {"id": "igsid_1"},
+            "recipient": {"id": "ig_business_1"},
+            "message": {"mid": "mid_2", "text": "hi"},
+        },
+    )
+
+    parsed = InstagramWebhookParser.parse_inbound_messages(data)
+
+    assert "attachments" not in parsed[0]

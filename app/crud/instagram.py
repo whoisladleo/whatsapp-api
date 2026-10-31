@@ -277,6 +277,7 @@ def create_direct_message(
     direction: str,
     body: Optional[str],
     ig_message_id: Optional[str] = None,
+    attachments: Optional[Any] = None,
 ) -> InstagramDirectMessage:
     message = InstagramDirectMessage(
         account_id=account_id,
@@ -284,6 +285,7 @@ def create_direct_message(
         direction=direction,
         body=body,
         ig_message_id=ig_message_id,
+        attachments=attachments,
     )
     db.add(message)
     db.commit()

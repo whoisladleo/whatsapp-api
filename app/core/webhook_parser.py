@@ -3,6 +3,33 @@ from typing import Any, Dict, List, Optional
 
 class WebhookParser:
     @staticmethod
+    def extract_attachments(msg_type: Optional[str], message: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Normalizes a WhatsApp media/sticker/contacts message into the shared
+        attachment shape (app/core/attachments.py). Also reused to hydrate
+        pre-#87 rows (which kept only raw_data) on read.
+        """
+        if msg_type in ("image", "document", "audio", "video"):
+            media = message.get(msg_type, {}) or {}
+            entry: Dict[str, Any] = {"type": msg_type}
+            if media.get("id"):
+                entry["media_id"] = media["id"]
+            if media.get("mime_type"):
+                entry["mime_type"] = media["mime_type"]
+            if media.get("filename"):
+                entry["filename"] = media["filename"]
+            return [entry]
+        if msg_type == "sticker":
+            media = message.get("sticker", {}) or {}
+            entry = {"type": "sticker"}
+            if media.get("id"):
+                entry["media_id"] = media["id"]
+            return [entry]
+        if msg_type == "contacts":
+            return [{"type": "contacts"}]
+        return []
+
+    @staticmethod
     def parse_inbound(data: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
         Parses Meta Webhook JSON into a list of simplified message objects.
@@ -23,6 +50,7 @@ class WebhookParser:
 
                     body = ""
                     location = None
+                    attachments = WebhookParser.extract_attachments(msg_type, message)
                     if msg_type == "text":
                         body = message.get("text", {}).get("body", "")
                     elif msg_type == "button":
@@ -34,7 +62,10 @@ class WebhookParser:
                             .get("title", "")
                         )
                     elif msg_type in ["image", "document", "audio", "video"]:
-                        body = message.get(msg_type, {}).get("id", "")
+                        # The media id used to land in body (noise for Amara
+                        # and the dashboard); the caption is the readable
+                        # part, the media itself lives in attachments (#87).
+                        body = message.get(msg_type, {}).get("caption", "")
                     elif msg_type == "location":
                         loc = message.get("location", {})
                         latitude = loc.get("latitude")
@@ -61,6 +92,8 @@ class WebhookParser:
                     }
                     if location is not None:
                         item["location"] = location
+                    if attachments:
+                        item["attachments"] = attachments
                     parsed_messages.append(item)
 
                 # Handle Status Updates (delivered, read, etc)

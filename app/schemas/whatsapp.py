@@ -1,6 +1,6 @@
 import uuid
 from pydantic import BaseModel, ConfigDict
-from typing import Optional, List
+from typing import Any, Optional, List
 from datetime import datetime
 
 
@@ -58,6 +58,7 @@ class MessageRead(BaseModel):
     to_phone: Optional[str]
     type: str
     body: Optional[str]
+    attachments: Optional[Any] = None
     direction: str
     status: str
     timestamp: datetime

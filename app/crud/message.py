@@ -31,6 +31,7 @@ def create_message(
         type=message_data.get("type", "text"),
         body=message_data.get("body"),
         raw_data=message_data.get("raw"),
+        attachments=message_data.get("attachments"),
         direction=message_data.get("direction"),
         status=message_data.get("status", "sent"),
         account_id=account_id,

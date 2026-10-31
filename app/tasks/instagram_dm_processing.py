@@ -1,6 +1,7 @@
 import logging
 from datetime import datetime
 
+from app.core.attachments import describe_attachments
 from app.core.celery_app import celery_app
 from app.core.ids import coerce_uuid
 from app.core.instagram_provider import InstagramProvider
@@ -83,12 +84,16 @@ async def _process(
     # the model prompt separates "recent conversation" from "customer just
     # sent" for readability, so exclude that final inbound row from history.
     history = [
-        {"direction": m.direction, "body": m.body}
+        {"direction": m.direction, "body": m.body or describe_attachments(m.attachments)}
         for m in history_rows
         if m.id != dm_row_uuid
     ]
     latest = next((m for m in history_rows if m.id == dm_row_uuid), None)
     message_body = latest.body if latest else ""
+    if not message_body and latest is not None:
+        # Forward/share/sticker with no text — Amara acknowledges the
+        # described event instead of seeing an empty message (#87).
+        message_body = describe_attachments(latest.attachments)
 
     try:
         reply_text = await llm_service.generate_dm_response(

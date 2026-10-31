@@ -7,6 +7,7 @@ import re
 import uuid
 from datetime import datetime, timedelta
 from typing import List, Optional
+from app.core.attachments import describe_attachments
 from app.core.config import settings
 from app.core.security import normalize_phone
 from sqlalchemy.orm import Session
@@ -1303,11 +1304,12 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
         
         chat_history_str = ""
         for m in history_msgs:
-            # Skip empty bodies
-            if not m.body:
+            text = m.body or describe_attachments(m.attachments)
+            # Skip bodies that are empty even after describing attachments
+            if not text:
                 continue
             sender = "Customer" if m.direction == "inbound" else "Amara"
-            chat_history_str += f"{sender}: {m.body}\n"
+            chat_history_str += f"{sender}: {text}\n"
 
         # 4. Build system instruction
         
