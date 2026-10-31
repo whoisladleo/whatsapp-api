@@ -1,3 +1,4 @@
+from app.schemas.common import UtcDateTime
 import uuid
 from pydantic import BaseModel, ConfigDict
 from typing import Optional
@@ -23,7 +24,7 @@ class KnowledgeBaseUpdate(BaseModel):
 class KnowledgeBaseInDB(KnowledgeBaseBase):
     id: uuid.UUID
     user_id: uuid.UUID
-    created_at: datetime
-    updated_at: datetime
+    created_at: UtcDateTime
+    updated_at: UtcDateTime
 
     model_config = ConfigDict(from_attributes=True)

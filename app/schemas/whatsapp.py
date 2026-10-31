@@ -1,3 +1,4 @@
+from app.schemas.common import UtcDateTime
 import uuid
 from pydantic import BaseModel, ConfigDict
 from typing import Any, Optional, List
@@ -61,14 +62,14 @@ class MessageRead(BaseModel):
     attachments: Optional[Any] = None
     direction: str
     status: str
-    timestamp: datetime
+    timestamp: UtcDateTime
 
     model_config = ConfigDict(from_attributes=True)
 
 
 class PendingHandoffRead(BaseModel):
     customer_phone: str
-    handoff_at: Optional[datetime] = None
+    handoff_at: Optional[UtcDateTime] = None
     last_message_body: Optional[str] = None
 
 
@@ -79,7 +80,7 @@ class MessageStats(BaseModel):
 
 class ConversationSummary(BaseModel):
     customer_phone: str
-    last_activity_at: Optional[datetime] = None
+    last_activity_at: Optional[UtcDateTime] = None
     last_message_body: Optional[str] = None
     last_message_direction: Optional[str] = None
     state: Optional[str] = None

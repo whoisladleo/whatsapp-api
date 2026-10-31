@@ -1,3 +1,4 @@
+from app.schemas.common import UtcDateTime
 import uuid
 from pydantic import BaseModel
 from typing import Any, Optional
@@ -9,7 +10,7 @@ class InstagramAccountRead(BaseModel):
     ig_business_id: str
     username: Optional[str] = None
     ai_enabled: bool
-    created_at: datetime
+    created_at: UtcDateTime
 
     class Config:
         from_attributes = True
@@ -21,7 +22,7 @@ class InstagramMessageRead(BaseModel):
     direction: str
     body: Optional[str]
     attachments: Optional[Any] = None
-    created_at: datetime
+    created_at: UtcDateTime
 
     class Config:
         from_attributes = True
@@ -35,7 +36,7 @@ class InstagramMessageSend(BaseModel):
 class InstagramConversationSummary(BaseModel):
     customer_id: uuid.UUID
     username: Optional[str] = None
-    last_activity_at: Optional[datetime] = None
+    last_activity_at: Optional[UtcDateTime] = None
     last_message_body: Optional[str] = None
     last_message_direction: Optional[str] = None
     state: Optional[str] = None
@@ -44,5 +45,5 @@ class InstagramConversationSummary(BaseModel):
 class InstagramPendingHandoffRead(BaseModel):
     customer_id: uuid.UUID
     username: Optional[str] = None
-    handoff_at: Optional[datetime] = None
+    handoff_at: Optional[UtcDateTime] = None
     last_message_body: Optional[str] = None

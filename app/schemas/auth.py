@@ -1,3 +1,4 @@
+from app.schemas.common import UtcDateTime
 import uuid
 from pydantic import BaseModel, ConfigDict, model_validator
 from typing import List, Optional
@@ -75,7 +76,7 @@ class MerchantListItem(BaseModel):
     phone_number: Optional[str] = None
     business_name: Optional[str] = None
     name: Optional[str] = None
-    created_at: Optional[datetime] = None
+    created_at: Optional[UtcDateTime] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -94,9 +95,9 @@ class MySubscriptionRead(BaseModel):
     # deny AI access identically (see subscription_access.is_merchant_allowed_ai).
     status: Optional[str] = None
     monthly_amount: Optional[float] = None
-    next_billing_at: Optional[datetime] = None
+    next_billing_at: Optional[UtcDateTime] = None
     retry_count: Optional[int] = None
-    past_due_since: Optional[datetime] = None
+    past_due_since: Optional[UtcDateTime] = None
 
 class PayNowRequest(BaseModel):
     # Only needed if no phone is already on file (User.username/phone_number)

@@ -1,3 +1,4 @@
+from app.schemas.common import UtcDateTime
 from datetime import datetime
 from typing import List, Optional
 
@@ -18,8 +19,8 @@ class ProductStats(BaseModel):
 
 
 class MerchantStats(BaseModel):
-    period_start: datetime
-    period_end: datetime
+    period_start: UtcDateTime
+    period_end: UtcDateTime
     replies: ReplyUsage
     buyers: int
     handoffs: int

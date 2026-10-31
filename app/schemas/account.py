@@ -1,3 +1,4 @@
+from app.schemas.common import UtcDateTime
 import uuid
 from pydantic import BaseModel
 from typing import Optional
@@ -34,7 +35,7 @@ class AccountUpdate(BaseModel):
 class AccountResponse(AccountBase):
     id: uuid.UUID
     user_id: uuid.UUID
-    created_at: datetime
+    created_at: UtcDateTime
     # We omit access_token from response for security
 
     class Config:
@@ -59,7 +60,7 @@ class AccountMetaStatus(BaseModel):
     # "display name needs approval"), so this is the only reliable signal.
     recent_send_failures: int = 0
     last_send_failure_reason: Optional[str] = None
-    last_send_failure_at: Optional[datetime] = None
+    last_send_failure_at: Optional[UtcDateTime] = None
 
 
 class NumberSubscriptionResponse(BaseModel):
@@ -68,9 +69,9 @@ class NumberSubscriptionResponse(BaseModel):
     id: uuid.UUID
     status: str
     monthly_amount: float
-    next_billing_at: Optional[datetime] = None
+    next_billing_at: Optional[UtcDateTime] = None
     retry_count: int
-    created_at: datetime
+    created_at: UtcDateTime
 
     class Config:
         from_attributes = True

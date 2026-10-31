@@ -1,3 +1,4 @@
+from app.schemas.common import UtcDateTime
 import uuid
 from pydantic import BaseModel, Field
 from typing import Optional
@@ -78,7 +79,7 @@ class ProductResponse(ProductBase):
     id: uuid.UUID
     slug: str
     merchant_id: uuid.UUID
-    created_at: datetime
+    created_at: UtcDateTime
     # Shop-import drafts (#74) — the dashboard badges these until a valid
     # save auto-completes them. Deliberately absent from ProductCreate /
     # ProductUpdate: merchants can neither create drafts directly nor flip

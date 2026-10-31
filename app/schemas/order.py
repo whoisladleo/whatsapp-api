@@ -1,3 +1,4 @@
+from app.schemas.common import UtcDateTime
 import uuid
 from pydantic import BaseModel
 from typing import Optional, List
@@ -8,7 +9,7 @@ from app.db.models import OrderStatus, PaymentType, InstallmentStatus, ProductSu
 class InstallmentRead(BaseModel):
     id: uuid.UUID
     amount_due: float
-    due_date: datetime
+    due_date: UtcDateTime
     status: InstallmentStatus
 
     class Config:
@@ -26,15 +27,15 @@ class OrderRead(BaseModel):
     channel: str = "whatsapp"
     product_name: Optional[str] = None
     customer_phone: Optional[str] = None
-    reserved_until: Optional[datetime] = None
-    created_at: datetime
+    reserved_until: Optional[UtcDateTime] = None
+    created_at: UtcDateTime
     # Present only when Order.product.is_subscription — see
     # app/services/product_subscription.py. This is the merchant-visibility
     # surface for recurring billing: a merchant sees a subscription go
     # PAST_DUE/CANCELLED here even without a WhatsApp account to receive
     # the best-effort push alert on.
     subscription_status: Optional[ProductSubscriptionStatus] = None
-    subscription_next_billing_at: Optional[datetime] = None
+    subscription_next_billing_at: Optional[UtcDateTime] = None
     subscription_retry_count: Optional[int] = None
 
 
