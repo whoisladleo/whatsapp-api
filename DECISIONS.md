@@ -176,3 +176,14 @@ Production-tier decisions only — what was chosen, what was considered and reje
 - *Dedicated "paused/upgrade" template at first block.* Deferred, not rejected: needs Meta approval; the reused 100% usage warning carries plan name/limit context for v1.
 - *Proration / auto-cancel-old on plan switch.* Rejected for v1: paying for a second plan while one is ACTIVE just stacks (highest limit wins); an admin cancels the old one. No silent money movement.
 - *Structured-output/JSON mode for generation.* Rejected: the provider interface is plain text completion; a strict fence-stripping parser plus per-item sanitization (name required, prices clamped ≥ 0, inverted min/max collapsed) is enough, and failures 502 without writing anything.
+
+## Sim close-flow guards (2026-10-31, #101)
+
+**Chose:** `_reclose_guard_note` in both close paths — any PENDING order for the same customer+product+channel blocks a re-close with an "already on its way" reminder (anchored to the pending order's price), and an ACTIVE subscription blocks a paid re-close with "already active". Guard runs before the stock claim, so a re-close neither reserves nor dispatches. `_dispatch_payment` skips the delivery/location ask for subscriptions (nothing to deliver); physical goods keep it on both channels. Empty model content retries once inline, then hands off with the standard holding reply (handoff keeps the holding promise true). Adjacent fix in the same function: the Tunzaa-failure path no longer "restores" stock on subscriptions (was minting phantom units) and is None-safe.
+
+**Considered and rejected:**
+- *Cancel-and-recreate on re-close.* Rejected: no verified Tunzaa cancel for an issued push; the abandoned prompt is still approvable, so pointing the buyer back at it is correct and simpler.
+- *Block only unexpired holds.* Rejected: errs toward double charges; expired PENDING rows self-heal via auto-cancel, and blocking them just delays the retry by minutes.
+- *Silent drop or no-handoff holding line on empty content.* Rejected: silence killed 5/32 sim convos, and the holding text promises a human follow-up — sending it without handing off makes a false promise.
+- *Fix-4 (truncated-marker strip).* Dropped as phantom: zero occurrences of any truncation marker across all 32 transcripts; the report citation (H2_main t2) shows a clean reply. No code changed for it.
+- *Physical-goods delivery ask removal.* Rejected: the shop still needs a delivery location for physical items regardless of payment method; sim evidence was subscriptions-only.
