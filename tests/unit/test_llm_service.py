@@ -1459,27 +1459,69 @@ async def test_agreement_reminder_schedule_failure_does_not_break_order_creation
     assert db_session.query(Order).count() == 1
 
 
-async def test_agreement_ignored_on_platform_account(db_session, platform_account, merchant):
+@respx.mock
+async def test_agreement_on_platform_account_executes_close(db_session, platform_account, merchant):
+    """#100 reverses the pre-#89 contract this test used to assert: the
+    platform prompt emits AGREEMENT_REACHED for subscription closes, so
+    the server executes it (a live transcript showed a prospect's yes
+    producing nothing)."""
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "tok-1"}))
+    respx.post(PAYMENT_URL).mock(
+        return_value=httpx.Response(200, json={"statusCode": 202, "success": True, "transactionID": "MOCK_TXN_PLATFORM"})
+    )
     db_session.add(
-        Product(slug="platform-widget", name="Widget", max_price=100, min_price=50, quantity=5, merchant_id=merchant.id)
+        Product(slug="platform-plan", name="Plan", max_price=100, min_price=100, quantity=0, merchant_id=merchant.id, is_subscription=True)
     )
     db_session.commit()
 
     async def handler(**kwargs):
         return _FakeResponse(
-            "Sure! [AGREEMENT_REACHED: product=Widget price=75 payment=full]"
+            "Sure! [AGREEMENT_REACHED: product=Plan price=100 payment=full]"
         )
 
     service = _service_with_fake_client(handler=handler)
 
     result = await service.generate_response(
-        message_body="I'll take a widget",
+        message_body="Lets do this",
         from_phone="255711130008",
         db=db_session,
         account=platform_account,
     )
 
     assert "AGREEMENT_REACHED" not in result
+    order = db_session.query(Order).one()
+    assert order.status.value == "PENDING"
+    assert order.tunzaa_transaction_id == "MOCK_TXN_PLATFORM"
+
+
+async def test_agreement_still_suppressed_while_handed_off(db_session, platform_account, merchant):
+    """The half of the old gate that survives #100: handoff wins over a
+    close in the same conversation."""
+    db_session.add(
+        Product(slug="platform-plan", name="Plan", max_price=100, min_price=100, quantity=0, merchant_id=merchant.id, is_subscription=True)
+    )
+    customer = Customer(phone_number="255711130009")
+    db_session.add(customer)
+    db_session.commit()
+    db_session.refresh(customer)
+    db_session.add(ConversationContext(customer_id=customer.id, state=ConversationState.HUMAN_HANDOFF))
+    db_session.commit()
+
+    async def handler(**kwargs):
+        return _FakeResponse(
+            "Sure! [AGREEMENT_REACHED: product=Plan price=100 payment=full]"
+        )
+
+    service = _service_with_fake_client(handler=handler)
+
+    result = await service.generate_response(
+        message_body="Lets do this",
+        from_phone="255711130009",
+        db=db_session,
+        account=platform_account,
+    )
+
+    assert result is None
     assert db_session.query(Order).count() == 0
 
 
