@@ -129,6 +129,7 @@ async def handle_webhook(
         account_id = account.id
         account_ai_enabled = account.ai_enabled
         account_callback_url = account.callback_url
+        account_is_platform = account.is_platform_account
 
         # 1. Update status, or create the inbound message (deduping Meta
         # retries of a delivery we've already processed — skip re-creating
@@ -173,12 +174,20 @@ async def handle_webhook(
             elif (
                 item.get("direction") == "inbound"
                 and item.get("type") == "interactive"
+                and (item.get("interactive_id") or item.get("body"))
                 and (
-                    normalize_button_id(item.get("interactive_id"), item.get("body")) or ""
-                ).startswith("handoff_")
+                    account_is_platform
+                    or (
+                        normalize_button_id(item.get("interactive_id"), item.get("body")) or ""
+                    ).startswith("handoff_")
+                )
             ):
                 # Handoff template button tap — not gated on ai_enabled,
                 # merchant tooling stays live even when AI replies are off.
+                # Every platform-chat tap dispatches (even unrecognized
+                # ones — handle_button answers those loudly) so a payload
+                # shape Meta drifts never strands a merchant in silence
+                # again (#96). Business-number taps still need a handoff id.
                 apply_async_or_rollback(
                     process_inbound_message,
                     [

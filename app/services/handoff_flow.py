@@ -53,6 +53,13 @@ def normalize_button_id(button_id: str | None, title: str | None) -> str | None:
         return BUTTON_TITLES[button_id]
     if title and title.strip() in BUTTON_TITLES:
         return BUTTON_TITLES[title.strip()]
+    # Title drift (case/extra spaces from a re-created template) must not
+    # silently drop a merchant's tap — match case-insensitively (#96).
+    folded = {key.casefold(): value for key, value in BUTTON_TITLES.items()}
+    if button_id and button_id.strip().casefold() in folded:
+        return folded[button_id.strip().casefold()]
+    if title and title.strip().casefold() in folded:
+        return folded[title.strip().casefold()]
     return button_id
 
 REPLY_MODE_TTL_SECONDS = 900  # 15 minutes to send the message
@@ -68,9 +75,20 @@ def _mode_key(merchant_id: uuid.UUID) -> str:
 
 
 def resolve_merchant(db: Session, from_phone: str) -> User | None:
-    """The tap/reply sender, by the same username match the platform
-    onboarding flow uses — strangers resolve to None and stay silent."""
-    return db.query(User).filter(User.username == normalize_phone(from_phone)).first()
+    """The tap/reply sender — strangers resolve to None and stay silent.
+    Compares normalized-to-normalized, the same as the is_merchant check
+    in webhook_processing: a username stored pre-normalization ("0712…",
+    "+255…") must still match, or taps die silent while texts work (#96).
+    The scan only runs when the indexed lookup misses, and taps are
+    merchant-rare, so the fallback costs nothing in practice."""
+    needle = normalize_phone(from_phone)
+    user = db.query(User).filter(User.username == needle).first()
+    if user is not None:
+        return user
+    for candidate_id, username in db.query(User.id, User.username).all():
+        if username and normalize_phone(username) == needle:
+            return db.get(User, candidate_id)
+    return None
 
 
 def remember_alert(alert_wamid: str, target: dict) -> None:
@@ -281,7 +299,11 @@ async def handle_button(
         if target is None:
             return note
         return _takeover(db, merchant, target, note)
-    return None
+    # A resolved merchant tapping *something* on the platform chat is never
+    # a stranger — staying silent strands them with no relay and no hint
+    # (#96). Strangers (merchant None) still get silence above.
+    logger.warning("Unrecognized handoff tap id=%r from merchant %s", button_id, merchant.id)
+    return "That tap didn't come through — reply with /reply instead."
 
 
 def _takeover(db: Session, merchant: User, target: dict, note: str) -> str:

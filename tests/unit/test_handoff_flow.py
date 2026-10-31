@@ -228,9 +228,32 @@ async def test_reply_button_with_no_pending(db_session, merchant):
     )
 
 
-async def test_reply_button_unknown_sender_or_button_stays_silent(db_session, merchant):
+async def test_reply_button_unknown_sender_stays_silent(db_session, merchant):
     assert await handle_button(db_session, None, BUTTON_REPLY, None) is None
-    assert await handle_button(db_session, merchant, "not_a_handoff_button", None) is None
+
+
+async def test_unknown_button_from_merchant_answers_loudly(db_session, merchant):
+    # A resolved merchant tapping something unrecognized is never a
+    # stranger — silence would strand them with no relay and no hint (#96).
+    reply = await handle_button(db_session, merchant, "not_a_handoff_button", None)
+
+    assert reply == "That tap didn't come through — reply with /reply instead."
+
+
+def test_resolve_merchant_matches_pre_normalization_username(db_session):
+    user = User(username="0700000099")
+    db_session.add(user)
+    db_session.commit()
+
+    assert resolve_merchant(db_session, "255700000099").id == user.id
+    assert resolve_merchant(db_session, "255799999999") is None
+
+
+def test_normalize_button_id_matches_titles_case_insensitively():
+    from app.services.handoff_flow import BUTTON_REPLY, normalize_button_id
+
+    assert normalize_button_id("0", "reply") == BUTTON_REPLY
+    assert normalize_button_id("  REPLY  ", None) == BUTTON_REPLY
 
 
 async def test_reply_button_resolves_exact_alert_via_context(

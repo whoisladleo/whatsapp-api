@@ -880,9 +880,12 @@ def test_handoff_reply_tap_arms_reply_mode_and_confirms(
 
 
 @respx.mock
-def test_non_handoff_button_tap_is_stored_but_not_dispatched(
+def test_unknown_platform_tap_answers_loudly_instead_of_silence(
     client, db_session, merchant_owner
 ):
+    # A tap Meta drifted (unknown id/title) on the platform chat used to
+    # die at the gate with zero feedback; now the merchant gets a hint
+    # pointing at /reply (#96).
     platform = WhatsAppAccount(
         name="Taskflow",
         phone_number_id="PHONE_PLATFORM2",
@@ -931,8 +934,66 @@ def test_non_handoff_button_tap_is_stored_but_not_dispatched(
     resp = client.post(WEBHOOK_URL, json=payload)
 
     assert resp.status_code == 200
+    assert send_route.called
+    outbound = db_session.query(Message).filter(Message.direction == "outbound").first()
+    assert "That tap didn't come through" in outbound.body
+
+
+@respx.mock
+def test_unknown_business_number_tap_still_dropped(
+    client, db_session, merchant_owner
+):
+    # Loud fallback is platform-chat-only: a random tap on a business
+    # number keeps the old stored-but-silent behavior.
+    business = WhatsAppAccount(
+        name="Shop",
+        phone_number_id="PHONE_BIZTAP",
+        access_token="tok",
+        ai_enabled=True,
+        user_id=merchant_owner.id,
+    )
+    db_session.add(business)
+    db_session.commit()
+
+    send_route = respx.post(url__regex=MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "wamid.y"}]})
+    )
+
+    message = {
+        "from": merchant_owner.username,
+        "id": "wamid.tap9",
+        "timestamp": "1700000000",
+        "type": "interactive",
+        "interactive": {
+            "type": "button_reply",
+            "button_reply": {"id": "some_other_flow", "title": "Something else"},
+        },
+    }
+    payload = {
+        "entry": [
+            {
+                "id": "entry1",
+                "changes": [
+                    {
+                        "value": {
+                            "messaging_product": "whatsapp",
+                            "metadata": {
+                                "display_phone_number": "255700000000",
+                                "phone_number_id": "PHONE_BIZTAP",
+                            },
+                            "messages": [message],
+                        },
+                        "field": "messages",
+                    }
+                ],
+            }
+        ]
+    }
+    resp = client.post(WEBHOOK_URL, json=payload)
+
+    assert resp.status_code == 200
     assert not send_route.called
-    stored = db_session.query(Message).filter(Message.whatsapp_message_id == "wamid.tap1").first()
+    stored = db_session.query(Message).filter(Message.whatsapp_message_id == "wamid.tap9").first()
     assert stored is not None
 
 
