@@ -2,7 +2,7 @@
 
 ## Coolify auto-deploy pipeline (2026-10-31, #85)
 
-**Chose:** push to master runs Tests; `docker-publish.yml` triggers on Tests completion (master, success only) and builds the exact tested SHA, so broken commits never publish. After pushing, CI POSTs the Coolify deploy webhooks for the API + worker image resources (URLs + token in GitHub secrets). Dashboard (Git-sourced) gets lint+build CI as signal only — Coolify Git auto-deploy fires on push and can't wait for CI. Rollback stays manual (Coolify redeploy previous).
+**Chose:** push to master runs Tests; `docker-publish.yml` triggers on Tests completion (master, success only) and builds the exact tested SHA, so broken commits never publish. After pushing, CI POSTs the Coolify deploy webhooks for the API + worker image resources (URLs + token in GitHub secrets). Dashboard (hosted on Cloudflare Pages, Git-connected) gets lint+build CI as signal only — Pages deploys on push and can't wait for CI. Rollback stays manual (Coolify redeploy previous / Pages rollback).
 
 **Considered and rejected:**
 - *Ungated publish (previous shape).* Rejected: tests and publish raced; red commits shipped images.
