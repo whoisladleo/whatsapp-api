@@ -898,7 +898,36 @@ def test_non_handoff_button_tap_is_stored_but_not_dispatched(
         return_value=httpx.Response(200, json={"messages": [{"id": "wamid.x"}]})
     )
 
-    payload = _button_tap_payload("PHONE_PLATFORM2", merchant_owner.username, "some_other_flow")
+    message = {
+        "from": merchant_owner.username,
+        "id": "wamid.tap1",
+        "timestamp": "1700000000",
+        "type": "interactive",
+        "interactive": {
+            "type": "button_reply",
+            "button_reply": {"id": "some_other_flow", "title": "Something else"},
+        },
+    }
+    payload = {
+        "entry": [
+            {
+                "id": "entry1",
+                "changes": [
+                    {
+                        "value": {
+                            "messaging_product": "whatsapp",
+                            "metadata": {
+                                "display_phone_number": "255700000000",
+                                "phone_number_id": "PHONE_PLATFORM2",
+                            },
+                            "messages": [message],
+                        },
+                        "field": "messages",
+                    }
+                ],
+            }
+        ]
+    }
     resp = client.post(WEBHOOK_URL, json=payload)
 
     assert resp.status_code == 200

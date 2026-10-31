@@ -34,6 +34,11 @@ BUTTON_DONE = "handoff_done"
 BUTTON_TAKEOVER = "handoff_takeover"
 
 BUTTON_TITLES = {
+    # Plain texts as created in WhatsApp Manager (no custom payloads there).
+    "Reply": BUTTON_REPLY,
+    "Done": BUTTON_DONE,
+    "Amara, take over.": BUTTON_TAKEOVER,
+    # Emoji variants, accepted as aliases.
     "✏️ Reply": BUTTON_REPLY,
     "✅ Done": BUTTON_DONE,
     "🤖 Amara, take over": BUTTON_TAKEOVER,

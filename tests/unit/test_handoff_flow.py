@@ -387,8 +387,9 @@ def test_normalize_button_id_accepts_payload_or_title():
     from app.services.handoff_flow import normalize_button_id
 
     assert normalize_button_id("handoff_reply", "Reply") == "handoff_reply"
+    assert normalize_button_id("Reply", "Reply") == "handoff_reply"
     assert normalize_button_id("✏️ Reply", "✏️ Reply") == "handoff_reply"
-    assert normalize_button_id("weird-id", "✅ Done") == "handoff_done"
-    assert normalize_button_id("🤖 Amara, take over", None) == "handoff_takeover"
+    assert normalize_button_id("weird-id", "Done") == "handoff_done"
+    assert normalize_button_id("Amara, take over.", None) == "handoff_takeover"
     assert normalize_button_id("other", "Other") == "other"
     assert normalize_button_id(None, None) is None
