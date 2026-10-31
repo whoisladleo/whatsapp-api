@@ -1,5 +1,14 @@
 # Decisions
 
+## Coolify auto-deploy pipeline (2026-10-31, #85)
+
+**Chose:** push to master runs Tests; `docker-publish.yml` triggers on Tests completion (master, success only) and builds the exact tested SHA, so broken commits never publish. After pushing, CI POSTs the Coolify deploy webhooks for the API + worker image resources (URLs + token in GitHub secrets). Dashboard (Git-sourced) gets lint+build CI as signal only — Coolify Git auto-deploy fires on push and can't wait for CI. Rollback stays manual (Coolify redeploy previous).
+
+**Considered and rejected:**
+- *Ungated publish (previous shape).* Rejected: tests and publish raced; red commits shipped images.
+- *Gating dashboard deploys on CI.* Rejected: would need PR-flow or image-based dashboard; a broken dashboard page is low-stakes and Coolify rollback is one click.
+- *`force=true` rebuilds on every deploy.* Rejected: the webhook default reuses the cache and just pulls `:latest`; clean rebuilds stay a manual option.
+
 ## Audit fixes: money-state guards, dispatch rollback, lazy token refresh (2026-10-31, #77-#84)
 
 **Chose:** (1) Tunzaa FAILED/CANCELLED only acts from PENDING — never regresses PAID; a second COMPLETED with a new txn id records the cash event but skips state rewrite and re-notify; COMPLETED-after-FAILED re-claims stock first and stays FAILED (logged, txn recorded) when stock is gone. (2) All four webhook dispatches roll back the stored row when the queue call throws, so Meta's retry replays fully instead of no-op-ing on already-processed. (3) Channel-connect scope stripped to approved basic + manage_messages; OAuth builders fail fast naming the missing setting. (4) Lazy IG token refresh (no Beat in repo): webhooks dispatch a refresh task when the token is 50+ days old, task claims via conditional stamp, restores the stamp on API failure. (5) Webhooks fail closed without secrets unless explicit ALLOW_UNSIGNED_WEBHOOKS=true. (6) RUN_MODE=production is an ops setting, no code. (7) Blank OTP usernames 422 before lookup. Full suite 1046 passed.
