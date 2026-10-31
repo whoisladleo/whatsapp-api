@@ -359,7 +359,7 @@ async def test_double_close_last_unit_exactly_one_order(db_session, shop_account
     shoes.quantity = 1
     db_session.commit()
 
-    async def fake_dispatch(self, db, order, product, phone, payment_type):
+    async def fake_dispatch(self, db, order, product, phone, payment_type, language=None):
         return "payment note"
 
     monkeypatch.setattr(LLMService, "_dispatch_payment", fake_dispatch)

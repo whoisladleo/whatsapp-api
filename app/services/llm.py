@@ -262,6 +262,57 @@ def _holding_reply(language: Optional[str]) -> str:
     return f"{_HOLDING_REPLIES['sw']}\n\n{_HOLDING_REPLIES['en']}"
 
 
+def _lang_text(variants: dict, language: Optional[str]) -> str:
+    """
+    Picks the customer's language variant of a template note; both
+    stacked (Swahili first) when the language isn't known — the same
+    fallback _holding_reply/_outage_reply use. Instagram never
+    classifies Customer.language, so IG notes are bilingual.
+    """
+    if language in variants:
+        return variants[language]
+    return f"{variants['sw']}\n\n{variants['en']}"
+
+
+_PAYMENT_REQUEST_LINES = {
+    "sw": "Ombi la malipo la TZS {price} limetumwa kwenye simu yako — tafadhali liidhinishe ili kukamilisha oda yako.",
+    "en": "A payment request for TZS {price} has been sent to your phone — please approve it to complete your order.",
+}
+
+_INSTALLMENT_LINES = {
+    "sw": "Mpango wako wa malipo ya awamu umeundwa! Tutawasiliana nawe na maelezo ya malipo.",
+    "en": "Your installment plan has been created! We'll be in touch with payment details.",
+}
+
+# Base delivery ask, no joiner — the FULL and installment branches
+# prepend their own ("While you're at it…" / "Please also…").
+_LOCATION_NOTES = {
+    "instagram": {
+        "sw": "jibu hapa na anwani yako ya kupelekewa ili tujue pa kukuletea",
+        "en": "reply here with your delivery address so we know where to deliver it",
+    },
+    "whatsapp": {
+        "sw": "shiriki eneo lako la kupelekewa kwa kutumia kipengele cha kushiriki eneo cha WhatsApp (ikoni ya 📎) ili tujue pa kukuletea",
+        "en": "share your delivery location using WhatsApp's location-sharing feature (the 📎 attach icon) so we know where to deliver it",
+    },
+}
+
+_DELIVERY_JOINERS = {
+    "full": {"sw": "Wakati huo huo, tafadhali", "en": "While you're at it, please"},
+    "installment": {"sw": "Tafadhali pia", "en": "Please also"},
+}
+
+_ALREADY_SENT_LINES = {
+    "sw": "Ombi la malipo la TZS {price} lishafika kwenye simu yako — tafadhali liidhinishe ili kukamilisha oda yako.",
+    "en": "A payment request for TZS {price} is already on its way to your phone — please approve it to complete your order.",
+}
+
+_ALREADY_ACTIVE_LINES = {
+    "sw": "Usajili wako wa {product} bado unaendelea — hakuna malipo mapya yanayohitajika.",
+    "en": "Your {product} subscription is already active — no new payment needed.",
+}
+
+
 async def _complete_with_empty_retry(provider, **kwargs) -> str:
     """
     One inline retry when the model returns empty content — a blank
@@ -276,7 +327,9 @@ async def _complete_with_empty_retry(provider, **kwargs) -> str:
     return text
 
 
-def _reclose_guard_note(db: Session, customer_id, product: Product, channel_filter) -> Optional[str]:
+def _reclose_guard_note(
+    db: Session, customer_id, product: Product, channel_filter, language: Optional[str] = None
+) -> Optional[str]:
     """
     Fail-closed guard against duplicate closes (#101): the model
     re-emits AGREEMENT_REACHED across turns (seen 3x in one sim
@@ -304,9 +357,8 @@ def _reclose_guard_note(db: Session, customer_id, product: Product, channel_filt
             customer_id,
             product.id,
         )
-        return (
-            f"A payment request for TZS {open_order.agreed_price:,.0f} is already on its way "
-            "to your phone — please approve it to complete your order."
+        return _lang_text(_ALREADY_SENT_LINES, language).format(
+            price=f"{open_order.agreed_price:,.0f}"
         )
     if product.is_subscription:
         active = (
@@ -325,7 +377,7 @@ def _reclose_guard_note(db: Session, customer_id, product: Product, channel_filt
                 customer_id,
                 product.id,
             )
-            return f"Your {product.name} subscription is already active — no new payment needed."
+            return _lang_text(_ALREADY_ACTIVE_LINES, language).format(product=product.name)
     return None
 
 
@@ -522,7 +574,9 @@ class LLMService:
 
         # Duplicate-close guard — before the stock claim, so a re-close
         # neither reserves a unit nor dispatches a second payment (#101).
-        reclose_note = _reclose_guard_note(db, customer.id, product, Order.account_id == account.id)
+        reclose_note = _reclose_guard_note(
+            db, customer.id, product, Order.account_id == account.id, customer.language
+        )
         if reclose_note:
             return reclose_note
 
@@ -562,7 +616,9 @@ class LLMService:
 
         self._schedule_reminders(order.id)
 
-        note = await self._dispatch_payment(db, order, product, normalized_from_phone, payment_type)
+        note = await self._dispatch_payment(
+            db, order, product, normalized_from_phone, payment_type, customer.language
+        )
         return note
 
     def _create_subscription_if_needed(
@@ -596,7 +652,8 @@ class LLMService:
         )
 
     async def _dispatch_payment(
-        self, db: Session, order: Order, product: Product, phone: str, payment_type: PaymentType
+        self, db: Session, order: Order, product: Product, phone: str, payment_type: PaymentType,
+        language: Optional[str] = None,
     ) -> str:
         from app.services.tunzaa import tunzaa_service
 
@@ -608,12 +665,22 @@ class LLMService:
         # use a feature we can't read would be actively misleading, so this
         # asks for a plain text address there instead. Subscriptions skip
         # the ask entirely — there is nothing to deliver (#101).
-        location_note = (
-            "reply here with your delivery address so we know where to deliver it."
-            if order.instagram_account_id
-            else "share your delivery location using WhatsApp's location-sharing feature (the 📎 "
-            "attach icon) so we know where to deliver it."
-        )
+        channel = "instagram" if order.instagram_account_id else "whatsapp"
+        price = f"{order.agreed_price:,.0f}"
+
+        def _with_delivery(line: str, joiner_key: str) -> str:
+            if product.is_subscription:
+                return line
+            joiner = _lang_text(_DELIVERY_JOINERS[joiner_key], language)
+            location = _lang_text(_LOCATION_NOTES[channel], language)
+            if language in ("sw", "en"):
+                return f"{line} {joiner} {location}."
+            # Unknown language: each half is already a sw/en stack, so
+            # join them per-language to keep the message readable.
+            sw_line, en_line = line.split("\n\n")
+            sw_loc, en_loc = location.split("\n\n")
+            sw_join, en_join = joiner.split("\n\n")
+            return f"{sw_line} {sw_join} {sw_loc}.\n\n{en_line} {en_join} {en_loc}."
 
         try:
             if payment_type == PaymentType.FULL:
@@ -622,13 +689,9 @@ class LLMService:
                 )
                 order.tunzaa_transaction_id = resp.get("transactionID")
                 db.commit()
-                note = (
-                    f"A payment request for TZS {order.agreed_price:,.0f} has been sent to your "
-                    "phone — please approve it to complete your order."
+                return _with_delivery(
+                    _lang_text(_PAYMENT_REQUEST_LINES, language).format(price=price), "full"
                 )
-                if not product.is_subscription:
-                    note += f" While you're at it, please {location_note}"
-                return note
             else:
                 resp = await tunzaa_service.create_installment_plan(order, product.name)
                 order.tunzaa_plan_id = str(resp.get("plan", {}).get("plan_id")) if resp.get("plan", {}).get("plan_id") else None
@@ -647,13 +710,9 @@ class LLMService:
                         )
                     )
                 db.commit()
-                note = (
-                    "Your installment plan has been created! We'll be in touch with payment "
-                    "details."
+                return _with_delivery(
+                    _lang_text(_INSTALLMENT_LINES, language), "installment"
                 )
-                if not product.is_subscription:
-                    note += f" Please also {location_note}"
-                return note
         except Exception as e:
             logger.error(f"Tunzaa dispatch failed for order {order.id}: {e}")
             # This order never got as far as an accepted payment attempt —
@@ -1182,7 +1241,9 @@ Match the customer's language (Swahili or English). Keep both lines to one sente
         )
 
         # Duplicate-close guard — same as _close_deal (#101).
-        reclose_note = _reclose_guard_note(db, customer.id, product, Order.instagram_account_id == account.id)
+        reclose_note = _reclose_guard_note(
+            db, customer.id, product, Order.instagram_account_id == account.id, customer.language
+        )
         if reclose_note:
             return reclose_note
 
@@ -1213,7 +1274,9 @@ Match the customer's language (Swahili or English). Keep both lines to one sente
 
         self._schedule_reminders(order.id)
 
-        return await self._dispatch_payment(db, order, product, normalized_phone, payment_type)
+        return await self._dispatch_payment(
+            db, order, product, normalized_phone, payment_type, customer.language
+        )
 
     async def generate_dm_response(
         self,
@@ -1294,7 +1357,7 @@ RULES:
 3. Closing: once the customer has clearly agreed on a specific product and price, ask whether they'd like to pay in full or in installments — unless the catalog marks that product "full payment only", in which case don't offer installments at all; if the customer asks for installments on such a product, tell them this one is full-payment only. Instagram doesn't give us their phone number automatically, so if you don't already have it from earlier in this conversation, ask for it too — explain it's needed to send the mobile-money payment request. Once you have a specific agreed price, a payment method choice, AND a phone number, confirm the deal and end your response with the exact marker [AGREEMENT_REACHED: product=<product name> price=<agreed price> payment=<full|installment> phone=<phone number>] (e.g. [AGREEMENT_REACHED: product=Shoes price=45000 payment=full phone=255700000000]). Only include this marker once all four are explicit — never guess or assume any of them.
 4. Payment: describe it accurately — a payment request gets sent directly to the given phone number for them to approve, not a menu of payment apps to choose from. Don't name specific mobile money providers.
 5. Human Handoff: if the customer is unreasonable, has complex questions you can't answer from the catalog/knowledge above, or explicitly asks for a human, include the exact marker [HUMAN_HANDOFF]. Don't include this for a normal close — that's handled by AGREEMENT_REACHED instead.
-6. Keep replies SHORT and natural, like a real Instagram DM — usually 1-3 sentences. Reply in the SAME language the customer just used — English message gets an English reply, Swahili gets Swahili. Never default to Swahili for an English message.
+6. Keep replies SHORT and natural, like a real Instagram DM — usually 1-3 sentences. Reply in the SAME language the customer just used — English message gets an English reply, Swahili gets Swahili. Never default to Swahili for an English message. Keep the entire reply in that one language — never mix Swahili and English within a single message.
 7. Currency: all prices are in Tanzanian Shillings (TZS) — always state them exactly as given, including the TZS label. Never say "$", "USD", "dollars", or imply any other currency, and never convert the number into another currency.
 8. Quoting: whenever you state a specific price for a product during negotiation but haven't closed the deal yet, end your response with the marker [QUOTE: product=<product name> price=<price>] (e.g. [QUOTE: product=Shoes price=45000]). Don't include this once you've emitted [AGREEMENT_REACHED] for the same deal.
 9. Out of stock: never offer, quote, or agree a price on a product the catalog marks OUT OF STOCK — if the customer asks about one, first say plainly, naming the product, that it is out of stock, then suggest an in-stock alternative from the catalog instead.
@@ -1538,7 +1601,7 @@ VOICE — this is you speaking as yourself, not a description of a product:
 - Short, WhatsApp-length messages. One idea per message, not paragraphs.
 - Lead with the benefit, not the mechanism. "I make sure you never miss a sale" beats "I use AI to process incoming messages."
 - Confident, warm, direct. No hedging, no disclaimers about being new or unfinished.
-- Reply in the SAME language the customer just used — English message gets an English reply, Swahili gets Swahili. Never switch languages mid-conversation unless they do first.
+- Reply in the SAME language the customer just used — English message gets an English reply, Swahili gets Swahili. Never switch languages mid-conversation unless they do first. Keep the entire reply in that one language — never mix Swahili and English within a single message.
 - If the customer corrects you — what to call them, which language, anything — adapt immediately and never repeat the corrected thing in the same reply.
 - Ask before you tell — a couple of discovery questions earn the right to pitch. Don't front-load everything in one message.
 - Never claim a specific number or result you don't actually have for THIS shop (no invented stats or "other shops saw X%"). Speak in outcomes instead ("I catch the messages you're currently losing").
@@ -1610,7 +1673,7 @@ RULES:
 
         base_instruction += """
 Current State:
-You are chatting with a customer. Be polite, persuasive, and use Swahili or English depending on their language.
+You are chatting with a customer. Be polite and persuasive. Reply in the SAME language the customer just used — English message gets an English reply, Swahili gets Swahili. Never switch languages mid-conversation unless they do first. Keep the entire reply in that one language — never mix Swahili and English within a single message.
 
 Reply Length: Keep replies SHORT and natural, like a real WhatsApp message from a person — usually 1-4 sentences. Do NOT write long, multi-section messages with several headers/bullet lists unless the customer explicitly asks for a full breakdown or detailed explanation.
 

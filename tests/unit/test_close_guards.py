@@ -148,8 +148,8 @@ def sub_product(db_session, merchant):
     return p
 
 
-def _wa_customer_and_context(db_session, phone):
-    customer = Customer(phone_number=phone)
+def _wa_customer_and_context(db_session, phone, language=None):
+    customer = Customer(phone_number=phone, language=language)
     db_session.add(customer)
     db_session.commit()
     db_session.refresh(customer)
@@ -158,6 +158,18 @@ def _wa_customer_and_context(db_session, phone):
     db_session.commit()
     db_session.refresh(context)
     return customer, context
+
+
+@pytest.fixture
+def guard_shoes(db_session, merchant):
+    p = Product(
+        slug="guard-shoes", name="Guard Shoes", max_price=50000, min_price=40000,
+        quantity=3, merchant_id=merchant.id,
+    )
+    db_session.add(p)
+    db_session.commit()
+    db_session.refresh(p)
+    return p
 
 
 # --- Fix 1: no delivery ask for subscriptions -------------------------------
@@ -366,3 +378,116 @@ async def test_wa_empty_twice_hands_off_with_holding(db_session, shop_account, s
     customer = db_session.query(Customer).filter_by(phone_number="255711190008").one()
     context = db_session.query(ConversationContext).filter_by(customer_id=customer.id).one()
     assert context.state == ConversationState.HUMAN_HANDOFF
+
+
+# --- Same-language template notes -------------------------------------------
+
+
+@respx.mock
+async def test_wa_close_note_swahili_for_sw_customer(db_session, shop_account, sub_product):
+    _mock_full_payment()
+    service, _ = _scripted_service(["deal"])
+    customer, context = _wa_customer_and_context(db_session, "255711190010", language="sw")
+
+    note = await service._close_deal(
+        db_session, shop_account, customer, "255711190010",
+        {"product_name": "Guard Plan", "price": 100000, "payment_type": "full"},
+        context,
+    )
+
+    assert "Ombi la malipo la TZS 100,000" in note
+    assert "A payment request" not in note
+
+
+@respx.mock
+async def test_wa_close_note_english_for_en_customer(db_session, shop_account, sub_product):
+    _mock_full_payment()
+    service, _ = _scripted_service(["deal"])
+    customer, context = _wa_customer_and_context(db_session, "255711190011", language="en")
+
+    note = await service._close_deal(
+        db_session, shop_account, customer, "255711190011",
+        {"product_name": "Guard Plan", "price": 100000, "payment_type": "full"},
+        context,
+    )
+
+    assert "A payment request for TZS 100,000 has been sent" in note
+    assert "Ombi la malipo" not in note
+
+
+@respx.mock
+async def test_wa_close_note_bilingual_when_language_unknown(db_session, shop_account, sub_product):
+    _mock_full_payment()
+    service, _ = _scripted_service(["deal"])
+    customer, context = _wa_customer_and_context(db_session, "255711190012")
+
+    note = await service._close_deal(
+        db_session, shop_account, customer, "255711190012",
+        {"product_name": "Guard Plan", "price": 100000, "payment_type": "full"},
+        context,
+    )
+
+    assert "Ombi la malipo la TZS 100,000" in note
+    assert "A payment request for TZS 100,000 has been sent" in note
+
+
+@respx.mock
+async def test_wa_physical_close_delivery_ask_follows_language(db_session, shop_account, guard_shoes):
+    _mock_full_payment()
+    service, _ = _scripted_service(["deal"])
+    customer, context = _wa_customer_and_context(db_session, "255711190013", language="sw")
+
+    note = await service._close_deal(
+        db_session, shop_account, customer, "255711190013",
+        {"product_name": "Guard Shoes", "price": 45000, "payment_type": "full"},
+        context,
+    )
+
+    assert "shiriki eneo lako" in note
+    assert "delivery address" not in note
+    assert "WhatsApp's location-sharing feature" not in note
+
+
+@respx.mock
+async def test_wa_reclose_guard_note_swahili_for_sw_customer(db_session, shop_account, sub_product):
+    _mock_full_payment()
+    service, _ = _scripted_service(["deal"])
+    customer, context = _wa_customer_and_context(db_session, "255711190014", language="sw")
+    agreement = {"product_name": "Guard Plan", "price": 100000, "payment_type": "full"}
+
+    await service._close_deal(db_session, shop_account, customer, "255711190014", agreement, context)
+    second = await service._close_deal(db_session, shop_account, customer, "255711190014", agreement, context)
+
+    assert "lishafika kwenye simu yako" in second
+    assert "already on its way" not in second
+
+
+@respx.mock
+async def test_ig_close_note_bilingual_when_language_unknown(
+    db_session, ig_account, ig_customer, sub_product
+):
+    # Instagram never classifies Customer.language, so IG notes stack both.
+    _mock_full_payment()
+    service, _ = _scripted_service(["deal"])
+
+    note = await service._close_instagram_deal(
+        db_session, ig_account, ig_customer,
+        {"product_name": "Guard Plan", "price": 100000, "payment_type": "full", "phone": "255711190015"},
+    )
+
+    assert "Ombi la malipo la TZS 100,000" in note
+    assert "A payment request for TZS 100,000 has been sent" in note
+
+
+async def test_wa_shop_prompt_has_same_language_rule(db_session, shop_account, guard_shoes):
+    service, calls = _scripted_service(["Sawa, bei ni TZS 45,000."])
+
+    await service.generate_response(
+        message_body="bei?",
+        from_phone="255711190016",
+        db=db_session,
+        account=shop_account,
+    )
+
+    assert "SAME language the customer just used" in calls[0]["system"]
+    assert "never mix Swahili and English within a single message" in calls[0]["system"]

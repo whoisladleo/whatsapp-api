@@ -187,3 +187,12 @@ Production-tier decisions only — what was chosen, what was considered and reje
 - *Silent drop or no-handoff holding line on empty content.* Rejected: silence killed 5/32 sim convos, and the holding text promises a human follow-up — sending it without handing off makes a false promise.
 - *Fix-4 (truncated-marker strip).* Dropped as phantom: zero occurrences of any truncation marker across all 32 transcripts; the report citation (H2_main t2) shows a clean reply. No code changed for it.
 - *Physical-goods delivery ask removal.* Rejected: the shop still needs a delivery location for physical items regardless of payment method; sim evidence was subscriptions-only.
+
+## Same-language close notes (2026-10-31)
+
+**Chose:** payment/dispatch/guard template notes are sw/en variants picked by `Customer.language` (WA classifies it; IG never does, so IG stacks both like `_holding_reply(None)`). English strings byte-identical to before. All three Amara prompts gain a no-mixing clause ("never mix Swahili and English within a single message"); the WA shop prompt's weak "use Swahili or English depending on their language" upgraded to the full same-language rule. Billing ruling encoded on the site, not in code: pay-today = live-today was already the behavior (first-payment webhook activates), so no subscription-timing change.
+
+**Considered and rejected:**
+- *Bilingual notes everywhere.* Rejected: doubles every payment message; language-aware with stacked fallback keeps known-language messages short.
+- *Per-message language detection for IG.* Rejected for v1: no detector exists; the stacked fallback is honest and matches existing holding/outage behavior.
+- *Handoff-fallback lines language-aware.* Deferred: bare-marker handoffs are rare and a human follows immediately; the holding/outage replies that accompany them are already language-aware.
