@@ -122,3 +122,14 @@ breaks #1 and #3. No founding-handover content (lock/refund/go-live terms) appea
 AB $0.058735 (42 turns) + CD $0.064955 (46) + EF $0.039344 (30) + GH $0.038951 (28). Rates
 $1.25/M in + $4.25/M out (public sources, NOT verified against Meta bill). ~10% of the $2
 matrix budget; harness errors: none (only known cosmetic `Event loop is closed` GC stderr noise).
+
+## 7. Reviewer caveats (added post-run, not part of the measured results)
+
+- Opener fidelity: the harness used same-spirit equivalents ("Habari! Naitwa Juma kutoka
+  Taskflow. ..." / "Hi! I'm Juma from Taskflow. ..."), NOT the verbatim O1/O2 spec texts
+  ("Habari! Nimeona duka lako..." / "Hi! Saw your shop..."). Buyer first reactions - and
+  hence close rates - are indicative, not literal. Re-run with verbatim openers possible.
+- Sim trees pre-date the #99 gender fix and #100 close fix, so sim behavior on those two
+  points reflects the OLD code (gendered address in transcripts is the pre-fix bug; closes
+  on `main` ignored platform accounts entirely).
+- Billing-at-payment vs go-live terms need a product ruling (see risk 3) before closes harden.
