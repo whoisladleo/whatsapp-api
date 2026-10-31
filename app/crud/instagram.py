@@ -188,6 +188,24 @@ def dm_already_processed(db: Session, ig_message_id: Optional[str]) -> bool:
     )
 
 
+def conversation_has_outbound_message(db: Session, customer_id: uuid.UUID) -> bool:
+    """
+    True once the shop side has sent anything in this DM thread — an Amara
+    reply, a dashboard send, or a saved hand-typed echo. The echo path in
+    handle_webhook reads this BEFORE saving the echo itself (which is also
+    outbound) to tell a hand-sent opener from a mid-chat takeover.
+    """
+    return (
+        db.query(InstagramDirectMessage)
+        .filter(
+            InstagramDirectMessage.customer_id == customer_id,
+            InstagramDirectMessage.direction == "outbound",
+        )
+        .first()
+        is not None
+    )
+
+
 def get_or_create_customer(
     db: Session, account_id: uuid.UUID, ig_scoped_id: str, username: Optional[str] = None
 ) -> InstagramCustomer:
@@ -380,6 +398,19 @@ def get_pending_handoffs_for_account(db: Session, account_id: uuid.UUID) -> List
             }
         )
     return results
+
+
+def set_human_handoff(db: Session, customer_id: uuid.UUID) -> None:
+    """
+    Puts the conversation in HUMAN_HANDOFF so Amara stays silent — the
+    merchant is typing in the thread themselves (see the echo path in
+    handle_webhook). Undone by resume_conversation (/resume). No merchant
+    alert: unlike llm.py's handoff triggers, the merchant is already here.
+    """
+    context = get_or_create_conversation(db, customer_id)
+    context.state = ConversationState.HUMAN_HANDOFF
+    context.handoff_at = datetime.utcnow()
+    db.commit()
 
 
 def resume_conversation(db: Session, customer_id: uuid.UUID) -> None:
