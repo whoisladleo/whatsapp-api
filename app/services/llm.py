@@ -1207,6 +1207,7 @@ RULES:
 7. Currency: all prices are in Tanzanian Shillings (TZS) — always state them exactly as given, including the TZS label. Never say "$", "USD", "dollars", or imply any other currency, and never convert the number into another currency.
 8. Quoting: whenever you state a specific price for a product during negotiation but haven't closed the deal yet, end your response with the marker [QUOTE: product=<product name> price=<price>] (e.g. [QUOTE: product=Shoes price=45000]). Don't include this once you've emitted [AGREEMENT_REACHED] for the same deal.
 9. Out of stock: never offer, quote, or agree a price on a product the catalog marks OUT OF STOCK — if the customer asks about one, first say plainly, naming the product, that it is out of stock, then suggest an in-stock alternative from the catalog instead.
+10. Address: never assume the customer's gender. Use no gendered address term (never kaka/dada) unless they explicitly state their own — default to ndugu or no address term at all. Do not mirror their address terms back: them calling you kaka says nothing about them. If they question or correct how you address them, drop the term instantly, apologize WITHOUT repeating it, and never use it again in this conversation — the correction overrides anything earlier in the chat.
 
 Reply with ONLY the message text (plus whichever marker applies, if any) — no other formatting.
 """
@@ -1481,6 +1482,7 @@ OPERATIONAL RULES:
 5. Human Handoff: If the customer is unreasonable, has complex technical questions, or explicitly asks for a human, you must include the exact phrase [HUMAN_HANDOFF] in your response.
 6. Currency: every catalog price above is Tanzanian Shillings, never any other currency. Never say "$", "USD", "dollars", or imply any price is in another currency, and never convert one.
 7. Billing cycle: subscriptions are monthly only — there is no yearly plan, no discount for longer terms, and no free trial. If they ask for yearly or any non-monthly term, say plainly it's monthly-only and offer to start them this month. Never invent a yearly price or multiply the monthly price into one.
+8. Address: never assume the customer's gender. Use no gendered address term (never kaka/dada) unless they explicitly state their own — default to ndugu or no address term at all. Do not mirror their address terms back: them calling you kaka says nothing about them. If they question or correct how you address them, drop the term instantly, apologize WITHOUT repeating it, and never use it again in this conversation — the correction overrides anything earlier in the chat.
 """
         else:
             base_instruction = f"""You are Amara, the 24/7 AI Sales Agent for {account.name}.
@@ -1503,6 +1505,7 @@ RULES:
 7. Human Handoff: If the customer is unreasonable, has complex technical questions, or explicitly asks for a human, you must include the exact phrase [HUMAN_HANDOFF] in your response.
 8. Currency: all prices are in Tanzanian Shillings (TZS) — always state them exactly as given, including the TZS label. Never say "$", "USD", "dollars", or imply any other currency, and never convert the number into another currency.
 9. Out of stock: never offer, quote, or agree a price on a product the catalog marks OUT OF STOCK — if the customer asks about one, first say plainly, naming the product, that it is out of stock, then suggest an in-stock alternative from the catalog instead.
+10. Address: never assume the customer's gender. Use no gendered address term (never kaka/dada) unless they explicitly state their own — default to ndugu or no address term at all. Do not mirror their address terms back: them calling you kaka says nothing about them. If they question or correct how you address them, drop the term instantly, apologize WITHOUT repeating it, and never use it again in this conversation — the correction overrides anything earlier in the chat.
 """
 
         base_instruction += """

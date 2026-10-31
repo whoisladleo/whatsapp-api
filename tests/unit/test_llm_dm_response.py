@@ -351,6 +351,20 @@ async def test_generate_dm_response_no_products_says_so_in_catalog(db_session, i
     assert "No products currently available." in captured["system"]
 
 
+async def test_generate_dm_response_prompt_carries_gender_neutral_address_rule(
+    db_session, ig_account, ig_customer, ig_context
+):
+    captured = {}
+    service = _service_with_fake_client(captured=captured)
+
+    await service.generate_dm_response(
+        "anything for sale?", db=db_session, account=ig_account, customer=ig_customer, context=ig_context, conversation_history=[]
+    )
+
+    assert "never assume the customer's gender" in captured["system"]
+    assert "apologize WITHOUT repeating it" in captured["system"]
+
+
 async def test_generate_dm_response_includes_knowledge_content(db_session, ig_account, ig_customer, ig_context):
     captured = {}
     service = _service_with_fake_client(captured=captured)

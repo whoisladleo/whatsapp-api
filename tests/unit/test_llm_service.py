@@ -525,6 +525,24 @@ async def test_regular_account_no_products_shows_placeholder(db_session, shop_ac
     assert "No products currently available." in captured["system"]
 
 
+async def test_prompt_carries_gender_neutral_address_rule(db_session, shop_account):
+    captured = {}
+    service = _service_with_fake_client(captured=captured)
+
+    await service.generate_response(
+        message_body="what do you sell?",
+        from_phone="255711111112",
+        db=db_session,
+        account=shop_account,
+    )
+
+    # Transcript 255765268058: mirrored "kaka" locked in and survived
+    # three corrections incl. "Mimi ni dada" (#99).
+    assert "never assume the customer's gender" in captured["system"]
+    assert "Do not mirror their address terms back" in captured["system"]
+    assert "apologize WITHOUT repeating it" in captured["system"]
+
+
 async def test_platform_account_first_message_sends_exact_welcome(db_session, platform_account):
     captured = {}
     service = _service_with_fake_client(captured=captured)

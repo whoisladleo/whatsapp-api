@@ -301,6 +301,9 @@ async def test_platform_prompt_shows_subscription_and_close_mechanics(
     # The dashboard link renders from settings, never hardcoded (#91).
     assert "https://business.taskflowos.dev" in instruction
     assert "dashboard-taskflow" not in instruction
+    # Gender-neutral address + correction priority (#99).
+    assert "never assume the customer's gender" in instruction
+    assert "apologize WITHOUT repeating it" in instruction
     # Same-language rule holds the welcome's language past turn 1 (#93).
     assert "SAME language the customer just used" in instruction
     # Monthly-only billing + adapt-to-correction (#97).
