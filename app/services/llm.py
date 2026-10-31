@@ -197,8 +197,11 @@ def _is_out_of_stock(product: Product) -> bool:
     merchant (is_active False). Either way the model must not offer it —
     see the out-of-stock RULES line in each prompt. Server-side
     _close_deal/_close_instagram_deal still reject a quantity-0 close as
-    the backstop (#53).
+    the backstop (#53). Subscription products are never out of stock —
+    they have no units to deplete (see #89).
     """
+    if product.is_subscription:
+        return product.is_active is False
     return (product.quantity or 0) < 1 or product.is_active is False
 
 
@@ -437,8 +440,12 @@ class LLMService:
                 f"AGREEMENT_REACHED price {price} outside [{product.min_price}, {product.max_price}] "
                 f"for '{product.name}' (possible prompt injection)"
             )
-        if (product.quantity or 0) < 1:
-            raise DealRejected(f"AGREEMENT_REACHED for '{product.name}' but it's out of stock")
+        # Subscriptions have no units — quantity is meaningless for them
+        # (the dashboard doesn't even ask for it), so neither the
+        # out-of-stock backstop nor the atomic claim below applies (#89).
+        if not product.is_subscription:
+            if (product.quantity or 0) < 1:
+                raise DealRejected(f"AGREEMENT_REACHED for '{product.name}' but it's out of stock")
 
         payment_type = (
             PaymentType.INSTALLMENT if agreement["payment_type"] == "installment" else PaymentType.FULL
@@ -451,7 +458,7 @@ class LLMService:
         # is still now, not deferred to payment success (soft-lock during
         # the hold window, so a second customer can't be sold the same
         # unit while this one is paying).
-        if not _try_claim_stock(db, product):
+        if not product.is_subscription and not _try_claim_stock(db, product):
             raise DealRejected(f"AGREEMENT_REACHED for '{product.name}' but it's out of stock")
         order = Order(
             customer_id=customer.id,
@@ -1058,8 +1065,10 @@ Match the customer's language (Swahili or English). Keep both lines to one sente
                 f"Instagram AGREEMENT_REACHED price {price} outside [{product.min_price}, {product.max_price}] "
                 f"for '{product.name}' (possible prompt injection)"
             )
-        if (product.quantity or 0) < 1:
-            raise DealRejected(f"Instagram AGREEMENT_REACHED for '{product.name}' but it's out of stock")
+        # Subscriptions have no units — see _close_deal (#89).
+        if not product.is_subscription:
+            if (product.quantity or 0) < 1:
+                raise DealRejected(f"Instagram AGREEMENT_REACHED for '{product.name}' but it's out of stock")
 
         phone = agreement.get("phone")
         if not phone:
@@ -1073,13 +1082,30 @@ Match the customer's language (Swahili or English). Keep both lines to one sente
             db.commit()
             db.refresh(customer)
 
+        # An Instagram prospect buying the platform subscription becomes a
+        # merchant: without a User row, activation can't sync their AI
+        # access and they can't log into the dashboard (see
+        # _resolve_merchant_for_platform_subscription). Ordinary shoppers
+        # deliberately get no User — only this product confers it (#89).
+        from app.services.subscription_access import get_platform_subscription_product
+
+        platform_product = get_platform_subscription_product(db)
+        if (
+            platform_product is not None
+            and product.id == platform_product.id
+            and not db.query(User).filter(User.username == normalized_phone).first()
+        ):
+            db.add(User(username=normalized_phone))
+            db.commit()
+
         payment_type = (
             PaymentType.INSTALLMENT if agreement["payment_type"] == "installment" else PaymentType.FULL
         )
 
         # Atomic stock claim — see _close_deal; a lost race rejects
-        # exactly like the out-of-stock pre-check above (#54).
-        if not _try_claim_stock(db, product):
+        # exactly like the out-of-stock pre-check above (#54). Skipped
+        # for subscriptions, which have no units (#89).
+        if not product.is_subscription and not _try_claim_stock(db, product):
             raise DealRejected(f"Instagram AGREEMENT_REACHED for '{product.name}' but it's out of stock")
         order = Order(
             customer_id=customer.id,
@@ -1305,12 +1331,25 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
             # The person texting is a customer, the merchant is the account owner
             merchant_id = account.user_id
 
-        # 2. Fetch products for this merchant (drafts excluded — see above)
-        products = (
-            db.query(Product)
-            .filter(Product.merchant_id == merchant_id, Product.is_draft == False)
-            .all()
-        )
+        # 2. Fetch products for this merchant (drafts excluded — see above).
+        # On the platform account the prospect owns nothing, so the catalog
+        # is the Taskflow subscription itself — without this Amara pitches
+        # a product she can't see and can never close (#89).
+        if is_platform_account:
+            from app.services.subscription_access import get_platform_subscription_product
+
+            platform_product = get_platform_subscription_product(db)
+            products = (
+                [platform_product]
+                if platform_product is not None and not platform_product.is_draft
+                else []
+            )
+        else:
+            products = (
+                db.query(Product)
+                .filter(Product.merchant_id == merchant_id, Product.is_draft == False)
+                .all()
+            )
         if not products:
             catalog_str = "No products currently available."
         else:
@@ -1318,7 +1357,10 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
             for p in products:
                 installments_note = "" if p.allow_installments else " (full payment only — installments not offered)"
                 stock_note = " (OUT OF STOCK)" if _is_out_of_stock(p) else ""
-                catalog_str += f"- {p.name}: Max Price TZS {p.max_price:,.0f}, Lowest Price You May Offer TZS {_negotiation_floor(p):,.0f}, Stock: {p.quantity}{stock_note}{installments_note}\n"
+                stock_display = (
+                    "available now, billed monthly" if p.is_subscription else f"Stock: {p.quantity}"
+                )
+                catalog_str += f"- {p.name}: Max Price TZS {p.max_price:,.0f}, Lowest Price You May Offer TZS {_negotiation_floor(p):,.0f}, {stock_display}{stock_note}{installments_note}\n"
                 if p.description:
                     catalog_str += f"  {p.description}\n"
 
@@ -1353,6 +1395,11 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
         # 4. Build system instruction
         
         if is_platform_account:
+            # The subscription price lives on the product, not in this
+            # prompt — it changes with plans (see #89). Falls back to the
+            # launch price only when no platform product is configured.
+            platform_price = int(products[0].max_price) if products else 100000
+            platform_price_display = f"{platform_price:,.0f} TZS a month"
             base_instruction = f"""You are Amara, the 24/7 AI Sales Agent for Taskflow OS.
 Your goal is to onboard new merchants and explain the value of having an AI agent handle their WhatsApp sales.
 
@@ -1371,7 +1418,7 @@ Hi, I'm *Amara*. I help shops answer customers instantly, handle the back-and-fo
 Habari! Naitwa *Amara*. Ninasaidia maduka kujibu wateja papo hapo, kushughulikia mazungumzo ya bei, na kuhakikisha hakuna ujumbe unaopotea — hata siku zenye shughuli nyingi. Naomba nikuulize maswali machache kwanza?
 """
             else:
-                base_instruction += """
+                base_instruction += f"""
 VOICE — this is you speaking as yourself, not a description of a product:
 - First person always. "I" do this — never "Amara does this" or "the platform enables."
 - The most persuasive thing you can say is that you bring real money, not just conversation. Every time you make the case for trying you, explicitly say you close sales and get payment moving — not just that you answer messages fast. Use words like "pesa"/"mauzo"/"order halisi" (or "money"/"sales"/"real orders" in English) — don't just describe handling messages.
@@ -1407,13 +1454,18 @@ HANDLING HESITATION — confident, no hedging:
 THE CLOSE, once they seem ready:
 "Want to try me on your shop and see what happens? I'll start with your last batch of messages so you can see exactly how I'd have handled them, before anything changes for your customers."
 
+CLOSING MECHANICS — how a yes becomes a subscription:
+- The price is fixed at exactly {platform_price_display} — never negotiate it, never state any other number.
+- This is a subscription, not a physical good: never ask about pickup or delivery, and never offer installments — full payment only.
+- Once they explicitly agree to subscribe at {platform_price}, confirm it back naturally, then end your response with the exact marker [AGREEMENT_REACHED: product=<exact product name from the catalog above> price={platform_price} payment=full]. Only include this marker once the yes is explicit — never guess or assume it. Emitting it sends them the mobile-money payment request automatically.
+
 OPERATIONAL RULES:
-1. Pricing: fixed and simple — state it plainly and confidently whenever directly asked, do not deflect to the dashboard for it: *100,000 TZS a month*, one flat price, *no commission* on their sales. They pay it as a mobile-money payment request to their phone, not taken out of their sales. Their first month starts the day you go live on their shop, not the day they pay, and they get a full refund if they change their mind before then. Never say there's no upfront payment, never say the fee is deducted from sales, and never mention a commission.
+1. Pricing: fixed and simple — state it plainly and confidently whenever directly asked, do not deflect to the dashboard for it: *{platform_price_display}*, one flat price, *no commission* on their sales. They pay it as a mobile-money payment request to their phone, not taken out of their sales. Their first month starts the day you go live on their shop, not the day they pay, and they get a full refund if they change their mind before then. Never say there's no upfront payment, never say the fee is deducted from sales, and never mention a commission.
 2. Onboarding & Setup: You CANNOT add products or register businesses via WhatsApp. If the user asks you to register their business, add a product, or set up their store, you MUST tell them that you cannot do this here and they MUST use the merchant dashboard: https://dashboard-taskflow.whoisladleo.dev/ . Do NOT pretend or hallucinate that you have added their products or business.
 3. How payment actually works — this is real and automatic, state it confidently, never say you have no payment process of your own: once a customer agrees to buy something, a payment request is sent automatically straight to their phone via mobile money for them to approve — no manual bank transfer, cash negotiation, or collection work for the shop owner. Installment plans (Lipa kwa Awamu) are also available if the shop wants to offer them. This is a fixed platform capability, the same for every shop, not something the shop configures.
 4. Delivery — this is genuinely NOT automatic, unlike payment: it depends entirely on how the shop already handles delivery. Only state a delivery cost, timeframe, or process the shop has actually told you; otherwise say it follows however the shop currently does it and you'll confirm the details.
 5. Human Handoff: If the customer is unreasonable, has complex technical questions, or explicitly asks for a human, you must include the exact phrase [HUMAN_HANDOFF] in your response.
-6. Currency: the 100,000 TZS above is Tanzanian Shillings, never any other currency. Never say "$", "USD", "dollars", or imply this price is in another currency, and never convert it.
+6. Currency: the {platform_price_display} above is Tanzanian Shillings, never any other currency. Never say "$", "USD", "dollars", or imply this price is in another currency, and never convert it.
 """
         else:
             base_instruction = f"""You are Amara, the 24/7 AI Sales Agent for {account.name}.
