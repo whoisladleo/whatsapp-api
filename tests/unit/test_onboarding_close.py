@@ -153,6 +153,45 @@ def test_subscriptions_are_never_out_of_stock(db_session, merchant):
 
 
 @respx.mock
+async def test_platform_marker_close_executes_end_to_end(db_session, platform_account, subscription_product):
+    """Transcript 255754817484 (#100): the WA platform prompt emits
+    AGREEMENT_REACHED, and the server must execute it — order, pending
+    subscription, Tunzaa dispatch, note appended, marker stripped. The
+    #89 tests called _close_deal directly and never saw the gate that
+    ignored the marker on platform accounts."""
+    _mock_full_payment()
+    # Not the first message (first messages get the verbatim welcome).
+    db_session.add(Message(
+        to_phone="255711110602", direction="outbound",
+        account_id=platform_account.id, type="text", body="earlier",
+    ))
+    db_session.commit()
+
+    async def handler(**kwargs):
+        return _FakeResponse(
+            "Perfect — you're in! "
+            "[AGREEMENT_REACHED: product=Taskflow OS price=100000 payment=full]"
+        )
+    service = _service_with_fake_client(handler=handler)
+
+    reply = await service.generate_response(
+        message_body="Lets do this",
+        from_phone="255711110602",
+        db=db_session,
+        account=platform_account,
+    )
+
+    assert "AGREEMENT_REACHED" not in reply
+    assert "payment request for TZS 100,000 has been sent" in reply
+    customer = db_session.query(Customer).filter_by(phone_number="255711110602").one()
+    order = db_session.query(Order).filter_by(customer_id=customer.id).one()
+    assert order.status.value == "PENDING"
+    assert order.tunzaa_transaction_id == "MOCK_TXN_ONBOARD"
+    subscription = db_session.query(ProductSubscription).filter_by(order_id=order.id).one()
+    assert subscription.status.value == "PENDING_PAYMENT"
+
+
+@respx.mock
 async def test_whatsapp_subscription_close_skips_stock(db_session, platform_account, subscription_product):
     _mock_full_payment()
     customer = Customer(phone_number="255711110601")

@@ -1587,22 +1587,18 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
                 if not response_text:
                     response_text = "I am transferring you to a human agent who can help you further. Please hold."
             
-            # 3. Deal closing (AGREEMENT_REACHED). Only the regular-merchant
-            # prompt branch above ever instructs the model to emit this
-            # marker (the platform account sells the Taskflow subscription,
-            # not the catalog products), but strip it unconditionally
+            # 3. Deal closing (AGREEMENT_REACHED). Both prompt branches
+            # instruct the model to emit this marker — regular merchants
+            # for catalog products, the platform account for the Taskflow
+            # subscription itself (#89) — but strip it unconditionally
             # regardless of branch as defense in depth against it leaking
             # into a customer-facing message. If a handoff also fired above,
             # handoff wins — don't create an order for a conversation
             # simultaneously being escalated to a human.
             response_text, agreement = _parse_and_strip_agreement(response_text)
             if agreement:
-                if is_platform_account or context.state == ConversationState.HUMAN_HANDOFF:
-                    logger.warning(
-                        "AGREEMENT_REACHED marker seen on an ineligible turn "
-                        f"(is_platform_account={is_platform_account}, "
-                        f"handoff={context.state == ConversationState.HUMAN_HANDOFF}); ignoring."
-                    )
+                if context.state == ConversationState.HUMAN_HANDOFF:
+                    logger.warning("AGREEMENT_REACHED marker seen on a handed-off turn; ignoring.")
                 else:
                     try:
                         note = await self._close_deal(
