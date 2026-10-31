@@ -298,6 +298,9 @@ async def test_platform_prompt_shows_subscription_and_close_mechanics(
     assert "includes 2,000 Amara replies a month" in instruction
     assert "price=<that plan's catalog Max Price>" in instruction
     assert "100,000" not in instruction
+    # The dashboard link renders from settings, never hardcoded (#91).
+    assert "https://business.taskflowos.dev" in instruction
+    assert "dashboard-taskflow" not in instruction
 
 
 async def test_platform_prompt_without_plan_flag_has_no_catalog(
