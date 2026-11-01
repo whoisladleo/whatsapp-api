@@ -546,6 +546,8 @@ async def pay_now(
         raise HTTPException(status_code=400, detail="A phone number is required to pay.")
     except self_service_billing.PhoneNumberInUseError:
         raise HTTPException(status_code=400, detail="This phone number is already in use.")
+    except self_service_billing.AlreadySubscribedError:
+        raise HTTPException(status_code=409, detail="This plan is already active — no new payment needed.")
     except Exception:
         raise HTTPException(status_code=502, detail="Failed to start payment. Please try again.")
 

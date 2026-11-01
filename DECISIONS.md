@@ -1,5 +1,13 @@
 # Decisions
 
+## Pay Now while ACTIVE refused (2026-11-01, #115)
+
+**Chose:** `pay_now` raises `AlreadySubscribedError` (→ HTTP 409) when an ACTIVE subscription exists for the customer+product — checked after customer resolution, before reuse/insert. ACTIVE-only: PAST_DUE catch-up, post-CANCELLED resubscribe, and PENDING_PAYMENT-without-a-live-order (dead prompt, legitimate retry) all keep flowing. Dashboard hides the Pay Now button while ACTIVE; the 409 detail surfaces through the existing generic error path (no new dashboard error plumbing needed). Verified: 3 new API tests.
+
+**Considered and rejected:**
+- *200-with-flag instead of 409 for already-subscribed.* Rejected per user Discovery pick: 409 + detail fits the route's existing error table and the dashboard's generic detail-surfacing path.
+- *Blocking PENDING_PAYMENT-without-order in pay_now too.* Rejected: that state means a dead prompt (or a reused-then-cancelled attempt); refusing would strand the buyer with no self-service path forward.
+
 ## Subscription double-charge: partial unique index + PAID-history guard (2026-11-01, #114)
 
 **Chose:** (1) Partial unique index `ix_orders_one_pending_per_deal` on `(customer_id, product_id, payment_type) WHERE status='PENDING'` — the DB, not the guard's read-then-write check, decides the double-close race (sandbox showed a 16ms-apart double-mint). Key is channel-blind because Pay Now orders carry no channel and its reuse query already treats chat PENDING rows as reusable; `payment_type` is in the key so a FULL order still coexists with an in-flight installment plan (pinned #110 behavior). Migration preamble retires older dup PENDINGs (latest wins, stock restored) with counts via NOTICE. (2) `_reclose_guard_note` also blocks subscription closes when any PAID order exists for that customer+product (ownership is global — a plan bought over WA blocks its IG re-close); consumable re-buys stay frictionless. (3) Race losers: chat closes roll back, restore the claimed unit, and return the already-sent note against the winner (re-queried channel-blind); Pay Now falls into its reuse path with `stock_taken` reset. Verified end-to-end on scratch Postgres 18 (preamble, index enforcement, downgrade round-trip) plus 9 new tests; full suite 1261 passed.
