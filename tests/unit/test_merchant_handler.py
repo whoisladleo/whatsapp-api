@@ -97,6 +97,30 @@ async def test_stock_product_not_found(db_session, merchant_account):
     assert "not found" in reply
 
 
+async def test_stock_decrement_clamps_at_zero(db_session, merchant_account):
+    reply = await handle_merchant_message(
+        db_session, merchant_account, "/stock Shoes -99", "255700000099"
+    )
+
+    product = db_session.query(Product).filter(Product.slug == "shoes").first()
+    assert product.quantity == 0
+    assert "New quantity: 0" in reply
+
+
+async def test_stock_none_quantity_treated_as_zero(db_session, merchant_account):
+    product = db_session.query(Product).filter(Product.slug == "shoes").first()
+    product.quantity = None
+    db_session.commit()
+
+    reply = await handle_merchant_message(
+        db_session, merchant_account, "/stock Shoes +5", "255700000099"
+    )
+
+    db_session.refresh(product)
+    assert product.quantity == 5
+    assert "New quantity: 5" in reply
+
+
 async def test_out_of_stock(db_session, merchant_account):
     reply = await handle_merchant_message(
         db_session, merchant_account, "/out_of_stock Shoes", "255700000099"
@@ -140,6 +164,21 @@ async def test_price_product_not_found(db_session, merchant_account):
     )
 
     assert "not found" in reply
+
+
+@pytest.mark.parametrize("command", [
+    "/price Shoes max:40000 min:50000",
+    "/price Shoes max:50000 min:0",
+    "/price Shoes max:0 min:0",
+])
+async def test_price_rejected_unless_zero_lt_min_lte_max(db_session, merchant_account, command):
+    reply = await handle_merchant_message(
+        db_session, merchant_account, command, "255700000099"
+    )
+
+    product = db_session.query(Product).filter(Product.slug == "shoes").first()
+    assert "need 0 < min <= max" in reply
+    assert (product.max_price, product.min_price) == (50000, 40000)
 
 
 async def test_unknown_command_falls_back_to_help(db_session, merchant_account):
@@ -195,10 +234,75 @@ async def _handed_off_customer(db_session, account, phone="255722223333"):
     return customer, context
 
 
-async def test_resume_missing_phone_shows_usage(db_session, merchant_account):
+async def test_bare_resume_with_nothing_waiting(db_session, merchant_account):
     reply = await handle_merchant_message(db_session, merchant_account, "/resume", "255700000099")
 
-    assert "Usage" in reply
+    assert reply == "No customers are waiting for you right now."
+
+
+async def _ig_handed_off_customer(db_session, merchant_account, username="waiter", scoped_id="igsid_waiter"):
+    ig_account = InstagramAccount(
+        ig_business_id="ig_biz_list", access_token="ig-tok", username="shop",
+        user_id=merchant_account.user_id,
+    )
+    db_session.add(ig_account)
+    db_session.commit()
+    db_session.refresh(ig_account)
+    ig_customer = InstagramCustomer(
+        ig_scoped_id=scoped_id, username=username, account_id=ig_account.id,
+    )
+    db_session.add(ig_customer)
+    db_session.commit()
+    db_session.refresh(ig_customer)
+    from datetime import datetime
+
+    context = InstagramConversationContext(
+        customer_id=ig_customer.id, state=ConversationState.HUMAN_HANDOFF, handoff_at=datetime.utcnow(),
+    )
+    db_session.add(context)
+    db_session.commit()
+    db_session.refresh(context)
+    return ig_customer, context
+
+
+async def test_bare_resume_lists_pending_handoffs(db_session, merchant_account):
+    wa_customer, _ = await _handed_off_customer(db_session, merchant_account)
+    await _ig_handed_off_customer(db_session, merchant_account)
+
+    reply = await handle_merchant_message(db_session, merchant_account, "/resume", "255700000099")
+
+    assert "1. " in reply and "2. " in reply
+    assert wa_customer.phone_number in reply
+    assert "@waiter" in reply
+    assert "/resume <number above>" in reply
+
+
+async def test_resume_index_pick_whatsapp(db_session, merchant_account):
+    customer, context = await _handed_off_customer(db_session, merchant_account)
+
+    reply = await handle_merchant_message(db_session, merchant_account, "/resume 1", "255700000099")
+
+    db_session.refresh(context)
+    assert context.state == ConversationState.NEGOTIATING
+    assert f"Conversation with {customer.phone_number} resumed" in reply
+
+
+async def test_resume_index_pick_instagram(db_session, merchant_account):
+    _, context = await _ig_handed_off_customer(db_session, merchant_account)
+
+    reply = await handle_merchant_message(db_session, merchant_account, "/resume 1", "255700000099")
+
+    db_session.refresh(context)
+    assert context.state == ConversationState.NEGOTIATING
+    assert "Conversation with @waiter resumed" in reply
+
+
+async def test_resume_out_of_range_index_falls_through_to_phone_path(db_session, merchant_account):
+    await _handed_off_customer(db_session, merchant_account)
+
+    reply = await handle_merchant_message(db_session, merchant_account, "/resume 9", "255700000099")
+
+    assert "No conversation found for 9." in reply
 
 
 async def test_resume_unknown_customer(db_session, merchant_account):

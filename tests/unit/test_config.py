@@ -1,7 +1,10 @@
 import pytest
+from cryptography.fernet import Fernet
 from pydantic import ValidationError
 
 from app.core.config import Settings
+
+_VALID_FERNET_KEY = Fernet.generate_key().decode()
 
 
 def test_database_url_uses_explicit_override_when_set():
@@ -43,7 +46,11 @@ def test_documented_example_keys_rejected_when_not_testing():
 
 
 def test_real_secret_key_accepted_when_not_testing():
-    settings = Settings(SECRET_KEY="a-real-random-secret-value", TESTING=False)
+    settings = Settings(
+        SECRET_KEY="a-real-random-secret-value",
+        TOKEN_ENCRYPTION_KEY=_VALID_FERNET_KEY,
+        TESTING=False,
+    )
 
     assert settings.SECRET_KEY == "a-real-random-secret-value"
 
@@ -52,3 +59,31 @@ def test_testing_mode_allows_placeholder_secret_key():
     settings = Settings(SECRET_KEY="your-super-secret-key-change-it", TESTING=True)
 
     assert settings.SECRET_KEY == "your-super-secret-key-change-it"
+
+
+def test_missing_token_encryption_key_rejected_when_not_testing():
+    with pytest.raises(ValidationError, match="TOKEN_ENCRYPTION_KEY"):
+        Settings(
+            SECRET_KEY="a-real-random-secret-value",
+            TOKEN_ENCRYPTION_KEY=None,
+            TESTING=False,
+        )
+
+
+def test_invalid_token_encryption_key_rejected_when_not_testing():
+    with pytest.raises(ValidationError, match="TOKEN_ENCRYPTION_KEY"):
+        Settings(
+            SECRET_KEY="a-real-random-secret-value",
+            TOKEN_ENCRYPTION_KEY="not-a-fernet-key",
+            TESTING=False,
+        )
+
+
+def test_testing_mode_needs_no_token_encryption_key():
+    settings = Settings(
+        SECRET_KEY="your-super-secret-key-change-it",
+        TOKEN_ENCRYPTION_KEY=None,
+        TESTING=True,
+    )
+
+    assert settings.TOKEN_ENCRYPTION_KEY is None

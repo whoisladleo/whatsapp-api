@@ -136,6 +136,48 @@ def test_create_access_token_invalid_secret_fails_decode():
         jwt.decode(token, "wrong-secret", algorithms=[settings.ALGORITHM])
 
 
+# --- sha256_hex / verify_sha256_hex / generate_refresh_token ----------------
+
+
+def test_sha256_hex_matches_hashlib():
+    assert security.sha256_hex("123456") == hashlib.sha256(b"123456").hexdigest()
+
+
+def test_verify_sha256_hex_accepts_matching_candidate():
+    stored = security.sha256_hex("123456")
+
+    assert security.verify_sha256_hex(stored, "123456") is True
+    assert security.verify_sha256_hex(stored, "000000") is False
+
+
+def test_verify_sha256_hex_rejects_missing_stored_value():
+    assert security.verify_sha256_hex(None, "123456") is False
+    assert security.verify_sha256_hex("", "123456") is False
+
+
+def test_verify_sha256_hex_uses_constant_time_compare(monkeypatch):
+    seen = {}
+    real_compare_digest = hmac.compare_digest
+
+    def spy(a, b):
+        seen["called"] = True
+        return real_compare_digest(a, b)
+
+    monkeypatch.setattr(security.hmac, "compare_digest", spy)
+
+    assert security.verify_sha256_hex(security.sha256_hex("123456"), "123456") is True
+    assert seen.get("called") is True
+
+
+def test_generate_refresh_token_is_opaque_and_unique():
+    first = security.generate_refresh_token()
+    second = security.generate_refresh_token()
+
+    assert first != second
+    assert "." not in first  # opaque bearer, not a JWT
+    assert len(first) >= 43  # 256 bits in urlsafe base64
+
+
 # --- generate_otp ------------------------------------------------------------
 
 def test_generate_otp_default_length_and_numeric():

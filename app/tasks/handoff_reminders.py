@@ -42,21 +42,25 @@ def _notify_merchant(db, context) -> str:
     if not customer:
         return "No customer linked to this context."
 
-    # Find the WhatsApp account this customer last messaged, so we know which
-    # merchant/account to alert and which credentials to send with. There is
-    # no direct customer->account link in the schema, so infer it from the
-    # most recent inbound message from this customer.
-    last_inbound = (
-        db.query(Message)
-        .filter(Message.from_phone == customer.phone_number, Message.direction == "inbound")
-        .order_by(Message.timestamp.desc())
-        .first()
-    )
-    if not last_inbound or not last_inbound.account_id:
+    # The account to alert is the one whose conversation this handoff belongs
+    # to. Legacy NULL-account rows predate that link, so they keep the old
+    # inference from the customer's most recent inbound message.
+    account = None
+    if context.account_id is not None:
+        account = db.query(WhatsAppAccount).filter(WhatsAppAccount.id == context.account_id).first()
+    if account is None and context.account_id is None:
+        last_inbound = (
+            db.query(Message)
+            .filter(Message.from_phone == customer.phone_number, Message.direction == "inbound")
+            .order_by(Message.timestamp.desc())
+            .first()
+        )
+        if not last_inbound or not last_inbound.account_id:
+            return "No account found for this customer."
+        account = db.query(WhatsAppAccount).filter(WhatsAppAccount.id == last_inbound.account_id).first()
+    if not account:
         return "No account found for this customer."
-
-    account = db.query(WhatsAppAccount).filter(WhatsAppAccount.id == last_inbound.account_id).first()
-    if not account or not account.owner:
+    if not account.owner:
         return "No merchant to notify."
 
     merchant_phone = account.owner.username

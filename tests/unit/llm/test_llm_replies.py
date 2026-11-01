@@ -341,6 +341,21 @@ def test_get_knowledge_base_missing_file_returns_empty(monkeypatch):
     assert result == ""
 
 
+@pytest.mark.parametrize("slug", ["../secret", "..", "a/b", "a/../../etc/passwd"])
+def test_get_knowledge_base_rejects_path_traversal(monkeypatch, slug):
+    service = LLMService(api_key=None)
+
+    def _boom(path):
+        raise AssertionError(f"traversal slug reached the filesystem: {path}")
+
+    import builtins
+
+    monkeypatch.setattr("app.services.llm.os.path.exists", _boom)
+    monkeypatch.setattr(builtins, "open", _boom)
+
+    assert service._get_knowledge_base(slug) == ""
+
+
 async def test_falls_back_to_knowledge_base_file_when_no_content_passed(db_session, shop_account, monkeypatch):
     monkeypatch.setattr("app.services.llm.os.path.exists", lambda path: True)
     import builtins

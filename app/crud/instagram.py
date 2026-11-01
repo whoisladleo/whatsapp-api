@@ -34,12 +34,12 @@ def get_account_by_ig_business_id(
 
 
 def get_accounts_by_user(db: Session, user_id: uuid.UUID) -> List[InstagramAccount]:
-    # access_token == "" marks a disconnected account (see disconnect_account)
+    # access_token IS NULL marks a disconnected account (see disconnect_account)
     # — the row and its comment/DM/order history stick around, but it's no
     # longer "connected" from the merchant's point of view.
     return (
         db.query(InstagramAccount)
-        .filter(InstagramAccount.user_id == user_id, InstagramAccount.access_token != "")
+        .filter(InstagramAccount.user_id == user_id, InstagramAccount.access_token.isnot(None))
         .all()
     )
 
@@ -53,7 +53,7 @@ def disconnect_account(db: Session, account: InstagramAccount) -> None:
     account with real history. Reconnecting later (upsert_account) finds and
     revives this same row rather than creating a duplicate.
     """
-    account.access_token = ""
+    account.access_token = None
     account.ai_enabled = False
     db.commit()
 

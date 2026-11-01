@@ -19,6 +19,12 @@ logger = logging.getLogger("app.services.llm")
 
 class ReplyMixin:
     def _get_knowledge_base(self, product_slug: str) -> str:
+        # product_slug is merchant-controlled — never let it escape the
+        # knowledge/ directory. Rejected slugs read as empty, exactly like
+        # a missing file.
+        if "/" in product_slug or ".." in product_slug:
+            logger.warning(f"Rejected suspicious knowledge-base slug: {product_slug!r}")
+            return ""
         kb_path = f"knowledge/{product_slug}.md"
         if not os.path.exists(kb_path):
             return ""

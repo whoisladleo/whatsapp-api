@@ -1,6 +1,7 @@
 import uuid
 from datetime import datetime, timedelta
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 from app.db.models import Customer, Message, ConversationContext, ConversationState
 from typing import Dict, Any, List, Optional
@@ -64,6 +65,69 @@ def update_message_status(db: Session, whatsapp_message_id: str, status: str):
     db.commit()
 
 
+def _prefer_scoped(conversations: List[ConversationContext], account_id: uuid.UUID) -> Optional[ConversationContext]:
+    """This account's context out of a customer's rows: the scoped row when
+    one exists, else the legacy NULL-account row (still unadopted)."""
+    fallback = None
+    for conversation in conversations or []:
+        if conversation.account_id == account_id:
+            return conversation
+        if conversation.account_id is None and fallback is None:
+            fallback = conversation
+    return fallback
+
+
+def get_context_for_account(
+    db: Session, customer_id: uuid.UUID, account_id: uuid.UUID
+) -> Optional[ConversationContext]:
+    """Fetch-only version of get_or_create_context: the scoped row when one
+    exists, else the legacy NULL-account row. Neither adopts nor creates."""
+    return _prefer_scoped(
+        db.query(ConversationContext)
+        .filter(ConversationContext.customer_id == customer_id)
+        .all(),
+        account_id,
+    )
+
+
+def get_or_create_context(
+    db: Session, customer_id: uuid.UUID, account_id: uuid.UUID
+) -> ConversationContext:
+    """
+    Fetch-or-create the (customer, account) conversation context. A legacy
+    NULL-account row is adopted by the first account that sees it (stamped
+    in place, keeping its state — a handoff stays a handoff); otherwise a
+    fresh NEGOTIATING row is created. Same lost-race fallback as
+    crud_instagram.get_or_create_conversation (#86).
+    """
+    context = get_context_for_account(db, customer_id, account_id)
+    if context is not None and context.account_id is not None:
+        return context
+
+    try:
+        if context is not None:
+            context.account_id = account_id
+        else:
+            context = ConversationContext(customer_id=customer_id, account_id=account_id)
+            db.add(context)
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        context = (
+            db.query(ConversationContext)
+            .filter(
+                ConversationContext.customer_id == customer_id,
+                ConversationContext.account_id == account_id,
+            )
+            .first()
+        )
+        if context is None:
+            raise
+        return context
+    db.refresh(context)
+    return context
+
+
 def resume_conversation_for_account(db: Session, account_id: uuid.UUID, phone: str) -> None:
     """
     Flips a HUMAN_HANDOFF conversation back to NEGOTIATING. Shared by the
@@ -74,11 +138,11 @@ def resume_conversation_for_account(db: Session, account_id: uuid.UUID, phone: s
     format the outcome for its own transport (WhatsApp reply text vs. an
     HTTP status code).
 
-    NOTE: Customer/ConversationContext are global in this schema (not
-    scoped per merchant/account). As a safeguard against one merchant
-    resuming a conversation that actually belongs to a different merchant's
-    customer, require that this customer has previously messaged *this*
-    account before allowing the resume.
+    The context lookup is scoped to this account: a handoff at another
+    shop for the same phone is a different row and is left alone. The
+    has-history check stays as well — it 404s (not 400s) when the phone
+    never messaged this account at all, and it keeps a legacy NULL-account
+    row attributable to the right shop on resume.
     """
     customer = db.query(Customer).filter(Customer.phone_number == phone).first()
     if not customer:
@@ -92,14 +156,12 @@ def resume_conversation_for_account(db: Session, account_id: uuid.UUID, phone: s
     if not has_history_with_account:
         raise ConversationNotFoundError(f"No conversation with {phone} found for this account.")
 
-    context = (
-        db.query(ConversationContext)
-        .filter(ConversationContext.customer_id == customer.id)
-        .first()
-    )
+    context = get_context_for_account(db, customer.id, account_id)
     if not context or context.state != ConversationState.HUMAN_HANDOFF:
         raise ConversationNotInHandoffError(f"{phone} is not currently in a human handoff state.")
 
+    if context.account_id is None:
+        context.account_id = account_id
     context.state = ConversationState.NEGOTIATING
     context.handoff_at = None
     db.commit()
@@ -172,16 +234,16 @@ def get_conversations_for_account(
 
     customers = (
         db.query(Customer)
-        .options(joinedload(Customer.conversation))
+        .options(joinedload(Customer.conversations))
         .filter(Customer.phone_number.in_(phones))
         .all()
     )
-    states = {
-        customer.phone_number: (
-            customer.conversation.state.value if customer.conversation else None
-        )
-        for customer in customers
-    }
+    # Per-account state: the same phone can be mid-handoff at one shop and
+    # negotiating at another — each account's list shows its own row.
+    states = {}
+    for customer in customers:
+        context = _prefer_scoped(customer.conversations, account_id)
+        states[customer.phone_number] = context.state.value if context else None
 
     return [
         {
@@ -264,38 +326,78 @@ def get_recent_send_failures(
 
 def get_pending_handoffs_for_account(db: Session, account_id: uuid.UUID) -> List[Dict[str, Any]]:
     """
-    Customers currently in ConversationState.HUMAN_HANDOFF whose most recent
-    inbound message belongs to this account. There is no direct
-    Customer/ConversationContext -> WhatsAppAccount link in the schema, so
-    the owning account is inferred from the latest inbound message, matching
-    the same inference used to route the handoff reminder task.
+    This account's customers currently in ConversationState.HUMAN_HANDOFF.
+    Scoped by account first: candidate phones come from this account's own
+    inbound messages, then each phone's (customer, account) context is
+    checked — 3 queries total regardless of fleet size, instead of loading
+    every handoff context plus one latest-inbound query each. Same response
+    shape as before; last_message_body is now this account's latest inbound
+    from that customer (previously the latest across all accounts).
     """
-    contexts = (
-        db.query(ConversationContext)
-        .filter(ConversationContext.state == ConversationState.HUMAN_HANDOFF)
+    phones = [
+        row[0]
+        for row in (
+            db.query(Message.from_phone)
+            .filter(
+                Message.account_id == account_id,
+                Message.direction == "inbound",
+                Message.from_phone.isnot(None),
+            )
+            .distinct()
+            .all()
+        )
+    ]
+    if not phones:
+        return []
+
+    customers = (
+        db.query(Customer)
+        .options(joinedload(Customer.conversations))
+        .filter(Customer.phone_number.in_(phones))
         .all()
     )
+    contexts_by_phone = {
+        customer.phone_number: _prefer_scoped(customer.conversations, account_id)
+        for customer in customers
+    }
+
+    # Latest inbound per phone on this account in a single query — the same
+    # ROW_NUMBER pattern get_conversations_for_account uses.
+    ranked = (
+        db.query(
+            Message.id.label("msg_id"),
+            Message.from_phone.label("customer_phone"),
+            func.row_number()
+            .over(partition_by=Message.from_phone, order_by=Message.timestamp.desc())
+            .label("rn"),
+        )
+        .filter(
+            Message.account_id == account_id,
+            Message.direction == "inbound",
+            Message.from_phone.in_(phones),
+        )
+        .subquery()
+    )
+    last_bodies = {
+        phone: body
+        for body, phone in (
+            db.query(Message.body, ranked.c.customer_phone)
+            .join(ranked, Message.id == ranked.c.msg_id)
+            .filter(ranked.c.rn == 1)
+            .all()
+        )
+    }
 
     results = []
-    for context in contexts:
-        customer = context.customer
-        if not customer:
+    for phone in phones:
+        context = contexts_by_phone.get(phone)
+        if context is None or context.state != ConversationState.HUMAN_HANDOFF:
             continue
-
-        last_inbound = (
-            db.query(Message)
-            .filter(Message.from_phone == customer.phone_number, Message.direction == "inbound")
-            .order_by(Message.timestamp.desc())
-            .first()
-        )
-        if not last_inbound or last_inbound.account_id != account_id:
-            continue
-
         results.append(
             {
-                "customer_phone": customer.phone_number,
+                "customer_phone": phone,
                 "handoff_at": context.handoff_at,
-                "last_message_body": last_inbound.body,
+                "last_message_body": last_bodies.get(phone),
             }
         )
 

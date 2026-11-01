@@ -1,3 +1,6 @@
+import re
+import uuid
+
 from sqlalchemy.orm import Session
 from app.core.security import normalize_phone
 from app.db.models import (
@@ -5,17 +8,19 @@ from app.db.models import (
     WhatsAppAccount,
     Product,
     Message,
-    InstagramAccount,
-    InstagramCustomer,
     Order,
     OrderStatus,
     PaymentType,
 )
 from app.crud import message as crud_message
 from app.crud import instagram as crud_instagram
-from app.services.handoff_flow import relay_to_instagram_customer, relay_to_whatsapp_customer
+from app.services.handoff_flow import (
+    list_pending_handoffs,
+    relay_to_instagram_customer,
+    relay_to_whatsapp_customer,
+    resolve_instagram_customer,
+)
 from app.services.payment_resend import ResendOutcome, merchant_resend_order
-import re
 
 async def handle_merchant_message(db: Session, account: WhatsAppAccount, message_body: str, from_phone: str) -> str:
     """
@@ -58,7 +63,11 @@ async def handle_merchant_message(db: Session, account: WhatsAppAccount, message
     if body.lower() == "/resume" or body.lower().startswith("/resume "):
         identifier = body[len("/resume"):].strip()
         if not identifier:
-            return "Usage: `/resume 2557XXXXXXXX` (WhatsApp customer) or `/resume @their_instagram_username` (Instagram customer)"
+            return _pending_pick_list(db, account, "resume")
+
+        pick = _pending_pick(db, account, identifier)
+        if pick is not None:
+            return await _resume_pending_pick(db, account, pick)
 
         # Same @ disambiguation /reply uses below — a real phone number
         # never starts with @, so this is unambiguous.
@@ -91,7 +100,11 @@ async def handle_merchant_message(db: Session, account: WhatsAppAccount, message
     if body.lower() == "/resend" or body.lower().startswith("/resend "):
         identifier = body[len("/resend"):].strip()
         if not identifier:
-            return "Usage: `/resend 2557XXXXXXXX` (WhatsApp customer) or `/resend @their_instagram_username` (Instagram customer)"
+            return _pending_pick_list(db, account, "resend")
+
+        pick = _pending_pick(db, account, identifier)
+        if pick is not None:
+            return await _resend_pending_pick(db, account, pick)
 
         if identifier.startswith("@"):
             return await _resend_instagram_customer(db, account, identifier[1:])
@@ -113,7 +126,9 @@ async def handle_merchant_message(db: Session, account: WhatsAppAccount, message
             if not product:
                 return f"Product '{product_name}' not found."
 
-            product.quantity += qty_change
+            # quantity is nullable (legacy rows) and a decrement past
+            # zero would leave phantom negative stock — clamp at 0.
+            product.quantity = max(0, (product.quantity or 0) + qty_change)
             db.commit()
             from app.tasks.catalog_sync import dispatch_catalog_sync
             dispatch_catalog_sync(product.id, "upsert")
@@ -145,6 +160,8 @@ async def handle_merchant_message(db: Session, account: WhatsAppAccount, message
             product_name = match.group(1).strip()
             max_p = float(match.group(2))
             min_p = float(match.group(3))
+            if not 0 < min_p <= max_p:
+                return "Invalid prices: need 0 < min <= max. Example: `/price Shoes max:50000 min:40000`"
 
             product = db.query(Product).filter(
                 Product.merchant_id == account.user_id,
@@ -164,6 +181,61 @@ async def handle_merchant_message(db: Session, account: WhatsAppAccount, message
             return "Invalid format. Example: `/price Shoes max:50000 min:40000`"
 
     return "Unknown command. Send `/manage` to see available commands."
+
+
+def _pending_pick_list(db: Session, account: WhatsAppAccount, command: str) -> str:
+    """Bare /resume and /resend answer with the merchant's waiting
+    handoffs — numbered, so a tap-sized `/resume 1` picks one — instead
+    of bare usage text nobody can act on without the phone numbers."""
+    pending = list_pending_handoffs(db, account.owner) if account.owner else []
+    if not pending:
+        return "No customers are waiting for you right now."
+    lines = [f"{i}. {entry['name']}" for i, entry in enumerate(pending, 1)]
+    return (
+        "Customers waiting for you:\n"
+        + "\n".join(lines)
+        + f"\nReply with /{command} <number above>, or /{command} <phone|@username>."
+    )
+
+
+def _pending_pick(db: Session, account: WhatsAppAccount, identifier: str):
+    """Resolves a bare-list index ('1') to its pending entry. A real
+    phone ref is far too long to collide with a list position, so a
+    small all-digit identifier is unambiguous — anything else (or an
+    out-of-range index) falls through to the normal with-args path."""
+    if not identifier.isdigit():
+        return None
+    pending = list_pending_handoffs(db, account.owner) if account.owner else []
+    idx = int(identifier) - 1
+    if not 0 <= idx < len(pending):
+        return None
+    return pending[idx]
+
+
+async def _resume_pending_pick(db: Session, account: WhatsAppAccount, pick: dict) -> str:
+    # A pick carries its own account context (the merchant may run
+    # several business numbers) — resume against the entry's account,
+    # not whichever number the command arrived on.
+    if pick["channel"] == "instagram":
+        return await _resume_instagram_conversation(db, account, pick["ref"])
+    try:
+        crud_message.resume_conversation_for_account(db, uuid.UUID(pick["account_id"]), pick["ref"])
+    except crud_message.ConversationNotFoundError as e:
+        return str(e)
+    except crud_message.ConversationNotInHandoffError as e:
+        return str(e)
+    return f"Conversation with {pick['ref']} resumed. Amara will respond to their next message."
+
+
+async def _resend_pending_pick(db: Session, account: WhatsAppAccount, pick: dict) -> str:
+    if pick["channel"] == "instagram":
+        return await _resend_instagram_customer(db, account, pick["ref"])
+    pick_account = (
+        db.query(WhatsAppAccount).filter(WhatsAppAccount.id == uuid.UUID(pick["account_id"])).first()
+    )
+    if not pick_account:
+        return "That business number is no longer connected."
+    return await _resend_whatsapp_customer(db, pick_account, pick["ref"])
 
 
 def _render_resend_result(who: str, order: Order, result) -> str:
@@ -244,22 +316,9 @@ async def _resend_instagram_customer(db: Session, account: WhatsAppAccount, ig_u
     InstagramAccount, username or ig_scoped_id). Same single-order rule
     as the WhatsApp path above.
     """
-    ig_account = (
-        db.query(InstagramAccount)
-        .filter(InstagramAccount.user_id == account.user_id, InstagramAccount.access_token != "")
-        .first()
-    )
+    ig_account, ig_customer = resolve_instagram_customer(db, account.user_id, ig_username)
     if not ig_account:
         return "No Instagram account connected."
-
-    ig_customer = (
-        db.query(InstagramCustomer)
-        .filter(
-            InstagramCustomer.account_id == ig_account.id,
-            (InstagramCustomer.username == ig_username) | (InstagramCustomer.ig_scoped_id == ig_username),
-        )
-        .first()
-    )
     if not ig_customer:
         return f"No Instagram conversation with @{ig_username} found."
 
@@ -292,22 +351,9 @@ async def _resume_instagram_conversation(db: Session, account: WhatsAppAccount, 
     global-Customer ambiguity to guard against here, since
     InstagramCustomer.account_id already scopes ownership directly.
     """
-    ig_account = (
-        db.query(InstagramAccount)
-        .filter(InstagramAccount.user_id == account.user_id, InstagramAccount.access_token != "")
-        .first()
-    )
+    ig_account, ig_customer = resolve_instagram_customer(db, account.user_id, ig_username)
     if not ig_account:
         return "No Instagram account connected."
-
-    ig_customer = (
-        db.query(InstagramCustomer)
-        .filter(
-            InstagramCustomer.account_id == ig_account.id,
-            (InstagramCustomer.username == ig_username) | (InstagramCustomer.ig_scoped_id == ig_username),
-        )
-        .first()
-    )
     if not ig_customer:
         return f"No Instagram conversation with @{ig_username} found."
 

@@ -1,4 +1,5 @@
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from app.core.catalog_client import DRAFT_NAME_PREFIX
 from app.db.models import Product, User
@@ -6,6 +7,16 @@ from app.schemas.product import ProductCreate, ProductUpdate
 from typing import List, Optional
 import re
 import uuid
+
+
+# Columns a bulk row may never write, on either the insert or the update
+# branch: identity/audit columns plus flags that only complete via their own
+# rule (is_draft) or stay admin-managed even in bulk (#90). Shared by both
+# branches so they can't drift apart again.
+_BULK_PROTECTED_FIELDS = frozenset({
+    'id', 'merchant_id', 'slug', 'created_at', 'is_draft',
+    'is_platform_plan', 'monthly_reply_limit',
+})
 
 
 def maybe_complete_draft(db_product: Product) -> bool:
@@ -72,7 +83,16 @@ def create_product(db: Session, product_in: ProductCreate, merchant_id: uuid.UUI
         merchant_id=merchant_id
     )
     db.add(db_product)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # generate_slug is check-then-insert: a concurrent create may commit
+        # the same slug between our check and our flush. Roll back and retry
+        # once with a guaranteed-fresh suffix; a second failure propagates.
+        db.rollback()
+        db_product.slug = f"{slug}-{uuid.uuid4().hex[:4]}"
+        db.add(db_product)
+        db.commit()
     db.refresh(db_product)
     # Best-effort Meta catalog sync: silent no-op when CATALOG_* is unset,
     # never breaks this write (see app/tasks/catalog_sync.py).
@@ -127,6 +147,12 @@ def bulk_upsert_products(db: Session, merchant_id: uuid.UUID, products_data: Lis
     products_data is a list of dictionaries.
     Uses 'sku' to identify existing products.
     """
+    if not dry_run:
+        # Same match-then-insert race as import_catalog_products: two
+        # simultaneous uploads for one merchant would otherwise both miss
+        # each other's uncommitted sku rows and insert duplicates. Dry runs
+        # read only, so they skip the lock.
+        lock_merchant_row(db, merchant_id)
     stats = {
         "requires_confirmation": dry_run,
         "total_products": len(products_data),
@@ -155,7 +181,7 @@ def bulk_upsert_products(db: Session, merchant_id: uuid.UUID, products_data: Lis
                 stats["duplicate_skus"].append(sku)
             if not dry_run:
                 for key, value in p_data.items():
-                    if hasattr(db_product, key) and key not in ['id', 'merchant_id', 'slug', 'created_at', 'is_draft', 'is_platform_plan', 'monthly_reply_limit']:
+                    if hasattr(db_product, key) and key not in _BULK_PROTECTED_FIELDS:
                         setattr(db_product, key, value)
                 # A bulk row can only clear the flag via the completion rule,
                 # never set or clear it directly (see excluded keys above).
@@ -167,9 +193,13 @@ def bulk_upsert_products(db: Session, merchant_id: uuid.UUID, products_data: Lis
             if not dry_run:
                 name = p_data.get("name", "Unnamed")
                 slug = generate_slug(db, name)
-                # CSV rows can carry any column — plan fields are never
-                # writable in bulk (#90), not even for admins.
-                clean = {k: v for k, v in p_data.items() if k not in ('is_platform_plan', 'monthly_reply_limit')}
+                # CSV rows can carry any column — unknown keys would TypeError
+                # the constructor, and identity/audit/flag columns must never
+                # come from a sheet (same exclusion as the update branch).
+                clean = {
+                    k: v for k, v in p_data.items()
+                    if hasattr(Product, k) and k not in _BULK_PROTECTED_FIELDS
+                }
                 new_product = Product(
                     merchant_id=merchant_id,
                     slug=slug,

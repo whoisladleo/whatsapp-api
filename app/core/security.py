@@ -37,6 +37,30 @@ def generate_otp(length: int = 6) -> str:
     return ''.join(str(secrets.randbelow(10)) for _ in range(length))
 
 
+def sha256_hex(value: str) -> str:
+    """Hex digest for storing short secrets (OTP codes, refresh-token
+    bearers) — the DB holds the digest, never the secret itself."""
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def verify_sha256_hex(stored_hex: Optional[str], candidate: str) -> bool:
+    """Constant-time check of a candidate secret against a stored hex
+    digest. Never raises on a missing/malformed stored value — that's just
+    a non-match (no code set, or a legacy row)."""
+    if not stored_hex:
+        return False
+    try:
+        return hmac.compare_digest(stored_hex, sha256_hex(candidate))
+    except TypeError:
+        return False
+
+
+def generate_refresh_token() -> str:
+    """Opaque single-use refresh bearer (256 bits of entropy); only its
+    sha256 lands in the DB (see RefreshToken)."""
+    return secrets.token_urlsafe(32)
+
+
 def verify_meta_signature(
     raw_body: bytes, signature_header: Optional[str], app_secret: Optional[str] = None
 ) -> bool:

@@ -406,6 +406,28 @@ async def test_consume_send_failure_stays_armed(
     assert get_reply_mode(merchant.id) is not None
 
 
+def test_resolve_instagram_customer_matches_username_or_scoped_id(
+    db_session, merchant, ig_handoff
+):
+    from app.services.handoff_flow import resolve_instagram_customer
+
+    by_name = resolve_instagram_customer(db_session, merchant.id, "waitingbuyer")
+    assert by_name[0].ig_business_id == "ig_biz_flow"
+    assert by_name[1].id == ig_handoff.id
+
+    by_scoped_id = resolve_instagram_customer(db_session, merchant.id, "igsid_flow")
+    assert by_scoped_id[1].id == ig_handoff.id
+
+    unknown = resolve_instagram_customer(db_session, merchant.id, "nobody")
+    assert unknown[0] is not None and unknown[1] is None
+
+
+def test_resolve_instagram_customer_without_connected_account(db_session, merchant):
+    from app.services.handoff_flow import resolve_instagram_customer
+
+    assert resolve_instagram_customer(db_session, merchant.id, "anyone") == (None, None)
+
+
 def test_normalize_button_id_accepts_payload_or_title():
     from app.services.handoff_flow import normalize_button_id
 

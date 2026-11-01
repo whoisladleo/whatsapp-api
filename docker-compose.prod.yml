@@ -16,6 +16,9 @@ services:
       - SECRET_KEY=${SECRET_KEY:-generate_a_very_secure_random_string_here}
       - ALGORITHM=${ALGORITHM:-HS256}
       - ACCESS_TOKEN_EXPIRE_MINUTES=${ACCESS_TOKEN_EXPIRE_MINUTES:-1440}
+      # Fernet key for stored-token encryption (finding 9) — required at boot
+      # and at migrate time. Generate once, back up with the DB credentials.
+      - TOKEN_ENCRYPTION_KEY=${TOKEN_ENCRYPTION_KEY}
       - WHATSAPP_TOKEN=${WHATSAPP_TOKEN}
       - PHONE_NUMBER_ID=${PHONE_NUMBER_ID}
       - WEBHOOK_VERIFY_TOKEN=${WEBHOOK_VERIFY_TOKEN}
@@ -64,6 +67,9 @@ services:
       - RUN_MODE=production
       - PROJECT_NAME=${PROJECT_NAME:-WhatsApp Medium}
       - SECRET_KEY=${SECRET_KEY:-generate_a_very_secure_random_string_here}
+      # Worker decrypts stored tokens on every send — same key as api, or it
+      # fails the boot check.
+      - TOKEN_ENCRYPTION_KEY=${TOKEN_ENCRYPTION_KEY}
       - WHATSAPP_TOKEN=${WHATSAPP_TOKEN}
       - PHONE_NUMBER_ID=${PHONE_NUMBER_ID}
       - CELERY_BROKER_URL=redis://redis:6379/0

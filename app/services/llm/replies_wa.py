@@ -6,8 +6,8 @@ from sqlalchemy.orm import Session
 from app.core.attachments import describe_attachments
 from app.core.config import settings
 from app.core.security import normalize_phone
+from app.crud import message as crud_message
 from app.db.models import (
-    ConversationContext,
     ConversationState,
     Customer,
     Message,
@@ -73,12 +73,11 @@ class WAReplyMixin:
             db.commit()
             db.refresh(customer)
             
-        context = db.query(ConversationContext).filter(ConversationContext.customer_id == customer.id).first()
-        if not context:
-            context = ConversationContext(customer_id=customer.id)
-            db.add(context)
-            db.commit()
-            db.refresh(context)
+        # Scoped per (customer, account): a handoff or pending quote at one
+        # shop must not leak into this shop's conversation with the same
+        # phone number. Legacy NULL-account rows are adopted by the first
+        # account that sees them (see crud.message.get_or_create_context).
+        context = crud_message.get_or_create_context(db, customer.id, account.id)
 
         # The customer just sent a new message, so they're no longer
         # "quiet" — proactively clear any outstanding quote-nudge state

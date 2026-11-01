@@ -267,7 +267,7 @@ def test_sync_enables_ai_when_allowed(
 
 
 def test_sync_skips_disconnected_instagram_account(db_session, merchant, platform_product, instagram_account):
-    instagram_account.access_token = ""
+    instagram_account.access_token = None
     instagram_account.ai_enabled = False
     db_session.commit()
 
@@ -275,7 +275,7 @@ def test_sync_skips_disconnected_instagram_account(db_session, merchant, platfor
 
     db_session.refresh(instagram_account)
     assert instagram_account.ai_enabled is False
-    assert instagram_account.access_token == ""
+    assert instagram_account.access_token is None
 
 
 def test_sync_is_a_no_op_without_any_plan(db_session, merchant, whatsapp_account):

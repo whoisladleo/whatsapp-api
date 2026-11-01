@@ -185,8 +185,17 @@ async def handle_webhook(
                 )
             elif (
                 item.get("direction") == "inbound"
-                and item.get("type") == "interactive"
-                and (item.get("interactive_id") or item.get("body"))
+                and (
+                    (
+                        item.get("type") == "interactive"
+                        and (item.get("interactive_id") or item.get("body"))
+                    )
+                    # Template quick-reply taps may also arrive as type
+                    # "button" (button.text = the title, no payload id) —
+                    # same tap, different envelope. Route them identically
+                    # instead of storing them silent.
+                    or (item.get("type") == "button" and item.get("body"))
+                )
                 and (
                     account_is_platform
                     or (

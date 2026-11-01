@@ -29,7 +29,17 @@ class Settings(BaseSettings):
     # Security
     SECRET_KEY: str = "your-super-secret-key-change-it"
     ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 7 days
+    # Short-lived access (60 min), renewed via rotating refresh tokens (7
+    # days, single-use rotation, server-side records — see RefreshToken and
+    # POST /auth/refresh). Was a flat 7 days with no refresh or revoke.
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
+    REFRESH_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 7 days
+
+    # Fernet key (from `Fernet.generate_key()`) encrypting third-party
+    # secrets stored in the DB (Meta tokens, number PINs — see
+    # app/db/encrypted.py). Losing it makes every stored token unreadable,
+    # so back it up with the database credentials, not the code.
+    TOKEN_ENCRYPTION_KEY: Optional[str] = None
 
     @model_validator(mode="after")
     def _reject_placeholder_secret_key(self):
@@ -45,6 +55,30 @@ class Settings(BaseSettings):
                 "missing or public placeholder key (anyone holding it can "
                 "forge JWTs for any user). Set the SECRET_KEY environment "
                 "variable to a random value."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _require_token_encryption_key(self):
+        if self.TESTING:
+            return self
+        if not self.TOKEN_ENCRYPTION_KEY or not self.TOKEN_ENCRYPTION_KEY.strip():
+            raise ValueError(
+                "TOKEN_ENCRYPTION_KEY is not configured: refusing to start "
+                "without it (stored Meta tokens could not be read). Set the "
+                "TOKEN_ENCRYPTION_KEY environment variable to a "
+                "`Fernet.generate_key()` value."
+            )
+        try:
+            from cryptography.fernet import Fernet
+
+            Fernet(self.TOKEN_ENCRYPTION_KEY.strip().encode())
+        except Exception:
+            raise ValueError(
+                "TOKEN_ENCRYPTION_KEY is not a valid Fernet key: refusing "
+                "to start. Generate one with "
+                "`python -c \"from cryptography.fernet import Fernet; "
+                "print(Fernet.generate_key().decode())\"`."
             )
         return self
 

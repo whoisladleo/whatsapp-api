@@ -6,9 +6,11 @@ import respx
 
 from app.db.models import (
     ConversationContext,
+    ConversationState,
     Customer,
     InstagramAccount,
     InstagramCustomer,
+    Message,
     Order,
     OrderStatus,
     PaymentType,
@@ -492,11 +494,49 @@ async def test_fresh_clone_directly_refuses_phoneless_parties(
 # --- /resend command ---
 
 
-async def test_resend_command_usage(db_session, account):
-    assert await handle_merchant_message(db_session, account, "/resend", "255700000920") == (
-        "Usage: `/resend 2557XXXXXXXX` (WhatsApp customer) or "
-        "`/resend @their_instagram_username` (Instagram customer)"
+async def test_bare_resend_with_nothing_waiting(db_session, account):
+    assert (
+        await handle_merchant_message(db_session, account, "/resend", "255700000920")
+        == "No customers are waiting for you right now."
     )
+
+
+def _hand_off(db_session, account, customer):
+    db_session.add(
+        Message(
+            from_phone=customer.phone_number, type="text", body="need help",
+            direction="inbound", status="sent", account_id=account.id,
+        )
+    )
+    db_session.add(
+        ConversationContext(
+            customer_id=customer.id, state=ConversationState.HUMAN_HANDOFF,
+            handoff_at=datetime.utcnow(),
+        )
+    )
+    db_session.commit()
+
+
+async def test_bare_resend_lists_pending_handoffs(db_session, account, customer):
+    _hand_off(db_session, account, customer)
+
+    reply = await handle_merchant_message(db_session, account, "/resend", "255700000920")
+
+    assert f"1. {customer.phone_number}" in reply
+    assert "/resend <number above>" in reply
+
+
+@respx.mock
+async def test_resend_index_pick_refires_single_live_order(
+    db_session, account, customer, product
+):
+    _mock_tunzaa()
+    _hand_off(db_session, account, customer)
+    _order(db_session, customer, product, account=account)
+
+    reply = await handle_merchant_message(db_session, account, "/resend 1", "255700000920")
+
+    assert reply == "Payment prompt re-sent to 255722220001 for Widget (TZS 50,000)."
 
 
 async def test_resend_command_no_pending_orders(db_session, account, customer):

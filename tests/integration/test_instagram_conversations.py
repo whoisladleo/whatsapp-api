@@ -147,6 +147,17 @@ def test_messages_404_for_customer_belonging_to_another_account(client, db_sessi
     assert resp.status_code == 404
 
 
+@pytest.mark.parametrize("limit", [0, -1, 501, 100000])
+def test_messages_rejects_out_of_range_limit(client, auth_user, account, customer, limit):
+    _, headers = auth_user
+    resp = client.get(
+        MESSAGES_URL,
+        params={"customer_id": customer.id, "limit": limit},
+        headers=headers,
+    )
+    assert resp.status_code == 422
+
+
 # --- POST /messages/send ----------------------------------------------------------
 
 

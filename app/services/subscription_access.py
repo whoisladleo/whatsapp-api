@@ -163,8 +163,8 @@ def sync_ai_access_for_merchant(db: Session, user: User) -> None:
     status change (app/services/product_subscription.py) and every account
     create/update/reconnect (app/crud/whatsapp.py, app/crud/instagram.py),
     so it always overrides whatever ai_enabled value a request tried to set.
-    Deliberately skips a disconnected Instagram account (access_token ==
-    "") — re-enabling it here would look like a reconnect it never had.
+    Deliberately skips a disconnected Instagram account (access_token IS
+    NULL) — re-enabling it here would look like a reconnect it never had.
     """
     allowed = is_merchant_allowed_ai(db, user)
 
@@ -176,7 +176,7 @@ def sync_ai_access_for_merchant(db: Session, user: User) -> None:
 
     for account in (
         db.query(InstagramAccount)
-        .filter(InstagramAccount.user_id == user.id, InstagramAccount.access_token != "")
+        .filter(InstagramAccount.user_id == user.id, InstagramAccount.access_token.isnot(None))
         .all()
     ):
         if account.ai_enabled != allowed:

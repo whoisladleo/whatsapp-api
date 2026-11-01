@@ -19,6 +19,8 @@ from app.schemas.auth import (
     Token,
     OTPRequest,
     OTPVerify,
+    RefreshRequest,
+    LogoutRequest,
     InstagramExchangeRequest,
     ImpersonateRequest,
     ImpersonatorRef,
@@ -31,6 +33,7 @@ from app.schemas.auth import (
     PayNowResponse,
 )
 from app.crud import instagram as crud_instagram
+from app.crud import refresh_token as crud_refresh
 from app.crud import user as crud_user
 from app.core.provider import WhatsAppProvider
 from app.services import instagram_oauth, self_service_billing
@@ -100,10 +103,34 @@ async def send_otp_message(phone_number: str, otp: str):
     except Exception as e:
         print(f"Failed to send OTP to {phone_number}: {e}")
 
+def _mint_session_tokens(db: Session, user: User) -> dict:
+    """
+    A real login's token pair: short-lived access (60 min) plus a rotating
+    refresh bearer (7 days, single-use). Only the refresh hash is stored —
+    the raw bearer is returned here once and never again.
+    """
+    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    raw_refresh = security.generate_refresh_token()
+    crud_refresh.create_refresh_token(
+        db,
+        user.id,
+        security.sha256_hex(raw_refresh),
+        datetime.utcnow() + timedelta(minutes=settings.REFRESH_TOKEN_EXPIRE_MINUTES),
+    )
+    return {
+        "access_token": security.create_access_token(
+            user.id, expires_delta=access_token_expires
+        ),
+        "token_type": "bearer",
+        "refresh_token": raw_refresh,
+    }
+
+
 @router.post("/request-otp")
 async def request_otp(
-    otp_data: OTPRequest, 
+    otp_data: OTPRequest,
     background_tasks: BackgroundTasks,
+    request: Request,
     db: Session = Depends(get_db)
 ):
     phone_number = normalize_phone(otp_data.username.strip())
@@ -116,6 +143,16 @@ async def request_otp(
     # fail_open=False: a Redis outage must deny OTP sends (429), not
     # unlimit them (WhatsApp cost + victim spam).
     if not check_and_increment(f"otp_req:{phone_number}", limit=3, window_seconds=300, fail_open=False):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many OTP requests. Please wait a few minutes and try again.",
+        )
+    # Per-caller-IP guard alongside the per-recipient one above: without it
+    # one caller fans out to unlimited distinct numbers (same abuse, same
+    # cost). Mirrors ig_login_start's 30/300s shape; fail_open=False for the
+    # same reason as the per-recipient guard.
+    client_ip = request.client.host if request.client else "unknown"
+    if not check_and_increment(f"otp_req_ip:{client_ip}", limit=30, window_seconds=300, fail_open=False):
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Too many OTP requests. Please wait a few minutes and try again.",
@@ -176,30 +213,79 @@ def verify_otp(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    if not user.otp_code or user.otp_code != otp_data.otp_code:
+    # ONE message for wrong and expired alike — a distinct "expired" reply
+    # tells an attacker a guessed code was otherwise correct. The hash check
+    # always runs (constant-time), so neither case leaks via timing either.
+    code_ok = crud_user.verify_user_otp(user, otp_data.otp_code)
+    expired = bool(user.otp_expires_at and user.otp_expires_at < datetime.utcnow())
+    if expired or not code_ok:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid OTP code",
             headers={"WWW-Authenticate": "Bearer"},
         )
-        
-    if user.otp_expires_at and user.otp_expires_at < datetime.utcnow():
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="OTP code has expired",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-        
+
     # Clear OTP after successful verification
     crud_user.clear_user_otp(db, user)
 
-    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    return {
-        "access_token": security.create_access_token(
-            user.id, expires_delta=access_token_expires
-        ),
-        "token_type": "bearer",
-    }
+    return _mint_session_tokens(db, user)
+
+
+@router.post("/refresh", response_model=Token)
+def refresh_session(
+    payload: RefreshRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """
+    Single-use rotation: the presented bearer is revoked and a fresh
+    access + refresh pair is minted. A revoked, expired, unknown, or
+    orphaned (user deleted) bearer all get the same 401 — no oracle.
+    Impersonation JWTs can never pass here (nothing hashes to a stored
+    row), so impersonated sessions stay short-lived and non-refreshable.
+    """
+    client_ip = request.client.host if request.client else "unknown"
+    if not check_and_increment(f"auth_refresh:{client_ip}", limit=30, window_seconds=300):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many refresh attempts. Please wait a few minutes and try again.",
+        )
+
+    record = crud_refresh.get_refresh_token_by_hash(
+        db, security.sha256_hex(payload.refresh_token)
+    )
+    user = crud_user.get_user(db, record.user_id) if record is not None else None
+    if (
+        record is None
+        or record.revoked_at is not None
+        or record.expires_at < datetime.utcnow()
+        or user is None
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired refresh token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    crud_refresh.revoke_refresh_token(db, record)
+    return _mint_session_tokens(db, user)
+
+
+@router.post("/logout")
+def logout(payload: LogoutRequest, db: Session = Depends(get_db)):
+    """
+    Revokes the presented refresh bearer. Deliberately unauthenticated —
+    an expired access token must never block logging out — and always
+    succeeds: unknown, already-revoked, or missing tokens just mean
+    there's nothing left to revoke.
+    """
+    if payload.refresh_token:
+        record = crud_refresh.get_refresh_token_by_hash(
+            db, security.sha256_hex(payload.refresh_token)
+        )
+        if record is not None and record.revoked_at is None:
+            crud_refresh.revoke_refresh_token(db, record)
+    return {"success": True}
 
 
 @router.get("/instagram/start")
@@ -316,13 +402,7 @@ def exchange_instagram_login_code(payload: InstagramExchangeRequest, db: Session
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    return {
-        "access_token": security.create_access_token(
-            user.id, expires_delta=access_token_expires
-        ),
-        "token_type": "bearer",
-    }
+    return _mint_session_tokens(db, user)
 
 
 @router.post("/impersonate", response_model=Token)

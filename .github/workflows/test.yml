@@ -51,6 +51,9 @@ jobs:
       # boot without a real SECRET_KEY — migrations never touch JWT, so any
       # non-placeholder value satisfies the fail-fast check.
       SECRET_KEY: ci-migrations-dummy-key
+      # Same story for the stored-token encryption key: any *valid* Fernet
+      # value passes (this one is 32 zero bytes — insecure, test-only).
+      TOKEN_ENCRYPTION_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

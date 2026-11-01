@@ -1,7 +1,9 @@
 import enum
 import uuid
-from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, JSON, Boolean, Float, Enum, Index, Uuid, text
+from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, JSON, Boolean, Float, Enum, Index, UniqueConstraint, Uuid, text
 from sqlalchemy.orm import relationship, DeclarativeBase
+
+from app.db.encrypted import EncryptedString
 from datetime import datetime
 
 class Base(DeclarativeBase):
@@ -117,6 +119,25 @@ class User(Base):
     products = relationship("Product", back_populates="merchant")
 
 
+class RefreshToken(Base):
+    """
+    Server-side record for one rotating refresh bearer. Only the sha256 of
+    the opaque token is stored (never the bearer itself); POST /auth/refresh
+    revokes the presented row and mints a fresh one (single-use rotation),
+    POST /auth/logout revokes it. Expired/revoked rows are inert — rejected
+    on sight — and left in place (no janitor; a future cleanup can drop rows
+    past expiry once volume justifies it).
+    """
+    __tablename__ = "refresh_tokens"
+
+    id = Column(UUIDType, primary_key=True, default=uuid.uuid4, index=True)
+    user_id = Column(UUIDType, ForeignKey("users.id"), nullable=False, index=True)
+    token_hash = Column(String, unique=True, index=True, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    revoked_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class KnowledgeBase(Base):
     __tablename__ = "knowledge_bases"
 
@@ -137,7 +158,8 @@ class WhatsAppAccount(Base):
     id = Column(UUIDType, primary_key=True, default=uuid.uuid4, index=True)
     name = Column(String, nullable=False)
     phone_number_id = Column(String, unique=True, index=True, nullable=False)
-    access_token = Column(String, nullable=False)
+    # Fernet ciphertext at rest, plaintext in Python (see app/db/encrypted.py).
+    access_token = Column(EncryptedString, nullable=False)
     verify_token = Column(String, nullable=True)
     callback_url = Column(String, nullable=True)  # URL to forward incoming messages
     product_slug = Column(String, nullable=True)  # To identify knowledge base
@@ -169,7 +191,8 @@ class PhoneNumberPool(Base):
     # POST /{phone_number_id}/register again after each display-name change
     # (see create_whatsapp_account) — without it, a claimed number's display
     # name can be submitted but never actually activated.
-    two_step_pin = Column(String, nullable=True)
+    # Fernet ciphertext at rest, plaintext in Python (see app/db/encrypted.py).
+    two_step_pin = Column(EncryptedString, nullable=True)
     status = Column(Enum(PhoneNumberStatus), default=PhoneNumberStatus.AVAILABLE, nullable=False)
     whatsapp_account_id = Column(UUIDType, ForeignKey("whatsapp_accounts.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -189,7 +212,8 @@ class PhoneNumberProvisioningAttempt(Base):
     twilio_sid = Column(String, nullable=True)
     phone_number = Column(String, nullable=True)  # E.164, e.g. +12025551234
     phone_number_id = Column(String, nullable=True)  # Meta's ID, set once META_REGISTERED
-    two_step_pin = Column(String, nullable=True)
+    # Fernet ciphertext at rest, plaintext in Python (see app/db/encrypted.py).
+    two_step_pin = Column(EncryptedString, nullable=True)
     # Populated by the Twilio inbound-SMS webhook once Meta's verification
     # code arrives (app/api/v1/pool.py) — the provisioning script polls this
     # column rather than receiving the code directly, since the code arrives
@@ -294,7 +318,10 @@ class InstagramAccount(Base):
 
     id = Column(UUIDType, primary_key=True, default=uuid.uuid4, index=True)
     ig_business_id = Column(String, unique=True, index=True, nullable=False)
-    access_token = Column(String, nullable=False)
+    # Fernet ciphertext at rest, plaintext in Python (see app/db/encrypted.py).
+    # NULL marks a disconnected account — never an empty string, which can't
+    # be matched in SQL once values are randomized ciphertext.
+    access_token = Column(EncryptedString, nullable=True)
     username = Column(String, nullable=True)
     ai_enabled = Column(Boolean, default=True)
     user_id = Column(UUIDType, ForeignKey("users.id"))
@@ -467,7 +494,10 @@ class Customer(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     orders = relationship("Order", back_populates="customer")
-    conversation = relationship("ConversationContext", back_populates="customer", uselist=False)
+    # One entry per WhatsApp account this phone has chatted with (see
+    # ConversationContext) — a list, not a scalar, since the same phone
+    # number can hold separate state with several shops at once.
+    conversations = relationship("ConversationContext", back_populates="customer")
 
 
 class Order(Base):
@@ -624,8 +654,21 @@ class ProductSubscription(Base):
 class ConversationContext(Base):
     __tablename__ = "conversation_contexts"
 
+    # One row per (customer, WhatsApp account): handoff, quote-nudge, and
+    # negotiation state must not leak across shops that share a customer
+    # phone number — a handoff at shop A used to silence the bot at shop B,
+    # and chatting at B cleared A's pending quote. account_id is NULL only
+    # for pre-scoping legacy rows, which the first account to see them
+    # adopts (see crud.message.get_or_create_context); Postgres and SQLite
+    # both treat NULLs as distinct in a unique constraint, so legacy rows
+    # never collide with each other or with scoped rows.
+    __table_args__ = (
+        UniqueConstraint("customer_id", "account_id", name="uq_conversation_contexts_customer_account"),
+    )
+
     id = Column(UUIDType, primary_key=True, default=uuid.uuid4, index=True)
-    customer_id = Column(UUIDType, ForeignKey("customers.id"), unique=True)
+    customer_id = Column(UUIDType, ForeignKey("customers.id"))
+    account_id = Column(UUIDType, ForeignKey("whatsapp_accounts.id"), nullable=True, index=True)
     state = Column(Enum(ConversationState), default=ConversationState.NEGOTIATING)
     failed_cycles = Column(Integer, default=0)
     current_product_intent = Column(String, nullable=True)
@@ -641,7 +684,8 @@ class ConversationContext(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    customer = relationship("Customer", back_populates="conversation")
+    customer = relationship("Customer", back_populates="conversations")
+    account = relationship("WhatsAppAccount")
 
 
 class AmaraEvent(Base):

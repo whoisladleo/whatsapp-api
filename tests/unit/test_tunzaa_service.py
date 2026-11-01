@@ -138,6 +138,23 @@ async def test_create_installment_plan_payload(db_session):
 
 
 @respx.mock
+async def test_initiate_payment_rounds_fractional_amount():
+    service = _service()
+    respx.post(TOKEN_URL).mock(
+        return_value=httpx.Response(200, json={"access_token": "tok-1"})
+    )
+    payment_route = respx.post(PAYMENT_URL).mock(
+        return_value=httpx.Response(200, json={"status": "PENDING"})
+    )
+
+    await service.initiate_payment("255711111111", 45000.9, "order-round-up")
+    await service.initiate_payment("255711111111", 45000.4, "order-round-down")
+
+    assert json.loads(payment_route.calls[0].request.content)["amount"] == "45001"
+    assert json.loads(payment_route.calls[1].request.content)["amount"] == "45000"
+
+
+@respx.mock
 async def test_initiate_payment_raises_on_http_error():
     service = _service()
     respx.post(TOKEN_URL).mock(

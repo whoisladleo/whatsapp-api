@@ -47,7 +47,7 @@ def test_disconnect_account_clears_token_and_pauses_ai_without_deleting_the_row(
 
     reloaded = db_session.query(InstagramAccount).filter(InstagramAccount.id == account_id).first()
     assert reloaded is not None
-    assert reloaded.access_token == ""
+    assert reloaded.access_token is None
     assert reloaded.ai_enabled is False
     assert reloaded.ig_business_id == "ig_1"
 
