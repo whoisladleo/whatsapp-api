@@ -152,6 +152,7 @@ async def pay_now(
         order = Order(
             customer_id=customer.id,
             product_id=product.id,
+            buyer_user_id=user.id,
             quantity=1,
             agreed_price=price,
             payment_type=PaymentType.FULL,

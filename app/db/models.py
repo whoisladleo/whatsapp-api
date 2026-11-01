@@ -500,6 +500,11 @@ class Order(Base):
     customer_id = Column(UUIDType, ForeignKey("customers.id"))
     product_id = Column(UUIDType, ForeignKey("products.id"), nullable=True)
     account_id = Column(UUIDType, ForeignKey("whatsapp_accounts.id"), nullable=True)
+    # Dashboard-native purchases (Pay Now) carry no channel account, so the
+    # merchant join can't attribute them — this records the buying user at
+    # creation instead, and the merchant scopings OR on it (#16). Chat
+    # closes leave it NULL (attributed via their account).
+    buyer_user_id = Column(UUIDType, ForeignKey("users.id"), nullable=True, index=True)
     # An order originates from exactly one channel — this is set instead of
     # account_id for a deal Amara closed over Instagram DM (see
     # LLMService._close_instagram_deal), which needs a real Customer/Order

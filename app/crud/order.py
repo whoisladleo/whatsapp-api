@@ -25,7 +25,11 @@ def _to_order_read(order: Order) -> OrderRead:
         agreed_price=order.agreed_price,
         account_id=order.account_id,
         instagram_account_id=order.instagram_account_id,
-        channel="instagram" if order.instagram_account_id else "whatsapp",
+        channel=(
+            "instagram"
+            if order.instagram_account_id
+            else ("whatsapp" if order.account_id else "dashboard")
+        ),
         product_name=order.product.name if order.product else None,
         customer_phone=order.customer.phone_number if order.customer else None,
         reserved_until=order.reserved_until,
@@ -65,6 +69,8 @@ def get_orders_by_merchant(
     # InstagramAccount (never both — see Order.instagram_account_id), so
     # this outer-joins both and matches whichever one is actually set,
     # rather than requiring every merchant to have a WhatsApp account.
+    # Dashboard-native purchases (Pay Now) carry no channel account at
+    # all — those match on the recorded buying user instead (#16).
     query = (
         db.query(Order)
         .outerjoin(WhatsAppAccount, Order.account_id == WhatsAppAccount.id)
@@ -73,6 +79,7 @@ def get_orders_by_merchant(
             or_(
                 WhatsAppAccount.user_id == user_id,
                 InstagramAccount.user_id == user_id,
+                Order.buyer_user_id == user_id,
             )
         )
     )
@@ -96,6 +103,7 @@ def get_order_for_merchant(db: Session, order_id: uuid.UUID, user_id: uuid.UUID)
             or_(
                 WhatsAppAccount.user_id == user_id,
                 InstagramAccount.user_id == user_id,
+                Order.buyer_user_id == user_id,
             ),
         )
         .first()
