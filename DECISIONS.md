@@ -1,5 +1,15 @@
 # Decisions
 
+## Merchant payment resend: /resend + endpoint + button (2026-11-01, #117/#18)
+
+**Chose:** one guarded service core (`payment_resend.merchant_resend_order`) behind three surfaces: the `/resend` merchant command (WA phone + IG @user), POST `/orders/{id}/resend`, and the dashboard button. Live PENDING FULL orders re-fire in place (same order-ref, newest txn wins — no double-charge by construction, 5-min throttle reused); expired holds cancel-then-re-close from identical terms through the real close path (validation, #114 index safety via cancel-first, subscription re-pointing, reminders); installments refused (Tunzaa-pushed legs); `/resend` with several live PENDINGs refuses listing the candidates instead of guessing; endpoint blocked while impersonating; every refusal carries a merchant-safe detail. The RESEND marker path delegates its Tunzaa call to the same core and only renders notes. Rollback discipline: any fresh-clone failure restores the old row exactly (status, hold, stock).
+
+**Considered and rejected:**
+- *Extending the expired hold instead of cloning.* Rejected per user Discovery pick: a fresh row mirrors Amara's own fresh-close and keeps retry history truthful; cancel-first satisfies the one-pending-per-deal index.
+- *Latest-wins for multi-PENDING /resend.* Rejected per user Discovery pick: refusing with a candidate list removes all wrong-deal prompt risk; the dashboard button covers the exact-order case.
+- *Re-firing installment legs.* Rejected (safety, not offered as a choice): legs go out on Tunzaa's schedule; re-firing would rebill one.
+- *Customer-facing text on merchant resend.* Rejected: the STK prompt itself is the notification; free text outside the 24h window fails silently (known incident) and a new template needs Meta approval.
+
 ## Phantom-payment detection: async LLM judge + merchant alert (2026-11-01, #116)
 
 **Chose:** after every AI reply sends (WA + IG), a celery task verifies the turn: exact filters first (turn ran the order machinery / handoff state / a live unexpired PENDING order backs the words), then an LLM judge for the remainder asking only "does this text claim a payment is already underway, given no live order?", then a merchant + OPS template alert on YES (existing handoff_notification template, tap-to-reply armed, no state flip, no nudge — alert-only). A per-conversation 6h Redis throttle bounds repeat pages. The monitor is total-fail-safe: judge unparseable/unavailable, no numbers on file, Redis down, or any internal crash all degrade to log lines, never exceptions — it must not break the pipeline it watches. Enqueue itself gates on (markers seen with no order action) or EN/SW payment tokens in either direction, so plain chat never pays for a judge call. Validated: 33 new tests plus a live 12/12 judge probe (EN/SW claims, presuppositions, future-conditionals, price talk, failure notices, true confirmations).

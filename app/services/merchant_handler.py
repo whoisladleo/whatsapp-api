@@ -1,8 +1,20 @@
 from sqlalchemy.orm import Session
-from app.db.models import WhatsAppAccount, Product, Message, InstagramAccount, InstagramCustomer
+from app.core.security import normalize_phone
+from app.db.models import (
+    Customer,
+    WhatsAppAccount,
+    Product,
+    Message,
+    InstagramAccount,
+    InstagramCustomer,
+    Order,
+    OrderStatus,
+    PaymentType,
+)
 from app.crud import message as crud_message
 from app.crud import instagram as crud_instagram
 from app.services.handoff_flow import relay_to_instagram_customer, relay_to_whatsapp_customer
+from app.services.payment_resend import ResendOutcome, merchant_resend_order
 import re
 
 async def handle_merchant_message(db: Session, account: WhatsAppAccount, message_body: str, from_phone: str) -> str:
@@ -14,6 +26,7 @@ async def handle_merchant_message(db: Session, account: WhatsAppAccount, message
     /price [Product_Name] max:[Price] min:[Price]
     /resume [Phone|@instagram_username]
     /reply [Phone|@instagram_username] [Message]
+    /resend [Phone|@instagram_username]
     /cancel (leave an armed handoff reply-mode without sending)
     """
     body = message_body.strip()
@@ -37,7 +50,9 @@ async def handle_merchant_message(db: Session, account: WhatsAppAccount, message
             "- To hand a conversation back to the AI: `/resume 2557XXXXXXXX` or "
             "`/resume @their_instagram_username`\n"
             "- To reply to a customer yourself: `/reply 2557XXXXXXXX Your message` or "
-            "`/reply @their_instagram_username Your message`"
+            "`/reply @their_instagram_username Your message`\n"
+            "- To re-fire a dead payment prompt: `/resend 2557XXXXXXXX` or "
+            "`/resend @their_instagram_username`"
         )
 
     if body.lower() == "/resume" or body.lower().startswith("/resume "):
@@ -72,6 +87,15 @@ async def handle_merchant_message(db: Session, account: WhatsAppAccount, message
         if identifier.startswith("@"):
             return await relay_to_instagram_customer(db, account.owner, identifier[1:], reply_text)
         return await relay_to_whatsapp_customer(db, account, identifier, reply_text)
+
+    if body.lower() == "/resend" or body.lower().startswith("/resend "):
+        identifier = body[len("/resend"):].strip()
+        if not identifier:
+            return "Usage: `/resend 2557XXXXXXXX` (WhatsApp customer) or `/resend @their_instagram_username` (Instagram customer)"
+
+        if identifier.startswith("@"):
+            return await _resend_instagram_customer(db, account, identifier[1:])
+        return await _resend_whatsapp_customer(db, account, identifier)
 
     if body.lower().startswith("/stock "):
         # Parse: /stock [Product_Name] +[Qty] or -[Qty]
@@ -140,6 +164,122 @@ async def handle_merchant_message(db: Session, account: WhatsAppAccount, message
             return "Invalid format. Example: `/price Shoes max:50000 min:40000`"
 
     return "Unknown command. Send `/manage` to see available commands."
+
+
+def _render_resend_result(who: str, order: Order, result) -> str:
+    """Merchant-facing rendering of a ResendResult — always names the
+    customer, product, and price so a re-fired prompt is never a mystery
+    charge. result.detail carries the pre-written safe explanation for
+    every refusal outcome."""
+    product_name = order.product.name if order.product else "their order"
+    price = f"TZS {(order.agreed_price or 0):,.0f}"
+    outcome = result.outcome
+    if outcome is ResendOutcome.RESENT:
+        return f"Payment prompt re-sent to {who} for {product_name} ({price})."
+    if outcome is ResendOutcome.FRESH_ORDERED:
+        return (
+            f"The old hold had expired — started a fresh order for {product_name} ({price}) "
+            f"and sent the prompt to {who}."
+        )
+    if outcome is ResendOutcome.THROTTLED:
+        return f"A prompt already went out recently — try again in {result.retry_after_seconds or 60}s."
+    return result.detail or "This order can't be resent right now."
+
+
+def _pending_full_orders(query):
+    return (
+        query.filter(Order.status == OrderStatus.PENDING, Order.payment_type == PaymentType.FULL)
+        .order_by(Order.created_at.desc())
+        .all()
+    )
+
+
+def _ambiguous_resend_reply(candidates) -> str:
+    lines = [
+        f"- {o.product.name if o.product else 'Order'} — TZS {(o.agreed_price or 0):,.0f}"
+        for o in candidates
+    ]
+    return (
+        "This customer has more than one pending order, so I won't guess which prompt to re-fire:\n"
+        + "\n".join(lines)
+        + "\nUse the resend button on the exact order in the dashboard."
+    )
+
+
+async def _resend_whatsapp_customer(db: Session, account: WhatsAppAccount, phone: str) -> str:
+    """
+    `/resend 2557XXXXXXXX`: re-fires the Tunzaa prompt on the customer's
+    single pending FULL order for this account (expired holds re-close
+    from identical terms — see payment_resend.merchant_resend_order).
+    Refuses rather than guesses when several are live, and explains
+    when only an installment plan is pending (Tunzaa pushes those legs
+    itself). Phone-keyed customers are global, but the order lookup is
+    scoped to this account — another shop's orders never leak in.
+    """
+    normalized = normalize_phone(phone)
+    customer = db.query(Customer).filter(Customer.phone_number == normalized).first()
+    base = (
+        db.query(Order).filter(Order.account_id == account.id, Order.customer_id == customer.id)
+        if customer
+        else db.query(Order).filter(False)
+    )
+    candidates = _pending_full_orders(base)
+    if len(candidates) > 1:
+        return _ambiguous_resend_reply(candidates)
+    if len(candidates) == 1:
+        return _render_resend_result(normalized, candidates[0], await merchant_resend_order(db, candidates[0]))
+    has_installment = (
+        base.filter(Order.status == OrderStatus.PENDING, Order.payment_type == PaymentType.INSTALLMENT).first()
+        is not None
+    )
+    if has_installment:
+        return "This customer's pending order is an installment plan — prompts go out on Tunzaa's own schedule, there is nothing to resend."
+    return f"No pending orders for {normalized}."
+
+
+async def _resend_instagram_customer(db: Session, account: WhatsAppAccount, ig_username: str) -> str:
+    """
+    `/resend @username` — the Instagram counterpart, scoped the same way
+    _resume_instagram_conversation is (this merchant's connected
+    InstagramAccount, username or ig_scoped_id). Same single-order rule
+    as the WhatsApp path above.
+    """
+    ig_account = (
+        db.query(InstagramAccount)
+        .filter(InstagramAccount.user_id == account.user_id, InstagramAccount.access_token != "")
+        .first()
+    )
+    if not ig_account:
+        return "No Instagram account connected."
+
+    ig_customer = (
+        db.query(InstagramCustomer)
+        .filter(
+            InstagramCustomer.account_id == ig_account.id,
+            (InstagramCustomer.username == ig_username) | (InstagramCustomer.ig_scoped_id == ig_username),
+        )
+        .first()
+    )
+    if not ig_customer:
+        return f"No Instagram conversation with @{ig_username} found."
+
+    who = f"@{ig_customer.username or ig_customer.ig_scoped_id}"
+    base = db.query(Order).filter(
+        Order.instagram_account_id == ig_account.id,
+        Order.instagram_customer_id == ig_customer.id,
+    )
+    candidates = _pending_full_orders(base)
+    if len(candidates) > 1:
+        return _ambiguous_resend_reply(candidates)
+    if len(candidates) == 1:
+        return _render_resend_result(who, candidates[0], await merchant_resend_order(db, candidates[0]))
+    has_installment = (
+        base.filter(Order.status == OrderStatus.PENDING, Order.payment_type == PaymentType.INSTALLMENT).first()
+        is not None
+    )
+    if has_installment:
+        return "This customer's pending order is an installment plan — prompts go out on Tunzaa's own schedule, there is nothing to resend."
+    return f"No pending orders for {who}."
 
 
 async def _resume_instagram_conversation(db: Session, account: WhatsAppAccount, ig_username: str) -> str:

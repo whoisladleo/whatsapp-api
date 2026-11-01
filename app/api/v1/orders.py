@@ -5,7 +5,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user
+from app.api.deps import forbid_impersonated, get_current_user
 from app.core.provider import WhatsAppProvider
 from app.crud import message as crud_message
 from app.crud.order import (
@@ -108,6 +108,52 @@ async def cancel_existing_order(
     await _notify_customer_of_cancellation(db, order)
 
     return get_order_detail_for_merchant(db, order_id, current_user.id)
+
+
+@router.post("/{order_id}/resend", response_model=OrderDetail)
+async def resend_order_payment(
+    order_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    _own_session: None = Depends(forbid_impersonated),
+):
+    """
+    Merchant-triggered retry of a dead payment prompt (#117): re-fires
+    the Tunzaa request on a live PENDING FULL order, or — when the hold
+    already expired — cancels the lapsed row and re-closes the identical
+    deal as a fresh order. Installments are refused (Tunzaa pushes legs
+    on its own schedule); a prompt re-fired within the throttle window
+    answers 429. Same order reference, so no double-charge by
+    construction. Blocked while impersonating: support never moves money.
+    Returns the order now awaiting payment (the fresh row after a clone).
+    """
+    from app.services.payment_resend import ResendOutcome, merchant_resend_order
+
+    order = get_order_for_merchant(db, order_id, current_user.id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if order.status != OrderStatus.PENDING:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Order is {order.status.value}, not PENDING — only a pending order can be resent.",
+        )
+
+    result = await merchant_resend_order(db, order)
+
+    if result.outcome in (ResendOutcome.RESENT, ResendOutcome.FRESH_ORDERED):
+        live_id = result.order.id if result.order else order_id
+        detail = get_order_detail_for_merchant(db, live_id, current_user.id)
+        if not detail:
+            raise HTTPException(status_code=500, detail="Resend succeeded but the order could not be reloaded.")
+        return detail
+    if result.outcome is ResendOutcome.THROTTLED:
+        raise HTTPException(
+            status_code=429,
+            detail=f"A prompt was already sent recently — try again in {result.retry_after_seconds or 60}s.",
+        )
+    if result.outcome is ResendOutcome.TUNZAA_ERROR:
+        raise HTTPException(status_code=502, detail="Could not reach Tunzaa right now.")
+    raise HTTPException(status_code=400, detail=result.detail or "This order can't be resent.")
 
 
 async def _notify_customer_of_cancellation(db: Session, order) -> None:
