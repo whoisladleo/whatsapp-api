@@ -281,12 +281,13 @@ class Settings(BaseSettings):
 
     # Template for the subscription nudge (daily sweep in
     # app/tasks/subscription_nudges.py): reminds a connected-but-unpaid
-    # merchant that Amara is paused. Static body plus a static URL button
-    # ("Taskflow OS" → dashboard settings) — no variables, so the send
-    # passes no components. Sent with platform credentials like the alerts
-    # above. None disables the sweep's sends (it logs and skips) — covers
-    # the pre-approval state, since an unapproved template name just gets
-    # Meta rejections.
+    # merchant that Amara is paused. Static body plus a quick-reply button
+    # answering "Yes" — no variables, so the send passes no components,
+    # and the tap itself is the pay confirmation (see the interactive
+    # branch in webhook_processing). Sent with platform credentials like
+    # the alerts above. None disables the sweep's sends (it logs and
+    # skips) — covers the pre-approval state, since an unapproved
+    # template name just gets Meta rejections.
     WHATSAPP_NUDGE_TEMPLATE_NAME: Optional[str] = "subscription_nudge"
     WHATSAPP_NUDGE_TEMPLATE_LANGUAGE: str = "en"
 
