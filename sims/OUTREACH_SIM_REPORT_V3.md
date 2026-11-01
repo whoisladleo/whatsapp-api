@@ -94,3 +94,44 @@ public rates, NOT verified against the Meta bill). Harness errors: none
   turns) is the controlled comparison, not the close count.
 - Handoff-heavy personas (D/E/F) end with the buyer talking to "the team"
   — the sim cannot verify a human actually follows up.
+
+## 8. Claude arm side-by-side (#108)
+
+Production runs `claude-sonnet-5` (confirmed: Coolify `LLM_PROVIDER=claude`);
+all sims through v3 ran `muse-spark-1.3`. Same code (`6315066`), prompts,
+scripts, and buyer behavior, model swapped. Transcripts:
+`sims/v3-claude-transcripts/`. Cost $0.1626 ESTIMATED at the harness's
+Muse-assumed rates — real Sonnet spend is higher; see cost note below.
+
+| metric (16 convos each) | Muse (v3) | Claude (v3c) |
+|---|---|---|
+| paid closes | G1, G2 | G1, G2 |
+| pending closes | A2, B1, B2 | A2, B1, B2 |
+| duplicate orders (DB) | 0 | 0 |
+| payment-truth violations | 0 | 0 (2 compliant conditionals: A2 t5 "to activate", A2 t8 "Once active") |
+| silent empty turns | 0 | 0 |
+| delivery asks | 0 | 0 |
+| length cuts | 3 (all recovered) | 0 |
+| mid-sentence fragments sent | 0 | 0 |
+| re-close guard fires | 1 (B2 t8) | 2 (A2 t5, G2 t4) |
+| gendered terms | 0 | 0 |
+| haggle floor / attacks refused | held / refused | held / refused |
+| voluntary handoffs | 7 (A1,D1,D2,E1,E2,F1,F2) | 3 (A1,D1,F1) |
+| Amara turns | 84 | 92 (+10%) |
+| est. tokens in / out (chars/4) | 106,878 / 2,858 | 116,893 (+9%) / 3,883 (+36%) |
+
+Behavioral notes (all first-hand): G1 t4 "Ninathibitisha malipo yako sasa,
+utapata uthibitisho rasmi hivi punde" and G2 t4 (thanks + guard reminder,
+no re-close claim) — payment-truth holds on Claude too, with the better
+G1 wording (promises the separate confirmation). H1 t4 handles the
+no-IG/no-WA buyer honestly ("haitakusaidia moja kwa moja") where Muse v2
+said "Bado inaweza kukusaidia". Claude declines-and-continues on
+skeptic/attack branches where Muse team-connects (D2/E1/E2/F2 stayed
+NEGOTIATING through longer scripts — hence the extra turns). One loose
+utterance: A2 t7 "I'll send the payment request again" — talk only, no
+AGREEMENT emitted, no second dispatch (DB confirms).
+
+Cost note: token volume is +9% in / +36% out on Claude, but the dollar
+comparison needs real rate cards for both models (the harness prices
+everything at $1.25/M + $4.25/M). Apply the pricing memo's rates to the
+token counts above for the money answer — I don't have the memo.
