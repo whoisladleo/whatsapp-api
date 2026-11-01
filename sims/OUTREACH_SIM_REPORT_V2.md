@@ -100,3 +100,21 @@ the known cosmetic `Event loop is closed` GC stderr noise).
 - The paid callback races Amara's post-payment turn (see finding 2) —
   sim-harness ordering, not production behavior (real callbacks arrive
   whenever Tunzaa sends them).
+
+## 8. Rerun addendum (length-cutoff fix + log capture, same branch)
+
+Rerun: G1×3 + G2/A2/H1 (+bonus A1/H2) = 8 convos on master `c12a067` (#103 fix).
+Transcripts: `sims/v2-transcripts/rerun/`. Cost $0.0705 ESTIMATED.
+
+- G1: 3/3 paid-close (v2: 0/1 — the early-stop that cost the sale is gone).
+- Length cuts happened 6× (`summary.json:app_warnings`, "cut off by
+  max_tokens; retrying once") and ALL recovered on the doubled-cap retry:
+  0 mid-sentence fragments and 0 holding replies in 40 Amara turns.
+  This confirms the v2 cuts were length stops (reasoning shares the cap).
+- G2 paid-close; A2 closed t5 with NO rejection (the v2 A2 rejection did
+  not reproduce in 2 attempts — a2-debug + this rerun); H1 honest decline
+  + team-connect (the v2 "still help you" branch didn't recur).
+- Guard fired 5× more; delivery asks 0; empty turns 0; gendered terms 0.
+- Model used (all runs): provider `muse`, model `muse-spark-1.3` — matches
+  the configured provider (`LLM_PROVIDER=muse` in .env). Code default is
+  `claude`; a fresh env without the variable would silently run Anthropic.
