@@ -1,5 +1,13 @@
 # Decisions
 
+## llm.py split into a package by job (2026-11-01, #111a)
+
+**Chose:** the 2,344-line `app/services/llm.py` is now `app/services/llm/` — constants, prompts (all reply-line dicts), markers (regexes + parsers), helpers (stock/hold/guards/text), providers (SDKs + completion + errors), and the `LLMService` class divided into job mixins (close, notify, replies, replies_dm, replies_wa) combined in service.py. Bodies moved byte-identical (verified by exact span coverage); only headers, mixin class lines, and the facade are new. `__init__.py` re-exports the full 30-name surface (every from-import anywhere, plus the `settings`/`os`/`httpx` monkeypatch targets), every module logs as `app.services.llm`, and the three names tests behavior-patch (`_try_claim_stock`, `_reclose_guard_note`, `match_post_to_product`) are called back through the facade so patches keep landing. Largest file is now 556 lines. Validated: full suite green with zero test edits (1387 passed / 96.23%), pyflakes clean.
+
+**Considered and rejected:**
+- *Moving code + updating all import sites.* Rejected per user Discovery pick: the facade keeps all 10 app + 16 test consumers untouched, so the diff is provably behavior-only.
+- *Splitting the test file and sim script in the same change.* Rejected per user Discovery pick: #111b (tests) follows separately, #111c (sim script) later.
+
 ## Shared LLM client: keep-alive off, both providers (2026-11-01, #121)
 
 **Chose:** both model SDKs get an httpx client with `keepalive_expiry=0` and the SDK-default 600s timeout, via one `_no_keepalive_http_client()` factory. Root cause (found by the #120 live probe): pooled connections bind to their creating loop, and every worker task runs in its own `asyncio.run` — the next same-process task reuses a connection bound to a closed loop and dies with "Event loop is closed", measured deterministically alternating 5/10 on rapid sequential calls. Production gaps usually exceeded the 5s pool expiry so replies mostly survived; rapid back-to-back turns (reply then verify seconds later) did not. After: 10/10 sequential shared-client completions on the production path and provider. Validated: 4 wiring tests (kwargs reach httpx, SDK holds our client, both providers) + live 10/10 probe, suite 1387 passed / 96.18%.
