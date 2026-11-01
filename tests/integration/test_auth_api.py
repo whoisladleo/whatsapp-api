@@ -546,6 +546,25 @@ def test_pay_now_uses_existing_username_as_phone(client, auth_user, db_session, 
 
 
 @respx.mock
+def test_pay_now_claims_no_stock_for_subscriptions(client, auth_user, db_session, monkeypatch):
+    # The seeded plan carries a bulk quantity, but plans have no units —
+    # Pay Now must leave it untouched, like the chat close does (#119).
+    product = _seed_platform_product(db_session)
+    _, headers = auth_user
+
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "tok-1"}))
+    respx.post(PAYMENT_URL).mock(
+        return_value=httpx.Response(200, json={"statusCode": 202, "success": True, "transactionID": "MOCK_TXN_NOSTOCK"})
+    )
+
+    resp = client.post("/api/v1/auth/me/subscription/pay", json={}, headers=headers)
+
+    assert resp.status_code == 200
+    db_session.refresh(product)
+    assert product.quantity == 999999
+
+
+@respx.mock
 def test_pay_now_with_inline_phone_number_saves_it_to_user(client, auth_user, db_session, monkeypatch):
     _seed_platform_product(db_session)
 
@@ -652,9 +671,9 @@ def test_pay_now_called_twice_reuses_pending_order(client, auth_user, db_session
     assert len(subscriptions) == 1
     assert subscriptions[0].order_id == orders[0].id
 
-    # Stock taken once, not per click.
+    # Plans have no units — Pay Now never takes stock for them (#119).
     db_session.refresh(product)
-    assert product.quantity == 999998
+    assert product.quantity == 999999
 
 
 @respx.mock
@@ -680,8 +699,8 @@ def test_pay_now_releases_reservation_on_dispatch_failure(client, auth_user, db_
 
 @respx.mock
 def test_pay_now_reused_order_dispatch_failure_restores_no_stock(client, auth_user, db_session, monkeypatch):
-    # Second click reuses the pending order (no stock taken this time), so
-    # a dispatch failure must cancel it without minting a phantom unit.
+    # Plans never take stock at all (#119), so a dispatch failure must
+    # cancel the order while leaving quantity untouched.
     from app.db.models import Order, OrderStatus
 
     product = _seed_platform_product(db_session)
@@ -698,7 +717,7 @@ def test_pay_now_reused_order_dispatch_failure_restores_no_stock(client, auth_us
     first = client.post("/api/v1/auth/me/subscription/pay", json={}, headers=headers)
     assert first.status_code == 200
     db_session.refresh(product)
-    assert product.quantity == 999998
+    assert product.quantity == 999999
 
     second = client.post("/api/v1/auth/me/subscription/pay", json={}, headers=headers)
     assert second.status_code == 502
@@ -707,7 +726,7 @@ def test_pay_now_reused_order_dispatch_failure_restores_no_stock(client, auth_us
     assert len(orders) == 1
     assert orders[0].status == OrderStatus.CANCELLED
     db_session.refresh(product)
-    assert product.quantity == 999998
+    assert product.quantity == 999999
 
 
 @respx.mock

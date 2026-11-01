@@ -146,7 +146,11 @@ async def pay_now(
     stock_taken = False
     fresh_order = False
     if order is None:
-        if product.quantity > 0:
+        # Subscriptions have no units — never claim stock for them, even
+        # when quantity drifted above zero (pre-#118 phantoms or a manual
+        # merchant edit). stock_taken stays False, so the release path
+        # below restores nothing either (#119).
+        if not product.is_subscription and product.quantity > 0:
             product.quantity -= 1
             stock_taken = True
         order = Order(
