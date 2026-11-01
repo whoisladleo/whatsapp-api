@@ -9,10 +9,11 @@ from datetime import datetime
 
 
 def resolve_handoff_number(user: User) -> Optional[str]:
-    """Handoff-alert recipient (#105): the explicit handoff number wins;
-    else the OTP `username`; else the profile `phone_number`. Values that
-    aren't dialable (social-login usernames, blanks) are skipped, so an
-    unset chain resolves to None and the alert stays silent."""
+    """Merchant-alert recipient (#105, #106): the explicit handoff number
+    wins; else the OTP `username`; else the profile `phone_number`. Values
+    that aren't dialable (social-login usernames, blanks) are skipped, so
+    an unset chain resolves to None and the alert stays silent. Used by
+    handoff alerts and usage warnings alike — one resolution, not two."""
     for raw in (user.handoff_phone_number, user.username, user.phone_number):
         normalized = normalize_phone(raw) if raw else ""
         if normalized and len(normalized) >= 9:
