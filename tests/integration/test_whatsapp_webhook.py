@@ -1278,3 +1278,150 @@ def test_button_type_takeover_tap_resumes_and_confirms(
     assert context.state == ConversationState.NEGOTIATING
     outbound = db_session.query(Message).filter(Message.direction == "outbound").first()
     assert "Amara is back on 255711111111" in outbound.body
+
+
+@respx.mock
+def test_platform_yes_reply_fires_subscription_push(
+    client, db_session, merchant_owner, monkeypatch
+):
+    # End-to-end wiring: a merchant answering YES on the platform chat
+    # reuses/creates their pending subscription order and fires the Tunzaa
+    # prompt — no dashboard login needed.
+    import fakeredis
+
+    import app.services.handoff_flow as flow_module
+
+    monkeypatch.setattr(flow_module, "redis_client", fakeredis.FakeRedis())
+
+    platform = WhatsAppAccount(
+        name="Taskflow",
+        phone_number_id="PHONE_YES",
+        access_token="tok",
+        ai_enabled=True,
+        is_platform_account=True,
+        user_id=merchant_owner.id,
+    )
+    db_session.add(platform)
+    db_session.add(
+        Product(
+            slug="taskflow-os-subscription", name="Taskflow OS Subscription",
+            max_price=100000, min_price=100000, quantity=999999,
+            merchant_id=merchant_owner.id, is_subscription=True,
+            is_platform_plan=True, monthly_reply_limit=2000,
+        )
+    )
+    db_session.commit()
+
+    respx.post("https://pay.tunzaa.co.tz/accounts/request/token").mock(
+        return_value=httpx.Response(200, json={"access_token": "tok-1"})
+    )
+    pay_route = respx.post("https://pay.tunzaa.co.tz/payments/initiate-payment").mock(
+        return_value=httpx.Response(
+            200, json={"statusCode": 202, "success": True, "transactionID": "TXN_YES"}
+        )
+    )
+    send_route = respx.post(url__regex=MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "wamid.yesreply"}]})
+    )
+
+    payload = _text_webhook_payload("PHONE_YES", merchant_owner.username, "YES", msg_id="wamid.yesm1")
+    resp = client.post(WEBHOOK_URL, json=payload)
+
+    assert resp.status_code == 200
+    assert pay_route.call_count == 1
+    assert send_route.called
+    outbound = db_session.query(Message).filter(Message.direction == "outbound").first()
+    assert "sent to 255700000099" in outbound.body
+
+
+def _yes_tap_payload(phone_number_id, from_phone, button_id, title, msg_id="wamid.yestap1"):
+    payload = _button_tap_payload(phone_number_id, from_phone, button_id, msg_id=msg_id)
+    reply = payload["entry"][0]["changes"][0]["value"]["messages"][0]["interactive"]["button_reply"]
+    reply["title"] = title
+    return payload
+
+
+def _platform_with_plan(db_session, merchant_owner, phone_number_id="PHONE_YES"):
+    platform = WhatsAppAccount(
+        name="Taskflow",
+        phone_number_id=phone_number_id,
+        access_token="tok",
+        ai_enabled=True,
+        is_platform_account=True,
+        user_id=merchant_owner.id,
+    )
+    db_session.add(platform)
+    db_session.add(
+        Product(
+            slug="taskflow-os-subscription", name="Taskflow OS Subscription",
+            max_price=100000, min_price=100000, quantity=999999,
+            merchant_id=merchant_owner.id, is_subscription=True,
+            is_platform_plan=True, monthly_reply_limit=2000,
+        )
+    )
+    db_session.commit()
+    return platform
+
+
+def _mock_tunzaa_push(txn_id="TXN_YES"):
+    respx.post("https://pay.tunzaa.co.tz/accounts/request/token").mock(
+        return_value=httpx.Response(200, json={"access_token": "tok-1"})
+    )
+    return respx.post("https://pay.tunzaa.co.tz/payments/initiate-payment").mock(
+        return_value=httpx.Response(
+            200, json={"statusCode": 202, "success": True, "transactionID": txn_id}
+        )
+    )
+
+
+@respx.mock
+def test_platform_yes_button_id_fires_subscription_push(
+    client, db_session, merchant_owner, monkeypatch
+):
+    # The nudge's quick-reply button: tapping it pays like typing YES.
+    # This covers the tap-id path (title intentionally unrelated).
+    import fakeredis
+
+    import app.services.handoff_flow as flow_module
+
+    monkeypatch.setattr(flow_module, "redis_client", fakeredis.FakeRedis())
+    _platform_with_plan(db_session, merchant_owner)
+    pay_route = _mock_tunzaa_push()
+    send_route = respx.post(url__regex=MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "wamid.yesreply"}]})
+    )
+
+    payload = _yes_tap_payload("PHONE_YES", merchant_owner.username, "Yes", "Pay now")
+    resp = client.post(WEBHOOK_URL, json=payload)
+
+    assert resp.status_code == 200
+    assert pay_route.call_count == 1
+    assert send_route.called
+    outbound = db_session.query(Message).filter(Message.direction == "outbound").first()
+    assert "sent to 255700000099" in outbound.body
+
+
+@respx.mock
+def test_platform_yes_button_title_fires_subscription_push(
+    client, db_session, merchant_owner, monkeypatch
+):
+    # Same tap, but Meta drifted the id — the title still matches.
+    import fakeredis
+
+    import app.services.handoff_flow as flow_module
+
+    monkeypatch.setattr(flow_module, "redis_client", fakeredis.FakeRedis())
+    _platform_with_plan(db_session, merchant_owner, phone_number_id="PHONE_YES2")
+    pay_route = _mock_tunzaa_push()
+    send_route = respx.post(url__regex=MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "wamid.yesreply"}]})
+    )
+
+    payload = _yes_tap_payload(
+        "PHONE_YES2", merchant_owner.username, "nudge_yes_drifted", "Yes"
+    )
+    resp = client.post(WEBHOOK_URL, json=payload)
+
+    assert resp.status_code == 200
+    assert pay_route.call_count == 1
+    assert send_route.called
