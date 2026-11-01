@@ -57,6 +57,9 @@ class UserProfile(BaseModel):
     # it (no username) — see app/services/subscription_access.py, which
     # matches this against the Customer who paid for the platform subscription.
     phone_number: Optional[str] = None
+    # Explicit handoff-alert override (dashboard settings) — see
+    # crud_user.resolve_handoff_number.
+    handoff_phone_number: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -88,6 +91,7 @@ class MerchantListRead(BaseModel):
 
 class UserProfileUpdate(BaseModel):
     phone_number: Optional[str] = None
+    handoff_phone_number: Optional[str] = None
 
 class MySubscriptionRead(BaseModel):
     # None status = no ProductSubscription found at all for this user —

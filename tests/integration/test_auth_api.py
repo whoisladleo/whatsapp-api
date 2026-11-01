@@ -381,6 +381,38 @@ def test_patch_me_without_phone_number_leaves_profile_unchanged(client, auth_use
     assert resp.json()["phone_number"] is None
 
 
+def test_patch_me_sets_handoff_number(client, auth_user, db_session):
+    user, headers = auth_user
+
+    resp = client.patch("/api/v1/auth/me", json={"handoff_phone_number": "0712345888"}, headers=headers)
+
+    assert resp.status_code == 200
+    assert resp.json()["handoff_phone_number"] == "255712345888"
+    db_session.refresh(user)
+    assert user.handoff_phone_number == "255712345888"
+
+
+def test_patch_me_rejects_non_dialable_handoff_number(client, auth_user):
+    _, headers = auth_user
+
+    resp = client.patch("/api/v1/auth/me", json={"handoff_phone_number": "not-a-number"}, headers=headers)
+
+    assert resp.status_code == 400
+
+
+def test_patch_me_empty_handoff_number_clears_override(client, auth_user, db_session):
+    user, headers = auth_user
+    user.handoff_phone_number = "255712345888"
+    db_session.commit()
+
+    resp = client.patch("/api/v1/auth/me", json={"handoff_phone_number": ""}, headers=headers)
+
+    assert resp.status_code == 200
+    assert resp.json()["handoff_phone_number"] is None
+    db_session.refresh(user)
+    assert user.handoff_phone_number is None
+
+
 # --- /me/subscription -----------------------------------------------------------
 
 TOKEN_URL = "https://pay.tunzaa.co.tz/accounts/request/token"

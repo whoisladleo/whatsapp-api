@@ -104,6 +104,11 @@ class User(Base):
     # who paid for the platform subscription. OTP merchants don't need this;
     # their phone is already `username`.
     phone_number = Column(String, nullable=True)
+    # Explicit handoff-alert override, set in dashboard settings. When set,
+    # handoff alerts go here instead of `username` (OTP number) — see
+    # crud_user.resolve_handoff_number. No uniqueness: two merchants may
+    # share an ops phone, and this is an alert target, not identity.
+    handoff_phone_number = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     accounts = relationship("WhatsAppAccount", back_populates="owner")

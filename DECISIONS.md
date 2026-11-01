@@ -209,3 +209,7 @@ Production-tier decisions only — what was chosen, what was considered and reje
 ## Amara closes the loop herself (2026-11-01, #104)
 
 **Chose:** no handover-at-interest flow — Amara runs the whole close (your call: handing off defeats her purpose). The post-payment wording contradiction is fixed at the source instead: all three prompts gain a payment-truth rule (never claim confirmed/received/active — the webhook confirmation arrives separately; on "I've paid" thank + say confirming). The webhook confirmation itself is now subscription-aware (no delivery line for plans; "subscription is now active" — the one place that may truthfully say so) with sw/en/bilingual variants. Handoff recipient stays `username or phone_number` (username wins, dashboard edits the fallback only) — no change; flagged as a possible follow-up.
+
+## Dedicated handoff number (2026-11-01, #105)
+
+**Chose:** `User.handoff_phone_number` (nullable, no index/unique — read off the loaded row, and two merchants may share an ops phone). Alert resolution is handoff-number, then OTP `username`, then profile `phone_number`, skipping non-dialable values (also fixes social-login usernames silently breaking the old `username or phone_number` pick). PATCH /auth/me sets it (400 on non-dialable, empty clears); dashboard settings card beside Billing Phone. Usage alerts and catalog sync keep the old resolution — handoffs only, per scope.

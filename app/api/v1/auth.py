@@ -472,10 +472,13 @@ def update_my_profile(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Currently only phone_number is settable — self-reported billing contact
-    for a merchant whose account has no phone tied to it (no username),
-    matched against the Customer who paid for the platform subscription.
-    See app/services/subscription_access.py.
+    phone_number is the self-reported billing contact for a merchant whose
+    account has no phone tied to it (no username), matched against the
+    Customer who paid for the platform subscription. See
+    app/services/subscription_access.py. handoff_phone_number is the
+    explicit handoff-alert override (empty clears it back to the OTP
+    number); unlike phone_number it needs no uniqueness — two merchants
+    may share an ops phone.
     """
     if payload.phone_number is not None:
         normalized = normalize_phone(payload.phone_number)
@@ -483,6 +486,16 @@ def update_my_profile(
         if existing and existing.id != current_user.id:
             raise HTTPException(status_code=400, detail="This phone number is already in use.")
         crud_user.set_user_phone_number(db, current_user, normalized)
+
+    if payload.handoff_phone_number is not None:
+        raw = payload.handoff_phone_number.strip()
+        if not raw:
+            crud_user.set_user_handoff_number(db, current_user, None)
+        else:
+            normalized = normalize_phone(raw)
+            if not normalized or len(normalized) < 9:
+                raise HTTPException(status_code=400, detail="That doesn't look like a phone number.")
+            crud_user.set_user_handoff_number(db, current_user, normalized)
 
     return current_user
 
