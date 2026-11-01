@@ -510,10 +510,6 @@ class FakeTunzaaService:
         self.calls.append({"method": "get_installment_plan", "plan_id": plan_id})
         return {"plan": {"plan_id": plan_id, "paid_amount": 0, "remaining_balance": 0}, "installments": []}
 
-    async def refund_payment(self, transaction_id, amount, reason):
-        self.calls.append({"method": "refund_payment", "transaction_id": transaction_id})
-        return {"status": "refunded"}
-
 
 def _content_len(content) -> int:
     if content is None:

@@ -102,18 +102,13 @@ def test_provision_after_payment_success(db_session, subscription, account, monk
     assert "ready" in notify_calls[0]
 
 
-def test_provision_after_payment_failure_refunds(db_session, subscription, monkeypatch):
+def test_provision_after_payment_failure_marks_refund_manual(db_session, subscription, monkeypatch):
+    # Refunds are manual (#110): no automatic reversal is attempted —
+    # support handles it by hand. The row is flagged refund-owed instead.
     async def fake_provision(db, verified_name=None, country_code=None):
         raise RuntimeError("Meta rejected it")
 
-    refund_calls = []
-
-    async def fake_refund(transaction_id, amount, reason):
-        refund_calls.append((transaction_id, amount, reason))
-        return {"status": "REFUNDED"}
-
     monkeypatch.setattr("app.services.pool_provisioning.provision_pool_number", fake_provision)
-    monkeypatch.setattr("app.services.tunzaa.tunzaa_service.refund_payment", fake_refund)
     notify_calls = _mock_notify_merchant(monkeypatch)
 
     sub_id = subscription.id
@@ -121,29 +116,28 @@ def test_provision_after_payment_failure_refunds(db_session, subscription, monke
 
     refreshed = db_session.query(NumberSubscription).filter(NumberSubscription.id == sub_id).first()
     assert refreshed.status == NumberSubscriptionStatus.PROVISIONING_FAILED
-    assert refund_calls == [("TXN-PAID", 10000, "Number provisioning failed")]
-    assert "refunded" in notify_calls[0]
-    assert refreshed.refund_status == "SUCCEEDED"
-
-
-def test_provision_after_payment_failure_refund_also_fails(db_session, subscription, monkeypatch):
-    async def fake_provision(db, verified_name=None, country_code=None):
-        raise RuntimeError("Meta rejected it")
-
-    async def fake_refund_fails(transaction_id, amount, reason):
-        raise RuntimeError("Tunzaa refund endpoint down")
-
-    monkeypatch.setattr("app.services.pool_provisioning.provision_pool_number", fake_provision)
-    monkeypatch.setattr("app.services.tunzaa.tunzaa_service.refund_payment", fake_refund_fails)
-    notify_calls = _mock_notify_merchant(monkeypatch)
-
-    sub_id = subscription.id
-    number_billing_tasks.provision_after_payment(sub_id)
-
-    refreshed = db_session.query(NumberSubscription).filter(NumberSubscription.id == sub_id).first()
-    assert refreshed.status == NumberSubscriptionStatus.PROVISIONING_FAILED
+    assert refreshed.refund_status == "MANUAL"
     assert "contact support" in notify_calls[0]
-    assert refreshed.refund_status == "FAILED"
+
+
+def test_provision_after_payment_failure_without_transaction_leaves_refund_null(
+    db_session, subscription, monkeypatch
+):
+    async def fake_provision(db, verified_name=None, country_code=None):
+        raise RuntimeError("Meta rejected it")
+
+    subscription.tunzaa_transaction_id = None
+    db_session.commit()
+    monkeypatch.setattr("app.services.pool_provisioning.provision_pool_number", fake_provision)
+    notify_calls = _mock_notify_merchant(monkeypatch)
+
+    sub_id = subscription.id
+    number_billing_tasks.provision_after_payment(sub_id)
+
+    refreshed = db_session.query(NumberSubscription).filter(NumberSubscription.id == sub_id).first()
+    assert refreshed.status == NumberSubscriptionStatus.PROVISIONING_FAILED
+    assert refreshed.refund_status is None
+    assert "contact support" in notify_calls[0]
 
 
 def test_provision_after_payment_missing_subscription_does_not_crash(db_session):

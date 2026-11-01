@@ -53,23 +53,13 @@ async def _do_provision_after_payment(subscription_id: str) -> None:
             logger.error(f"Number purchase provisioning failed for subscription {subscription_id}: {e}")
             subscription.status = NumberSubscriptionStatus.PROVISIONING_FAILED
 
+            # Refunds are manual (#110): support reverses the charge by hand
+            # (Tunzaa dashboard). MANUAL flags the row as refund-owed; a
+            # support action can flip it to SUCCEEDED later. No transaction
+            # means nothing was charged — leave refund_status NULL.
             if subscription.tunzaa_transaction_id:
-                try:
-                    await tunzaa_service.refund_payment(
-                        subscription.tunzaa_transaction_id,
-                        subscription.monthly_amount,
-                        reason="Number provisioning failed",
-                    )
-                    subscription.refund_status = "SUCCEEDED"
-                    refund_note = "You've been refunded."
-                except Exception as refund_err:
-                    logger.error(f"Refund failed for subscription {subscription_id}: {refund_err}")
-                    subscription.refund_status = "FAILED"
-                    refund_note = "Please contact support for a refund."
-            else:
-                # No transaction to reverse (defensive — provisioning only
-                # runs after a confirmed payment); leave refund_status NULL.
-                refund_note = "Please contact support for a refund."
+                subscription.refund_status = "MANUAL"
+            refund_note = "Please contact support for a refund."
             db.commit()
 
             await number_billing.notify_merchant(

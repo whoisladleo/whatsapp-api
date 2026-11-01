@@ -4,9 +4,10 @@ Revision ID: c9e1f4a2b7d3
 Revises: b7c3e9a1f4d2
 Create Date: 2026-11-01
 
-Audit fix #110: persist whether the post-provisioning-failure refund
-succeeded, so the dashboard stops statically claiming "you've been
-refunded". Nullable, no backfill (NULL = unknown / predates this).
+Audit fix #110: record post-provisioning-failure refund state (MANUAL
+= charge owed back, support reverses by hand), so the dashboard stops
+statically claiming "you've been refunded". Nullable, no backfill (NULL
+= nothing charged, or predates this).
 """
 from typing import Sequence, Union
 

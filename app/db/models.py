@@ -232,11 +232,12 @@ class NumberSubscription(Base):
     # 0 = no renewal retry used yet; 1 = the one allowed retry has fired.
     # A second consecutive failure at retry_count == 1 triggers DEACTIVATED.
     retry_count = Column(Integer, default=0, nullable=False)
-    # Outcome of the refund attempt after a PROVISIONING_FAILED (#110):
-    # "SUCCEEDED", "FAILED", or NULL when no refund was attempted (or the
-    # row predates this). The dashboard reads this instead of assuming the
-    # refund worked — the Tunzaa refund endpoint is still unverified, so a
-    # failure here is a real possibility, not a formality.
+    # Refund state after a PROVISIONING_FAILED (#110): "MANUAL" means a
+    # charge is owed back and support reverses it by hand (Tunzaa
+    # dashboard) — refunds are never attempted automatically. A support
+    # action can flip MANUAL to "SUCCEEDED" later. NULL means nothing was
+    # charged, or the row predates this. The dashboard shows the
+    # contact-support copy for anything but SUCCEEDED.
     refund_status = Column(String, nullable=True)
     provisioning_attempt_id = Column(
         UUIDType, ForeignKey("phone_number_provisioning_attempts.id"), nullable=True

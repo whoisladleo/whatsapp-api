@@ -84,47 +84,6 @@ class TunzaaService:
             print(f"Tunzaa initiate_payment error: {e}")
             raise
 
-    async def refund_payment(self, transaction_id: str, amount: float, reason: str) -> Dict[str, Any]:
-        """
-        Reverses a completed payment — used when a number purchase's payment
-        succeeds but the actual Twilio/Meta provisioning then fails (see
-        app/tasks/number_billing.py), so the merchant isn't charged for a
-        number they never got.
-
-        UNVERIFIED: unlike initiate_payment/create_installment_plan/
-        get_installment_plan (each confirmed against Tunzaa's real
-        sandbox API per the comments on those methods), no real Tunzaa
-        refund endpoint has been exercised against sandbox/production yet —
-        this endpoint path and payload shape are a best-effort guess
-        mirroring initiate_payment's shape. Confirm against Tunzaa's actual
-        API (or support) before relying on this in production; until then,
-        a failure here is logged and swallowed by callers rather than
-        trusted to have silently succeeded.
-        """
-        payload = {
-            "transaction_id": transaction_id,
-            "amount": str(int(amount)),
-            "reason": reason,
-        }
-        headers = {
-            "Authorization": f"Bearer {await self.get_token()}",
-            "Content-Type": "application/json",
-            **self._environment_header(),
-        }
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    f"{self.base_url}/payments/refund",
-                    json=payload,
-                    headers=headers,
-                    timeout=10.0,
-                )
-                response.raise_for_status()
-                return response.json()
-        except Exception as e:
-            print(f"Tunzaa refund_payment error: {e}")
-            raise
-
     async def create_installment_plan(self, order: Order, product_name: str) -> Dict[str, Any]:
         """
         Create a Tunzaa Lipa kwa Awamu installment plan.
