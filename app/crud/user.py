@@ -3,8 +3,21 @@ from typing import List, Optional
 
 from sqlalchemy import or_
 from sqlalchemy.orm import Session, selectinload
+from app.core.security import normalize_phone
 from app.db.models import User
 from datetime import datetime
+
+
+def resolve_handoff_number(user: User) -> Optional[str]:
+    """Handoff-alert recipient (#105): the explicit handoff number wins;
+    else the OTP `username`; else the profile `phone_number`. Values that
+    aren't dialable (social-login usernames, blanks) are skipped, so an
+    unset chain resolves to None and the alert stays silent."""
+    for raw in (user.handoff_phone_number, user.username, user.phone_number):
+        normalized = normalize_phone(raw) if raw else ""
+        if normalized and len(normalized) >= 9:
+            return normalized
+    return None
 
 
 def get_user_by_username(db: Session, username: str) -> User:
@@ -85,6 +98,13 @@ def search_users(db: Session, q: Optional[str], cap: int = 1000) -> List[User]:
 
 def set_user_phone_number(db: Session, user: User, phone_number: Optional[str]) -> User:
     user.phone_number = phone_number
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def set_user_handoff_number(db: Session, user: User, phone_number: Optional[str]) -> User:
+    user.handoff_phone_number = phone_number
     db.commit()
     db.refresh(user)
     return user

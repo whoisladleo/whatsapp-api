@@ -939,11 +939,12 @@ class LLMService:
         variable.
 
         Best-effort/silent if the merchant has no phone on file at all
-        (checks username, then the Facebook-login self-reported
-        phone_number — same resolution order
-        subscription_access.find_platform_subscription uses).
+        (explicit handoff number, then OTP username, then the
+        self-reported phone_number — see crud_user.resolve_handoff_number).
         """
-        merchant_phone = merchant.username or merchant.phone_number
+        from app.crud import user as crud_user
+
+        merchant_phone = crud_user.resolve_handoff_number(merchant)
         if not merchant_phone:
             return
 
