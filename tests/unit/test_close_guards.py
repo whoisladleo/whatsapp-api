@@ -491,3 +491,147 @@ async def test_wa_shop_prompt_has_same_language_rule(db_session, shop_account, g
 
     assert "SAME language the customer just used" in calls[0]["system"]
     assert "never mix Swahili and English within a single message" in calls[0]["system"]
+
+
+# --- Amara closes the loop herself (#104) ------------------------------------
+
+
+async def test_wa_shop_prompt_has_payment_truth_rule(db_session, shop_account, sub_product):
+    service, calls = _scripted_service(["Sawa, bei ni sawa."])
+
+    await service.generate_response(
+        message_body="bei?",
+        from_phone="255711190030",
+        db=db_session,
+        account=shop_account,
+    )
+
+    assert "Payment truth: you can't see Tunzaa's side" in calls[0]["system"]
+
+
+async def test_ig_dm_prompt_has_payment_truth_rule(
+    db_session, ig_account, ig_customer, ig_context, sub_product
+):
+    service, calls = _scripted_service(["Sawa."])
+
+    await service.generate_dm_response(
+        "bei?",
+        db=db_session,
+        account=ig_account,
+        customer=ig_customer,
+        context=ig_context,
+        conversation_history=[],
+    )
+
+    assert "Payment truth: you can't see Tunzaa's side" in calls[0]["system"]
+
+
+async def test_wa_platform_prompt_has_payment_truth_rule(db_session, merchant, sub_product):
+    from app.db.models import Message, WhatsAppAccount
+
+    platform_account = WhatsAppAccount(
+        name="Taskflow", phone_number_id="LOOP_PLATFORM", access_token="tok",
+        user_id=merchant.id, is_platform_account=True,
+    )
+    db_session.add(platform_account)
+    db_session.commit()
+    db_session.refresh(platform_account)
+    # Not the first message (first messages get the verbatim welcome).
+    db_session.add(Message(
+        to_phone="255711190031", direction="outbound",
+        account_id=platform_account.id, type="text", body="earlier",
+    ))
+    db_session.commit()
+    service, calls = _scripted_service(["Sawa."])
+
+    await service.generate_response(
+        message_body="tell me more",
+        from_phone="255711190031",
+        db=db_session,
+        account=platform_account,
+    )
+
+    assert "Payment truth: you can't see Tunzaa's side" in calls[0]["system"]
+
+
+_loop_phone_counter = [0]
+
+
+def _loop_order(db_session, merchant, language, is_subscription):
+    from app.db.models import Order
+
+    _loop_phone_counter[0] += 1
+    customer = Customer(
+        phone_number=f"25571119{_loop_phone_counter[0]:04d}", language=language
+    )
+    product = Product(
+        slug=f"loop-{'sub' if is_subscription else 'goods'}-{language or 'none'}",
+        name="Loop Plan" if is_subscription else "Loop Goods",
+        max_price=100000, min_price=100000, quantity=0,
+        merchant_id=merchant.id, is_subscription=is_subscription,
+    )
+    db_session.add_all([customer, product])
+    db_session.commit()
+    order = Order(customer_id=customer.id, product_id=product.id, status=OrderStatus.PAID)
+    db_session.add(order)
+    db_session.commit()
+    db_session.refresh(order)
+    return order
+
+
+def test_payment_notification_subscription_sw(db_session, merchant):
+    from app.api.v1.tunzaa_webhook import _payment_notification_body
+
+    body = _payment_notification_body(
+        "payment_complete", _loop_order(db_session, merchant, "sw", True)
+    )
+
+    assert "Malipo yamethibitishwa" in body
+    assert "Usajili wako umeanza" in body
+    assert "kupelekewa" not in body
+    assert "delivery" not in body.lower()
+
+
+def test_payment_notification_subscription_en(db_session, merchant):
+    from app.api.v1.tunzaa_webhook import _payment_notification_body
+
+    body = _payment_notification_body(
+        "payment_complete", _loop_order(db_session, merchant, "en", True)
+    )
+
+    assert "Payment confirmed! Thank you for your order." in body
+    assert "subscription is now active" in body
+    assert "delivery" not in body.lower()
+
+
+def test_payment_notification_physical_keeps_delivery(db_session, merchant):
+    from app.api.v1.tunzaa_webhook import _payment_notification_body
+
+    body = _payment_notification_body(
+        "payment_complete", _loop_order(db_session, merchant, "en", False)
+    )
+
+    assert "Payment confirmed! Thank you for your order." in body
+    assert "We'll be in touch shortly about delivery." in body
+
+
+def test_payment_notification_bilingual_when_language_unknown(db_session, merchant):
+    from app.api.v1.tunzaa_webhook import _payment_notification_body
+
+    body = _payment_notification_body(
+        "payment_complete", _loop_order(db_session, merchant, None, True)
+    )
+
+    assert "Malipo yamethibitishwa" in body
+    assert "Payment confirmed" in body
+
+
+def test_payment_notification_failed_sw(db_session, merchant):
+    from app.api.v1.tunzaa_webhook import _payment_notification_body
+
+    body = _payment_notification_body(
+        "payment_failed", _loop_order(db_session, merchant, "sw", False)
+    )
+
+    assert "hayakukamilika" in body
+    assert "could not be completed" not in body
