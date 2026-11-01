@@ -399,3 +399,43 @@ async def test_pay_now_race_reuses_winner(
     assert db_session.query(Order).filter_by(customer_id=customer.id).count() == 1
     assert db_session.get(Product, platform_plan.id).quantity == 5
     assert payment_route.call_count == 1
+
+
+@respx.mock
+async def test_pay_now_double_click_race_restores_claimed_unit(
+    db_session, merchant, monkeypatch
+):
+    # P12 guardrail: the atomic claim commits separately (like _close_deal's),
+    # so a lost double-click race must give its unit back explicitly — the
+    # IntegrityError rollback no longer undoes it. Quantity must end exactly
+    # where it started: no leak, no phantom.
+    payment_route = _mock_payments(("TXN_DUP_PAYNOW_GOODS",))
+    goods = Product(
+        slug="dup-platform-goods", name="Dup Platform Goods", max_price=50000, min_price=50000,
+        quantity=1, merchant_id=merchant.id, is_subscription=False, is_platform_plan=True,
+    )
+    db_session.add(goods)
+    db_session.commit()
+    db_session.refresh(goods)
+    user = User(username="255711280010")
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+    customer = _wa_customer(db_session, "255711280010")
+    winner = _pending_order(db_session, customer, goods, txn_id=None)
+
+    real_find = self_service_billing._find_reusable_order
+    calls = {"n": 0}
+
+    def _miss_once(db, customer, product):
+        calls["n"] += 1
+        return None if calls["n"] == 1 else real_find(db, customer, product)
+
+    monkeypatch.setattr(self_service_billing, "_find_reusable_order", _miss_once)
+
+    result = await self_service_billing.pay_now(db_session, user, "255711280010")
+
+    assert result["order_id"] == winner.id
+    assert db_session.query(Order).filter_by(customer_id=customer.id).count() == 1
+    assert db_session.get(Product, goods.id).quantity == 1
+    assert payment_route.call_count == 1

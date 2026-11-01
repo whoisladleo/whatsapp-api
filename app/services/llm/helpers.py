@@ -5,6 +5,7 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
+from app.crud.order import try_release_pending_order
 from app.db.models import (
     Order,
     OrderStatus,
@@ -158,9 +159,12 @@ def _reclose_guard_note(
                 customer_id,
                 product.id,
             )
-            open_order.status = OrderStatus.CANCELLED
-            if open_order.product_id and not product.is_subscription:
-                product.quantity = (product.quantity or 0) + (open_order.quantity or 1)
+            # Atomic release (P10): a FAILED callback, auto-cancel, or
+            # dashboard cancel may have resolved the hold concurrently —
+            # only the transition winner restores. Either way the hold is
+            # no longer a live PENDING blocker, so fall through and close
+            # fresh.
+            try_release_pending_order(db, open_order, OrderStatus.CANCELLED)
             db.commit()
         else:
             logger.warning(

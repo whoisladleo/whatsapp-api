@@ -104,8 +104,10 @@ def order(db_session, customer, account, product):
     return o
 
 
-def _mock_send_text(monkeypatch, ok=True):
+def _mock_send_text(monkeypatch, ok=True, calls=None):
     async def fake(self, to, body, preview_url=False):
+        if calls is not None:
+            calls.append({"to": to, "body": body})
         if not ok:
             raise RuntimeError("network down")
         return {"messages": [{"id": "wamid.tunzaa"}]}
@@ -700,14 +702,19 @@ def test_failed_twice_restores_stock_once(client, db_session, order, product):
     assert product.quantity == 3
 
 
-def test_completed_after_paid_records_cash_without_renotify(
+def test_completed_after_paid_records_cash_and_marks_refund_without_customer_renotify(
     client, db_session, order, product, monkeypatch
 ):
-    _mock_send_text(monkeypatch)
-    calls = []
-    _mock_send_template(monkeypatch, calls=calls)
+    # P7: a genuine double payment (second COMPLETED, new txn) must alert
+    # the merchant and flag the refund owed — previously only a stats event
+    # was recorded and nobody was told. The customer already got their
+    # confirmation on the first payment, so they are not re-notified.
+    texts, templates = [], []
+    _mock_send_text(monkeypatch, calls=texts)
+    _mock_send_template(monkeypatch, calls=templates)
     _complete(client, order.id, "T-PAID-1")
-    assert len(calls) == 1
+    assert len(templates) == 1
+    assert len(texts) == 1
 
     resp = _complete(client, order.id, "T-PAID-2", amount="45000")
 
@@ -715,7 +722,14 @@ def test_completed_after_paid_records_cash_without_renotify(
     db_session.refresh(order)
     assert order.status == OrderStatus.PAID
     assert order.tunzaa_transaction_id == "T-PAID-1"
-    assert len(calls) == 1
+    assert order.refund_status == "MANUAL"
+    assert len(texts) == 1
+    assert len(templates) == 2
+    _, summary, reference = _alert_values(templates[1])
+    assert "duplicate" in summary.lower()
+    assert "refund owed" in reference.lower()
+    assert "T-PAID-2" in reference
+    assert "Paid in full" not in reference
     payments = (
         db_session.query(AmaraEvent)
         .filter(AmaraEvent.kind == AmaraEventKind.PAYMENT)
@@ -795,6 +809,202 @@ def test_cancelled_then_completed_without_stock_stays_cancelled(
     assert order.status == OrderStatus.CANCELLED
     assert product.quantity == 0
     assert order.tunzaa_transaction_id == "T-PAID-LATE"
+
+
+# --- paid-but-no-stock notifies both sides + marks refund owed (P6) ------------
+
+
+def test_failed_then_completed_without_stock_notifies_and_marks_refund(
+    client, db_session, order, product, monkeypatch
+):
+    texts, templates = [], []
+    _mock_send_text(monkeypatch, calls=texts)
+    _mock_send_template(monkeypatch, calls=templates)
+    _fail(client, order.id, "T-F-1")
+    product.quantity = 0  # sold out while the customer retried
+    db_session.commit()
+
+    resp = _complete(client, order.id, "T-PAID-RETRY")
+
+    assert resp.json() == {"status": "success", "message": "Payment arrived but stock unavailable"}
+    db_session.refresh(order)
+    db_session.refresh(product)
+    assert order.status == OrderStatus.FAILED
+    assert product.quantity == 0
+    assert order.tunzaa_transaction_id == "T-PAID-RETRY"
+    # Refund-owed marker (MANUAL convention, cf. NumberSubscription).
+    assert order.refund_status == "MANUAL"
+    # Customer told (the earlier payment_failed text plus this notice) ...
+    assert len(texts) == 2
+    assert texts[0]["to"] == texts[1]["to"] == "255711112222"
+    assert "refund" in texts[1]["body"].lower()
+    assert "no longer available" in texts[1]["body"]
+    # ... and the merchant alerted with shortage copy, not "Paid in full".
+    assert len(templates) == 1
+    assert templates[0]["to"] == "255700000900"
+    _, summary, reference = _alert_values(templates[0])
+    assert "out of stock" in summary
+    assert "refund owed" in reference.lower()
+    assert "Paid in full" not in reference
+    # Real cash moved, so the payment is counted like the paid-twice branch.
+    payments = db_session.query(AmaraEvent).filter_by(kind=AmaraEventKind.PAYMENT).all()
+    assert [(p.amount, p.product_name) for p in payments] == [(45000, "Shoes")]
+
+
+def test_cancelled_then_completed_without_stock_notifies_and_marks_refund(
+    client, db_session, order, product, monkeypatch
+):
+    texts, templates = [], []
+    _mock_send_text(monkeypatch, calls=texts)
+    _mock_send_template(monkeypatch, calls=templates)
+    order.status = OrderStatus.CANCELLED
+    product.quantity = 0
+    db_session.commit()
+
+    resp = _complete(client, order.id, "T-PAID-LATE")
+
+    assert resp.json() == {"status": "success", "message": "Payment arrived but stock unavailable"}
+    db_session.refresh(order)
+    assert order.status == OrderStatus.CANCELLED
+    assert order.refund_status == "MANUAL"
+    assert len(texts) == 1
+    assert texts[0]["to"] == "255711112222"
+    assert "refund" in texts[0]["body"].lower()
+    assert len(templates) == 1
+    _, summary, reference = _alert_values(templates[0])
+    assert "out of stock" in summary
+    assert "refund owed" in reference.lower()
+
+
+# --- leg-aware FAILED / CANCELLED (P8) ---------------------------------------
+
+# NOTE: whether Tunzaa actually sends leg-level FAILED/CANCELLED callbacks
+# with installment_id is UNVERIFIED — these tests pin that order-level
+# callbacks (no installment_id, or no legs paid) behave exactly as before,
+# and that a leg-level failure with earlier legs PAID fails only the leg.
+
+
+def _add_leg(db_session, order, tunzaa_id, status=InstallmentStatus.PENDING):
+    leg = Installment(
+        order_id=order.id, tunzaa_installment_id=tunzaa_id, amount_due=15000,
+        due_date=order.created_at, status=status,
+    )
+    db_session.add(leg)
+    db_session.commit()
+    db_session.refresh(leg)
+    return leg
+
+
+def _leg(db_session, order, tunzaa_id):
+    return (
+        db_session.query(Installment)
+        .filter(
+            Installment.order_id == order.id,
+            Installment.tunzaa_installment_id == tunzaa_id,
+        )
+        .one()
+    )
+
+
+@pytest.mark.parametrize("status_value", ["FAILED", "CANCELLED"])
+def test_leg_failure_with_paid_legs_keeps_order_pending_and_holds_stock(
+    client, db_session, plan_order, product, monkeypatch, status_value
+):
+    texts = []
+    _mock_send_text(monkeypatch, calls=texts)
+    _leg(db_session, plan_order, "10000").status = InstallmentStatus.PAID
+    _add_leg(db_session, plan_order, "10001")
+    db_session.refresh(product)
+    stock_before = product.quantity
+
+    resp = _post(
+        client,
+        {
+            "status": status_value, "reference_id": f"order-{plan_order.id}",
+            "installment_id": "10001", "transaction_id": "T-LEG-FAIL",
+        },
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "success", "message": "Installment payment failed; order remains PENDING"}
+    db_session.refresh(plan_order)
+    db_session.refresh(product)
+    assert plan_order.status == OrderStatus.PENDING
+    assert product.quantity == stock_before
+    assert _leg(db_session, plan_order, "10001").status == InstallmentStatus.OVERDUE
+    assert _leg(db_session, plan_order, "10000").status == InstallmentStatus.PAID
+    # The order wasn't cancelled, so no cancellation notice goes out.
+    assert texts == []
+
+
+def test_leg_failure_with_paid_legs_keeps_subscription_pending(
+    client, db_session, snpl_subscription_order, snpl_pending_subscription, monkeypatch
+):
+    _mock_send_text(monkeypatch)
+    _leg(db_session, snpl_subscription_order, "20000").status = InstallmentStatus.PAID
+    db_session.add(
+        Installment(
+            order_id=snpl_subscription_order.id, tunzaa_installment_id="20001", amount_due=50000,
+            due_date=snpl_subscription_order.created_at, status=InstallmentStatus.PENDING,
+        )
+    )
+    db_session.commit()
+
+    resp = _post(
+        client,
+        {
+            "status": "FAILED", "reference_id": f"order-{snpl_subscription_order.id}",
+            "installment_id": "20001", "transaction_id": "T-LEG-FAIL-SNPL",
+        },
+    )
+
+    assert resp.status_code == 200
+    db_session.refresh(snpl_subscription_order)
+    db_session.refresh(snpl_pending_subscription)
+    assert snpl_subscription_order.status == OrderStatus.PENDING
+    assert snpl_pending_subscription.status == ProductSubscriptionStatus.PENDING_PAYMENT
+
+
+def test_leg_failure_with_no_legs_paid_fails_whole_order(
+    client, db_session, plan_order, product, monkeypatch
+):
+    _mock_send_text(monkeypatch)
+    stock_before = product.quantity
+
+    resp = _post(
+        client,
+        {
+            "status": "FAILED", "reference_id": f"order-{plan_order.id}",
+            "installment_id": "10000", "transaction_id": "T-LEG-FAIL-1",
+        },
+    )
+
+    assert resp.json() == {"status": "success", "message": "Order marked as FAILED"}
+    db_session.refresh(plan_order)
+    db_session.refresh(product)
+    assert plan_order.status == OrderStatus.FAILED
+    assert product.quantity == stock_before + plan_order.quantity
+
+
+def test_order_level_failure_on_plan_with_paid_legs_still_fails_fast(
+    client, db_session, plan_order, product, monkeypatch
+):
+    _mock_send_text(monkeypatch)
+    _leg(db_session, plan_order, "10000").status = InstallmentStatus.PAID
+    db_session.commit()
+    db_session.refresh(product)
+    stock_before = product.quantity
+
+    resp = _post(
+        client,
+        {"status": "FAILED", "reference_id": f"order-{plan_order.id}", "transaction_id": "T-ORD-FAIL"},
+    )
+
+    assert resp.json() == {"status": "success", "message": "Order marked as FAILED"}
+    db_session.refresh(plan_order)
+    db_session.refresh(product)
+    assert plan_order.status == OrderStatus.FAILED
+    assert product.quantity == stock_before + plan_order.quantity
 
 
 # --- misc ---------------------------------------------------------------------
@@ -1331,3 +1541,35 @@ def test_payment_event_uses_tunzaa_amount_when_given(client, db_session, order, 
     })
 
     assert db_session.query(AmaraEvent).filter_by(kind=AmaraEventKind.PAYMENT).one().amount == 44000
+
+
+# --- atomic stock release (P10) / single-transaction reclaim (P11) -----------------
+
+
+def test_failed_loses_race_restores_no_stock(client, db_session, order, product, monkeypatch):
+    # P10: auto-cancel (or a dashboard cancel) resolved the order after this
+    # callback read it — the callback must not restore a second unit.
+    _mock_send_text(monkeypatch)
+    db_session.query(Order).filter(Order.id == order.id).update(
+        {Order.status: OrderStatus.CANCELLED}, synchronize_session=False
+    )
+    assert order.status == OrderStatus.PENDING  # stale, as a race loser sees it
+
+    resp = _fail(client, order.id, "T-F-RACE")
+
+    assert resp.json() == {"status": "ignored", "reason": "Order already resolved"}
+    db_session.refresh(product)
+    assert product.quantity == 2
+
+
+def test_try_reclaim_stock_defers_commit_to_caller(db_session, order, product):
+    # P11: the reclaim must not commit internally — a crash (or a concurrent
+    # COMPLETED) between its commit and the caller's loses a unit. Rolling
+    # back after the call alone must undo the re-decrement.
+    from app.api.v1.tunzaa_webhook import _try_reclaim_stock
+
+    assert _try_reclaim_stock(db_session, order) is True
+
+    db_session.rollback()
+    db_session.refresh(product)
+    assert product.quantity == 2

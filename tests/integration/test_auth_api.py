@@ -1055,3 +1055,133 @@ def test_pay_now_allows_resubscribe_after_cancelled(client, auth_user, db_sessio
 
     assert resp.status_code == 200
     assert db_session.query(Order).count() == 2
+
+
+# --- atomic Pay Now stock claim (P12) ------------------------------------------------
+
+
+def _seed_platform_goods(db_session, slug="taskflow-os-goods", price=50000, quantity=1):
+    # A platform plan that IS a physical good (units to claim) — the stock
+    # path _seed_platform_product's subscription plans never exercise.
+    from app.db.models import Product
+
+    platform_owner = db_session.query(User).filter(User.username == "255700000997").first()
+    if not platform_owner:
+        platform_owner = User(username="255700000997")
+        db_session.add(platform_owner)
+        db_session.commit()
+        db_session.refresh(platform_owner)
+
+    product = Product(
+        slug=slug, name="Taskflow OS Goods", max_price=price, min_price=price,
+        quantity=quantity, merchant_id=platform_owner.id, is_subscription=False,
+        is_platform_plan=True,
+    )
+    db_session.add(product)
+    db_session.commit()
+    db_session.refresh(product)
+    return product
+
+
+@respx.mock
+def test_pay_now_loses_last_unit_race_without_phantom_claim(client, auth_user, db_session):
+    # P12: two customers racing the last unit used to check-then-decrement,
+    # so both "claimed" it (quantity went to -1). The loser must now see 0
+    # rows and take nothing — simulated deterministically (see
+    # tests/unit/test_stock_claim.py): the row is moved to 0 behind the ORM
+    # object's back, and the failed dispatch afterwards must restore nothing.
+    from app.db.models import Customer, Order, OrderStatus, Product
+
+    product = _seed_platform_goods(db_session)
+    user, headers = auth_user
+    # Pre-created so pay_now takes no commit (customer creation) before the
+    # claim — any commit would expire the stale read below.
+    db_session.add(Customer(phone_number=user.username))
+    db_session.commit()
+
+    db_session.query(Product).filter(Product.id == product.id).update(
+        {Product.quantity: 0}, synchronize_session=False
+    )
+    assert product.quantity == 1  # stale, as a race loser sees it
+
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "tok-1"}))
+    respx.post(PAYMENT_URL).mock(return_value=httpx.Response(500))
+
+    resp = client.post("/api/v1/auth/me/subscription/pay", json={}, headers=headers)
+
+    assert resp.status_code == 502
+    db_session.refresh(product)
+    assert product.quantity == 0
+    order = db_session.query(Order).filter(Order.product_id == product.id).first()
+    assert order.status == OrderStatus.CANCELLED
+
+
+@respx.mock
+def test_pay_now_claims_last_unit_on_clean_path(client, auth_user, db_session):
+    # Guardrail: uncontended, the atomic claim takes the unit exactly once.
+    from app.db.models import Order, OrderStatus
+
+    product = _seed_platform_goods(db_session)
+    _, headers = auth_user
+
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "tok-1"}))
+    respx.post(PAYMENT_URL).mock(
+        return_value=httpx.Response(200, json={"statusCode": 202, "success": True, "transactionID": "MOCK_TXN_GOODS"})
+    )
+
+    resp = client.post("/api/v1/auth/me/subscription/pay", json={}, headers=headers)
+
+    assert resp.status_code == 200
+    db_session.refresh(product)
+    assert product.quantity == 0
+    order = db_session.query(Order).filter(Order.product_id == product.id).first()
+    assert order.status == OrderStatus.PENDING
+    assert order.tunzaa_transaction_id == "MOCK_TXN_GOODS"
+
+
+@respx.mock
+def test_pay_now_reused_order_claims_no_second_unit(client, auth_user, db_session):
+    # Guardrail: a second click reuses the pending order and claims nothing more.
+    from app.db.models import Order
+
+    product = _seed_platform_goods(db_session)
+    _, headers = auth_user
+
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "tok-1"}))
+    respx.post(PAYMENT_URL).mock(
+        side_effect=[
+            httpx.Response(200, json={"statusCode": 202, "success": True, "transactionID": "MOCK_TXN_G1"}),
+            httpx.Response(200, json={"statusCode": 202, "success": True, "transactionID": "MOCK_TXN_G2"}),
+        ]
+    )
+
+    first = client.post("/api/v1/auth/me/subscription/pay", json={}, headers=headers)
+    second = client.post("/api/v1/auth/me/subscription/pay", json={}, headers=headers)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["order_id"] == second.json()["order_id"]
+    assert db_session.query(Order).count() == 1
+    db_session.refresh(product)
+    assert product.quantity == 0
+
+
+@respx.mock
+def test_pay_now_dispatch_failure_after_won_claim_releases_unit(client, auth_user, db_session):
+    # P12 symmetry: a claimed unit on a failed dispatch goes back — the
+    # failure path must not leak stock any more than it mints phantoms.
+    from app.db.models import Order, OrderStatus
+
+    product = _seed_platform_goods(db_session)
+    _, headers = auth_user
+
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "tok-1"}))
+    respx.post(PAYMENT_URL).mock(return_value=httpx.Response(500))
+
+    resp = client.post("/api/v1/auth/me/subscription/pay", json={}, headers=headers)
+
+    assert resp.status_code == 502
+    db_session.refresh(product)
+    assert product.quantity == 1
+    order = db_session.query(Order).filter(Order.product_id == product.id).first()
+    assert order.status == OrderStatus.CANCELLED

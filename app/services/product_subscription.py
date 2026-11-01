@@ -15,6 +15,11 @@ RENEWAL_PERIOD_DAYS = 30
 # "10 retries over 2 weeks" policy (14 days / 10 is an ugly 33.6h).
 RENEWAL_RETRY_DELAY_SECONDS = 36 * 60 * 60
 MAX_RENEWAL_RETRIES = 10
+# A renewal callback is only treated as a stale duplicate while the paid
+# cycle is still more than this far from due — the 1h absorbs
+# scheduler/clock skew so a genuine next-cycle signal (which always arrives
+# at/after next_billing_at) is never mistaken for one.
+RENEWAL_DUE_GRACE_SECONDS = 3600
 
 
 def get_or_create_pending_subscription(
@@ -154,16 +159,41 @@ def _record_renewal_payment(db: Session, subscription: ProductSubscription) -> N
     )
 
 
+def _current_cycle_already_paid(subscription: ProductSubscription) -> bool:
+    """True when the current cycle was already paid for and isn't due yet —
+    ACTIVE with retry_count reset and next_billing_at still in the future.
+    A renewal callback arriving in that state is a stale duplicate for the
+    paid cycle, not a genuine signal about an outstanding charge. Anything
+    else — PAST_DUE, a missing date, or a due/overdue date — must be
+    processed normally."""
+    if subscription.status != ProductSubscriptionStatus.ACTIVE:
+        return False
+    if subscription.retry_count != 0:
+        return False
+    if not subscription.next_billing_at:
+        return False
+    return subscription.next_billing_at > datetime.utcnow() + timedelta(
+        seconds=RENEWAL_DUE_GRACE_SECONDS
+    )
+
+
 async def handle_renewal_payment_result(
     db: Session, subscription: ProductSubscription, status_value: Optional[str], transaction_id: Optional[str]
 ) -> None:
     """Called from the Tunzaa webhook for a "product-subscription-renewal-<id>" reference."""
     from app.tasks.product_subscription_billing import charge_renewal, check_past_due_grace_expired
 
-    if transaction_id:
-        subscription.tunzaa_transaction_id = transaction_id
-
     if status_value == "COMPLETED":
+        if _current_cycle_already_paid(subscription):
+            # P4: duplicate COMPLETED for the already-paid cycle — the
+            # renewal task is already outstanding, so don't move
+            # next_billing_at or schedule a second one (two tasks would each
+            # push next cycle). Whether Tunzaa dedupes same-reference pushes
+            # is unverified, so single-task scheduling is enforced here
+            # rather than assumed there.
+            return
+        if transaction_id:
+            subscription.tunzaa_transaction_id = transaction_id
         subscription.status = ProductSubscriptionStatus.ACTIVE
         subscription.retry_count = 0
         subscription.past_due_since = None
@@ -180,6 +210,15 @@ async def handle_renewal_payment_result(
         sync_access_if_platform_subscription(db, subscription)
 
     elif status_value in ("FAILED", "CANCELLED"):
+        if _current_cycle_already_paid(subscription):
+            # P3: stale FAILED for the already-paid cycle — must not regress
+            # to PAST_DUE, schedule a retry, or start the past-due grace
+            # clock (that double-charges at +36h and +30d). Genuine
+            # next-cycle failures arrive once next_billing_at is due, so
+            # they never hit this path.
+            return
+        if transaction_id:
+            subscription.tunzaa_transaction_id = transaction_id
         if subscription.retry_count < MAX_RENEWAL_RETRIES:
             subscription.status = ProductSubscriptionStatus.PAST_DUE
             subscription.retry_count += 1
@@ -237,6 +276,11 @@ async def handle_renewal_payment_result(
             )
             sync_access_if_platform_subscription(db, subscription)
     else:
+        # Unknown/missing status: must NOT record the txn id — the
+        # webhook's same-txn guard would then discard the genuine
+        # COMPLETED with this id as "Already processed", leaving a paid
+        # cycle never activated. Mirrors the Order path, which stores the
+        # txn id only inside the COMPLETED/FAILED branches.
         db.commit()
 
 

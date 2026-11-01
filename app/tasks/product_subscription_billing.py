@@ -153,6 +153,20 @@ async def _do_retry_installment_reconcile(order_id: str, attempt: int) -> None:
                     f"{RECONCILE_MAX_ATTEMPTS}x for order {order_id} ({e}); "
                     "leaving PENDING for merchant review."
                 )
+                # A log line alone meant the order was later auto-cancelled
+                # despite possibly being fully paid, with nobody told — the
+                # give-up must page the merchant with the order and the
+                # amounts on record. Best-effort: never crash the task. (P9)
+                try:
+                    from app.api.v1.tunzaa_webhook import notify_merchant_of_reconcile_giveup
+                    await notify_merchant_of_reconcile_giveup(
+                        db, order, RECONCILE_MAX_ATTEMPTS
+                    )
+                except Exception as alert_err:
+                    logger.error(
+                        f"retry_installment_reconcile: give-up alert failed "
+                        f"for order {order_id}: {alert_err}"
+                    )
             return
         apply_installment_plan_state(db, order, plan_data)
         db.commit()
