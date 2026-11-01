@@ -1,6 +1,6 @@
 """Unit tests for the pure (stdlib-only) parts of the Instagram outreach
 simulation harness — personas, branching, token/cost estimation, and the
-calibration math. Loads scripts/simulate_instagram_outreach.py by path so
+calibration math. Loads scripts/sim_outreach_personas.py by path so
 no app import (and no API key) is needed."""
 
 import importlib.util
@@ -8,12 +8,12 @@ from pathlib import Path
 
 import pytest
 
-HARNESS_PATH = Path(__file__).resolve().parents[2] / "scripts" / "simulate_instagram_outreach.py"
+HARNESS_PATH = Path(__file__).resolve().parents[2] / "scripts" / "sim_outreach_personas.py"
 
 
 @pytest.fixture(scope="module")
 def h():
-    spec = importlib.util.spec_from_file_location("simulate_instagram_outreach", HARNESS_PATH)
+    spec = importlib.util.spec_from_file_location("sim_outreach_personas", HARNESS_PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

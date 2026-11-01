@@ -1,5 +1,12 @@
 # Decisions
 
+## Sim harness split + refresh workaround removed (2026-11-01, #111c)
+
+**Chose:** `scripts/simulate_instagram_outreach.py` (1,335 lines) is now two files along its existing pure/app-bound marker: `scripts/sim_outreach_personas.py` (421 lines, stdlib-only personas + math, still loaded by path in tests) and the runner (931 lines, sibling from-import of the 14 names it uses). Also removed `_refresh_llm_client` + its call: the per-turn client rebuild was a workaround for the #121 pool bug, now fixed at the root, so the sim just reuses the shared client like production. Run-recipe docstring updated to copy both files. Validated: sim tests 13/13, `--help` entry run, full suite 1387 passed / 96.23%, pyflakes clean. Closes #111 (all three oversized files now under the limit).
+
+**Considered and rejected:**
+- *Three-way split (personas / fakes / runner).* Unnecessary: two files already satisfy the rule with the least import plumbing in a non-package scripts dir.
+
 ## test_llm_service.py split by area (2026-11-01, #111b)
 
 **Chose:** the 1,859-line test file is now `tests/unit/llm/` — conftest.py (the 5 shared fixtures, auto-available) plus six area files mirroring the source split (replies, catalog, notify, markers, close, quotes; largest 561 lines). Test bodies byte-identical (span coverage asserted, 79 = 79 collected); the small fake-client block is duplicated per file needing it, matching the codebase's existing precedent for test fakes, with per-file imports pyflakes-trimmed. Validated: full suite 1387 passed / 96.23%, pyflakes clean.
