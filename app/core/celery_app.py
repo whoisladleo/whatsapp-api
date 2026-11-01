@@ -21,6 +21,7 @@ celery_app = Celery(
         "app.tasks.product_subscription_billing",
         "app.tasks.usage_alerts",
         "app.tasks.catalog_sync",
+        "app.tasks.subscription_nudges",
     ]
 )
 

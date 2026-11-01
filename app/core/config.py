@@ -279,6 +279,17 @@ class Settings(BaseSettings):
     WHATSAPP_USAGE_ALERT_TEMPLATE_LANGUAGE: str = "en"
     OPS_ALERT_PHONE: Optional[str] = None
 
+    # Template for the subscription nudge (daily sweep in
+    # app/tasks/subscription_nudges.py): reminds a connected-but-unpaid
+    # merchant that Amara is paused. Static body plus a static URL button
+    # ("Taskflow OS" → dashboard settings) — no variables, so the send
+    # passes no components. Sent with platform credentials like the alerts
+    # above. None disables the sweep's sends (it logs and skips) — covers
+    # the pre-approval state, since an unapproved template name just gets
+    # Meta rejections.
+    WHATSAPP_NUDGE_TEMPLATE_NAME: Optional[str] = "subscription_nudge"
+    WHATSAPP_NUDGE_TEMPLATE_LANGUAGE: str = "en"
+
     # Meta Commerce catalog (D1: MetaCatalogClient only; D2 wires the
     # product-lifecycle hooks). CATALOG_ACCESS_TOKEN is a business
     # system-user token with catalog_management (and business_management for

@@ -257,6 +257,12 @@ async def handle_webhook(
             else:
                 background_tasks.add_task(_forward_to_callback, account_callback_url, item)
 
+    # Traffic-triggered daily sweep (no Celery Beat in this stack): at most
+    # one webhook per rolling 24h actually queues it; never raises.
+    from app.tasks.subscription_nudges import maybe_dispatch_daily_sweep
+
+    maybe_dispatch_daily_sweep()
+
     return {"status": "ok"}
 
 
