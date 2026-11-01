@@ -18,6 +18,7 @@ from app.db.session import SessionLocal
 from app.services.llm import LLMUnavailable, llm_service
 from app.services import usage
 from app.services.merchant_handler import handle_merchant_message
+from app.tasks.claim_verification import should_verify_payment_claim, verify_payment_claim
 
 logger = logging.getLogger(__name__)
 
@@ -233,6 +234,9 @@ async def _process(
     response_text = None
     is_merchant = False
     quota_blocked = False
+    # What the AI turn did (markers seen / order machinery ran) — filled
+    # by generate_response for the post-send payment-claim check (#116).
+    turn_outcome: dict = {}
 
     if interactive_id:
         # Handoff template button tap — lands on the platform number, where
@@ -297,6 +301,7 @@ async def _process(
                     db=db,
                     account=account,
                     retry_on_outage=llm_attempt < len(LLM_RETRY_COUNTDOWNS_SECONDS),
+                    turn_outcome=turn_outcome,
                 )
 
     if response_text:
@@ -344,5 +349,35 @@ async def _process(
             },
             account.id,
         )
+
+        # Backstop for Amara promising a payment with no order behind it
+        # (#116): async verify, never inline — the customer already has
+        # their reply and this must not slow the next turn. Merchant
+        # commands and quota holdings never promise payments, so only
+        # AI-generated customer replies are eligible.
+        if (
+            status == "sent"
+            and not is_merchant
+            and not quota_blocked
+            and should_verify_payment_claim(
+                message_body,
+                response_text,
+                markers_seen=turn_outcome.get("markers_seen", False),
+                order_action=turn_outcome.get("order_action", False),
+            )
+        ):
+            try:
+                verify_payment_claim.apply_async(
+                    args=[
+                        "whatsapp",
+                        str(account.id),
+                        from_phone,
+                        message_body,
+                        response_text,
+                        turn_outcome.get("order_action", False),
+                    ]
+                )
+            except Exception as enqueue_err:
+                logger.error(f"Failed to enqueue payment-claim verification: {enqueue_err}")
 
     return "Success"

@@ -10,6 +10,7 @@ from app.db.models import ConversationState, InstagramAccount, InstagramCustomer
 from app.db.session import SessionLocal
 from app.services import usage
 from app.services.llm import LLMUnavailable, llm_service
+from app.tasks.claim_verification import should_verify_payment_claim, verify_payment_claim
 from app.tasks.webhook_processing import LLM_RETRY_COUNTDOWNS_SECONDS, _run_async, _send_with_retries
 
 logger = logging.getLogger(__name__)
@@ -99,6 +100,9 @@ async def _process(
     # instead of a generated reply — and the holding message itself is
     # never metered, so this path skips record_reply below.
     quota_blocked = False
+    # What the AI turn did (markers seen / order machinery ran) — filled
+    # by generate_dm_response for the post-send payment-claim check (#116).
+    turn_outcome: dict = {}
     holding = usage.check_reply_quota(db, account.owner) if account.owner else None
     if holding is not None:
         reply_text = holding
@@ -114,6 +118,7 @@ async def _process(
                 conversation_history=history,
                 account_name=account.username or "the shop",
                 retry_on_outage=llm_attempt < len(LLM_RETRY_COUNTDOWNS_SECONDS),
+                turn_outcome=turn_outcome,
             )
         except LLMUnavailable as e:
             logger.warning("Claude unavailable for DM %s (attempt %s); retrying: %s", dm_row_uuid, llm_attempt, e)
@@ -149,5 +154,28 @@ async def _process(
     )
     if not quota_blocked:
         usage.record_reply(db, account.user_id, "instagram_dm", instagram_account_id=account.id)
+
+    # Backstop for Amara promising a payment with no order behind it
+    # (#116) — same shape as the WhatsApp hook: async verify after a
+    # successful AI-reply send, quota holdings excluded.
+    if not quota_blocked and should_verify_payment_claim(
+        message_body,
+        reply_text,
+        markers_seen=turn_outcome.get("markers_seen", False),
+        order_action=turn_outcome.get("order_action", False),
+    ):
+        try:
+            verify_payment_claim.apply_async(
+                args=[
+                    "instagram",
+                    str(account.id),
+                    str(customer.id),
+                    message_body,
+                    reply_text,
+                    turn_outcome.get("order_action", False),
+                ]
+            )
+        except Exception as enqueue_err:
+            logger.error(f"Failed to enqueue payment-claim verification: {enqueue_err}")
 
     return "Processed."

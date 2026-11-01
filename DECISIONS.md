@@ -1,5 +1,16 @@
 # Decisions
 
+## Phantom-payment detection: async LLM judge + merchant alert (2026-11-01, #116)
+
+**Chose:** after every AI reply sends (WA + IG), a celery task verifies the turn: exact filters first (turn ran the order machinery / handoff state / a live unexpired PENDING order backs the words), then an LLM judge for the remainder asking only "does this text claim a payment is already underway, given no live order?", then a merchant + OPS template alert on YES (existing handoff_notification template, tap-to-reply armed, no state flip, no nudge — alert-only). A per-conversation 6h Redis throttle bounds repeat pages. The monitor is total-fail-safe: judge unparseable/unavailable, no numbers on file, Redis down, or any internal crash all degrade to log lines, never exceptions — it must not break the pipeline it watches. Enqueue itself gates on (markers seen with no order action) or EN/SW payment tokens in either direction, so plain chat never pays for a judge call. Validated: 33 new tests plus a live 12/12 judge probe (EN/SW claims, presuppositions, future-conditionals, price talk, failure notices, true confirmations).
+
+**Considered and rejected:**
+- *Inline check before send.* Rejected per user Discovery pick: prevention would tax every message with judge latency; seconds-late detection + alert is the chosen trade.
+- *Regex-only verdict.* Rejected per user Discovery pick: claimed-complete vs future-conditional across two languages is beyond phrase lists (regex stays only as the cheap recall gate).
+- *Auto-handoff or auto-retry-close on a hit.* Rejected for v1 per user Discovery pick: alert-only until the false-positive rate is observed; auto-charging from last-known terms needs consent-safety design.
+- *New dashboard notification center.* No such infra exists in either repo; the WA template reaches the merchant in minutes, a dashboard only when opened. Chosen channel confirmed with user.
+- *Reusing `_send_platform_alert_to_merchant` for the send.* It sends to a single User, and its handoff caller skips platform accounts entirely; the phantom alert needs owner + OPS bare-phone recipients on every account, so it follows the usage_alerts direct-send pattern with the same template shape instead.
+
 ## Pay Now while ACTIVE refused (2026-11-01, #115)
 
 **Chose:** `pay_now` raises `AlreadySubscribedError` (→ HTTP 409) when an ACTIVE subscription exists for the customer+product — checked after customer resolution, before reuse/insert. ACTIVE-only: PAST_DUE catch-up, post-CANCELLED resubscribe, and PENDING_PAYMENT-without-a-live-order (dead prompt, legitimate retry) all keep flowing. Dashboard hides the Pay Now button while ACTIVE; the 409 detail surfaces through the existing generic error path (no new dashboard error plumbing needed). Verified: 3 new API tests.
