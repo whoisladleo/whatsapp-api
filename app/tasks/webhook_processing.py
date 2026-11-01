@@ -230,6 +230,7 @@ async def _process(
     context_message_id: str | None = None,
 ) -> str:
     from app.services.handoff_flow import consume_reply_mode, handle_button, resolve_merchant
+    from app.services.self_service_billing import is_pay_confirmation
 
     response_text = None
     is_merchant = False
@@ -243,10 +244,29 @@ async def _process(
         # the sender is never account.owner, so this runs before the
         # merchant/customer fork below.
         merchant = resolve_merchant(db, from_phone)
-        response_text = await handle_button(db, merchant, interactive_id, context_message_id)
+        if (
+            merchant is not None
+            and account.is_platform_account
+            and (
+                is_pay_confirmation(interactive_id)
+                or is_pay_confirmation(message_body)
+            )
+        ):
+            # "Yes" tap on the subscription nudge = pay confirmation, same
+            # as typing YES. Scoped to the platform chat so a shop's own
+            # buttons can never trigger a payment. None (plans
+            # unconfigured) falls through to normal button handling.
+            from app.services.self_service_billing import confirm_subscription_payment
+
+            yes_reply = await confirm_subscription_payment(db, merchant, from_phone, "yes")
+            if yes_reply is not None:
+                response_text = yes_reply
+                is_merchant = True
         if response_text is None:
-            return "Unknown button tap; staying silent."
-        is_merchant = True
+            response_text = await handle_button(db, merchant, interactive_id, context_message_id)
+            if response_text is None:
+                return "Unknown button tap; staying silent."
+            is_merchant = True
     elif account.is_platform_account:
         merchant = resolve_merchant(db, from_phone)
         if merchant is not None:
@@ -256,6 +276,18 @@ async def _process(
             response_text = await consume_reply_mode(db, merchant, message_body)
             if response_text is not None:
                 is_merchant = True
+            else:
+                # Reply-YES subscription payment (the nudge's "just say the
+                # word" twin to dashboard Pay Now). None means "not a pay
+                # confirmation" — falls through to normal handling below.
+                from app.services.self_service_billing import confirm_subscription_payment
+
+                yes_reply = await confirm_subscription_payment(
+                    db, merchant, from_phone, message_body
+                )
+                if yes_reply is not None:
+                    response_text = yes_reply
+                    is_merchant = True
 
     if response_text is None:
         is_merchant = account.owner and normalize_phone(from_phone) == normalize_phone(

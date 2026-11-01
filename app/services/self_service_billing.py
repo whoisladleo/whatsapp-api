@@ -247,6 +247,82 @@ async def pay_now(
     }
 
 
+# Chat confirmations for the subscription nudge ("just say the word" twin
+# to the dashboard Pay Now button): accepted answers, matched
+# case-insensitively after stripping.
+PAY_CONFIRM_WORDS = frozenset({"yes", "ndiyo"})
+
+
+def is_pay_confirmation(text: str | None) -> bool:
+    """Normalized YES/NDIYO match, shared by the typed-text path and the
+    nudge quick-reply tap path (tap id and title are both checked — Meta
+    drifts which one carries the configured response)."""
+    return (text or "").strip().lower() in PAY_CONFIRM_WORDS
+
+
+async def confirm_subscription_payment(
+    db: Session, user: User, sender_phone: str, message_body: str
+) -> Optional[str]:
+    """
+    Reply-YES fast path for subscription payment. Returns the
+    merchant-facing reply, or None when this message isn't a pay
+    confirmation (caller falls through to normal handling).
+
+    Same order-<id> reference and pending-order reuse as pay_now — this
+    calls pay_now itself, so a YES while a prompt is still unpaid just
+    re-fires against the live order instead of minting a second charge
+    (#110). Throttled like a merchant resend: a YES inside
+    RESEND_MIN_INTERVAL of the last dispatch gets a wait note, not a
+    second prompt.
+    """
+    if not is_pay_confirmation(message_body):
+        return None
+
+    from app.services.subscription_access import get_platform_plans
+
+    plans = get_platform_plans(db)
+    if not plans:
+        return None  # gating off — a YES means nothing here; fall through
+    if len(plans) > 1:
+        dashboard = settings.DASHBOARD_URL.rstrip("/")
+        return (
+            "You've got more than one plan to choose from — "
+            f"pick yours here and tap Pay: {dashboard}/dashboard/settings"
+        )
+    product = plans[0]
+
+    normalized_phone = normalize_phone(sender_phone)
+    customer = db.query(Customer).filter(Customer.phone_number == normalized_phone).first()
+    if customer is not None:
+        live = _find_reusable_order(db, customer, product)
+        if live is not None and live.tunzaa_transaction_id and live.updated_at:
+            from app.services.llm import RESEND_MIN_INTERVAL
+
+            elapsed = datetime.utcnow() - live.updated_at
+            if elapsed < RESEND_MIN_INTERVAL:
+                wait_mins = int((RESEND_MIN_INTERVAL - elapsed).total_seconds() // 60) + 1
+                return (
+                    "A payment prompt is already on its way to your phone — "
+                    f"check it (or wait ~{wait_mins} min and say YES again)."
+                )
+
+    try:
+        result = await pay_now(db, user, normalized_phone)
+    except AlreadySubscribedError:
+        return "Your subscription is already active — Amara is on."
+    except (PhoneNumberRequiredError, PhoneNumberInUseError):
+        dashboard = settings.DASHBOARD_URL.rstrip("/")
+        return (
+            "I couldn't match your number to your account — "
+            f"pay from the dashboard instead: {dashboard}/dashboard/settings"
+        )
+    except Exception:
+        logger.exception(f"Chat pay-confirm failed for user {user.id}")
+        return "I couldn't reach the payment network — try YES again in a bit."
+
+    return result["message"]
+
+
 def _find_reusable_order(db: Session, customer: Customer, product: Product):
     """Latest still-pending FULL single-unit order for this customer+product, if any."""
     return (
