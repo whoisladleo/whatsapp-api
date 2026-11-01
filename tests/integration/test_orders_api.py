@@ -366,3 +366,99 @@ def test_cancel_order_still_succeeds_when_whatsapp_send_raises(
     )
     assert outbound is not None
     assert outbound.status == "failed"
+
+
+def test_list_orders_includes_own_pay_now_order(client, merchant, merchant_headers, db_session):
+    # Dashboard-native purchases carry no channel account — they show via
+    # the recorded buying user, while another merchant's stay hidden (#16).
+    other = User(username="255700000701")
+    db_session.add(other)
+    db_session.commit()
+    db_session.refresh(other)
+    buyer = Customer(phone_number="255711113333")
+    db_session.add(buyer)
+    db_session.commit()
+    db_session.refresh(buyer)
+    plan = Product(
+        slug="entry-plan", name="Taskflow Entry Plan", max_price=100000, min_price=100000,
+        quantity=0, merchant_id=merchant.id, is_subscription=True, is_platform_plan=True,
+    )
+    db_session.add(plan)
+    db_session.commit()
+    db_session.refresh(plan)
+    mine = Order(
+        customer_id=buyer.id, product_id=plan.id, buyer_user_id=merchant.id,
+        quantity=1, agreed_price=100000, payment_type=PaymentType.FULL,
+        status=OrderStatus.PAID,
+    )
+    theirs = Order(
+        customer_id=buyer.id, product_id=plan.id, buyer_user_id=other.id,
+        quantity=1, agreed_price=100000, payment_type=PaymentType.FULL,
+        status=OrderStatus.PAID,
+    )
+    db_session.add_all([mine, theirs])
+    db_session.commit()
+
+    resp = client.get(BASE, headers=merchant_headers)
+
+    assert resp.status_code == 200
+    ids = [row["id"] for row in resp.json()]
+    assert str(mine.id) in ids
+    assert str(theirs.id) not in ids
+    assert [row for row in resp.json() if row["id"] == str(mine.id)][0]["channel"] == "dashboard"
+
+
+def test_order_detail_visible_via_buyer_link(client, merchant, merchant_headers, db_session):
+    buyer = Customer(phone_number="255711114444")
+    db_session.add(buyer)
+    db_session.commit()
+    db_session.refresh(buyer)
+    plan = Product(
+        slug="entry-plan-2", name="Taskflow Entry Plan", max_price=100000, min_price=100000,
+        quantity=0, merchant_id=merchant.id, is_subscription=True, is_platform_plan=True,
+    )
+    db_session.add(plan)
+    db_session.commit()
+    db_session.refresh(plan)
+    order = Order(
+        customer_id=buyer.id, product_id=plan.id, buyer_user_id=merchant.id,
+        quantity=1, agreed_price=100000, payment_type=PaymentType.FULL,
+        status=OrderStatus.PAID,
+    )
+    db_session.add(order)
+    db_session.commit()
+    db_session.refresh(order)
+
+    resp = client.get(f"{BASE}/{order.id}", headers=merchant_headers)
+
+    assert resp.status_code == 200
+    assert resp.json()["id"] == str(order.id)
+
+
+def test_channel_less_order_without_buyer_stays_hidden(client, merchant_headers, db_session):
+    # Unmatched backfill rows (buyer_user_id NULL) keep today's behavior:
+    # hidden, never leaked to a merchant view (#16).
+    buyer = Customer(phone_number="255711115555")
+    db_session.add(buyer)
+    db_session.commit()
+    db_session.refresh(buyer)
+    plan = Product(
+        slug="entry-plan-3", name="Taskflow Entry Plan", max_price=100000, min_price=100000,
+        quantity=0, is_subscription=True, is_platform_plan=True,
+    )
+    db_session.add(plan)
+    db_session.commit()
+    db_session.refresh(plan)
+    db_session.add(
+        Order(
+            customer_id=buyer.id, product_id=plan.id,
+            quantity=1, agreed_price=100000, payment_type=PaymentType.FULL,
+            status=OrderStatus.PAID,
+        )
+    )
+    db_session.commit()
+
+    resp = client.get(BASE, headers=merchant_headers)
+
+    assert resp.status_code == 200
+    assert resp.json() == []

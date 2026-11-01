@@ -8,6 +8,14 @@
 - *200-with-flag instead of 409 for already-subscribed.* Rejected per user Discovery pick: 409 + detail fits the route's existing error table and the dashboard's generic detail-surfacing path.
 - *Blocking PENDING_PAYMENT-without-order in pay_now too.* Rejected: that state means a dead prompt (or a reused-then-cancelled attempt); refusing would strand the buyer with no self-service path forward.
 
+## Channel-less orders made visible to the buying merchant (2026-11-01, #16)
+
+**Chose:** New nullable `orders.buyer_user_id` FK, set by `pay_now` at creation; the two merchant scopings OR on it so channel-less dashboard purchases appear in the buyer's Orders list (previously invisible — the merchant join matches neither side). Migration backfills old channel-less rows by buyer-phone match, linking only unambiguous (exactly-one-user) matches and leaving the rest NULL (hidden, the safe direction). Channel-less rows serialize as `channel: "dashboard"` instead of the mistranslated `"whatsapp"`. Verified: 3 new API tests, full suite 1267 passed, backfill proven on scratch Postgres 18 (username/phone/ambiguous/unmatched/account-linked cases + idempotent round-trip).
+
+**Considered and rejected:**
+- *Attributing old channel-less rows by account inference or leaving them hidden.* Rejected per user Discovery pick: phone backfill restores history; ambiguous matches stay hidden rather than guess.
+- *A status filter/tabs on the Orders page.* Rejected per user Discovery pick: flat all-status list; the table already renders every row it's given, so no dashboard list change was needed at all.
+
 ## Subscription double-charge: partial unique index + PAID-history guard (2026-11-01, #114)
 
 **Chose:** (1) Partial unique index `ix_orders_one_pending_per_deal` on `(customer_id, product_id, payment_type) WHERE status='PENDING'` — the DB, not the guard's read-then-write check, decides the double-close race (sandbox showed a 16ms-apart double-mint). Key is channel-blind because Pay Now orders carry no channel and its reuse query already treats chat PENDING rows as reusable; `payment_type` is in the key so a FULL order still coexists with an in-flight installment plan (pinned #110 behavior). Migration preamble retires older dup PENDINGs (latest wins, stock restored) with counts via NOTICE. (2) `_reclose_guard_note` also blocks subscription closes when any PAID order exists for that customer+product (ownership is global — a plan bought over WA blocks its IG re-close); consumable re-buys stay frictionless. (3) Race losers: chat closes roll back, restore the claimed unit, and return the already-sent note against the winner (re-queried channel-blind); Pay Now falls into its reuse path with `stock_taken` reset. Verified end-to-end on scratch Postgres 18 (preamble, index enforcement, downgrade round-trip) plus 9 new tests; full suite 1261 passed.
