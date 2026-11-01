@@ -1183,10 +1183,14 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
-    if os.environ.get("LLM_PROVIDER", "claude") != "muse":
-        raise SystemExit("Production model is muse — export LLM_PROVIDER=muse (with MODEL_API_KEY) and retry.")
-    if "MODEL_API_KEY" not in os.environ or not os.environ["MODEL_API_KEY"]:
-        raise SystemExit("MODEL_API_KEY is not exported. Export it BEFORE starting python (see module docstring).")
+    sim_provider = os.environ.get("LLM_PROVIDER", "claude")
+    if sim_provider not in ("muse", "claude"):
+        raise SystemExit("Set LLM_PROVIDER=muse or LLM_PROVIDER=claude and retry.")
+    # Muse reads MODEL_API_KEY, Claude reads ANTHROPIC_API_KEY (both via
+    # Settings in app/services/llm.py). Either way, export BEFORE python.
+    need_key = "MODEL_API_KEY" if sim_provider == "muse" else "ANTHROPIC_API_KEY"
+    if need_key not in os.environ or not os.environ[need_key]:
+        raise SystemExit(f"{need_key} is not exported. Export it BEFORE starting python (see module docstring).")
 
     repo_root = ensure_repo_on_path()
 
