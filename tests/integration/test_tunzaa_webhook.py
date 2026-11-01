@@ -187,6 +187,27 @@ def test_reference_for_nonexistent_order_is_ignored(client):
     assert resp.json() == {"status": "ignored", "reason": "Order not found"}
 
 
+def test_unknown_order_rejection_logs_claimed_reference_and_status(client, caplog):
+    # A signed callback for an order we don't have must leave a trace with
+    # the claimed reference — otherwise env mismatches and never-created
+    # orders are invisible (#113).
+    with caplog.at_level("WARNING", logger="app.api.v1.tunzaa_webhook"):
+        resp = _post(
+            client,
+            {
+                "status": "COMPLETED",
+                "reference_id": "order-999999",
+                "transaction_id": "TXN_GHOST",
+            },
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ignored", "reason": "Order not found"}
+    assert "reference_id='order-999999'" in caplog.text
+    assert "COMPLETED" in caplog.text
+    assert "TXN_GHOST" in caplog.text
+
+
 # --- COMPLETED ---------------------------------------------------------------
 
 

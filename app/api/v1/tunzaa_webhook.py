@@ -86,6 +86,11 @@ async def handle_tunzaa_webhook(
     transaction_id = data.get("transaction_id")
 
     if not order_ref:
+        logger.warning(
+            "Ignoring Tunzaa callback with no reference_id: status=%r transaction_id=%r.",
+            status_value,
+            transaction_id,
+        )
         return {"status": "ignored", "reason": "No reference_id provided"}
 
     if order_ref.startswith("number-purchase-") or order_ref.startswith("number-renewal-"):
@@ -98,6 +103,16 @@ async def handle_tunzaa_webhook(
     order = db.query(Order).filter(Order.id == order_id).first() if order_id else None
 
     if not order:
+        # Loud on purpose: a signed callback for an order we don't have
+        # means an env/secret mismatch, a reference that never got
+        # created (the pre-#113 silent-marker failure), or a deleted
+        # order — all invisible if this just returns "ignored".
+        logger.warning(
+            "Ignoring Tunzaa callback: order not found for reference_id=%r status=%r transaction_id=%r.",
+            order_ref,
+            status_value,
+            transaction_id,
+        )
         return {"status": "ignored", "reason": "Order not found"}
 
     # Idempotency: Tunzaa retries a callback up to 5 times per their docs.
@@ -109,6 +124,12 @@ async def handle_tunzaa_webhook(
         and order.tunzaa_transaction_id == transaction_id
         and order.status != OrderStatus.PENDING
     ):
+        logger.info(
+            "Ignoring duplicate Tunzaa callback for order %s: status=%r transaction_id=%r.",
+            order.id,
+            status_value,
+            transaction_id,
+        )
         return {"status": "ignored", "reason": "Already processed"}
 
     if status_value == "COMPLETED":

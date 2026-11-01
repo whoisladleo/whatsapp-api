@@ -1,5 +1,16 @@
 # Decisions
 
+## Amara-doesn't-close: resend path, lazy-cancel of expired holds, prompt repairs (2026-11-01, #113)
+
+**Chose:** (1) `[RESEND_PAYMENT]` marker with optional deal terms: re-fires the Tunzaa prompt against this chat's live PENDING FULL order (same `order-<id>` reference, newest txn id wins, 5-min throttle off new `Order.updated_at`), dispatches onto it if the first attempt never went out, or closes fresh from the marker's terms when no live order exists — the pre-fix silent-marker failure. Installment markers are refused (legs are Tunzaa-pushed; re-firing would rebill). (2) The reclose guard retires expired PENDING holds on the spot (CANCELLED + stock restore) instead of wedging every future close behind "already sent" — auto-cancel's 48h countdown doesn't survive a redeploy, and a weeks-old PENDING row was found live in prod. (3) Prompts: resend clause (model never claims the resend itself — only the appended note does), no-address-term in English / ndugu in Swahili, re-open rule (answer the new question, never another goodbye), monthly-only billing on all three prompts (platform already had it). (4) Webhook `ignored` returns now log claimed reference/status/txn.
+
+**Considered and rejected:**
+- *Re-close via a second AGREEMENT_REACHED instead of RESEND.* Rejected: mints a duplicate PENDING order + double stock claim per attempt; same-reference resend keeps one order with multiple prompts, any approval completing it.
+- *Bumping `reserved_until` on resend.* Rejected: the auto-cancel countdown fires at the old deadline and would see the extension as "stale, newer firing will cancel" — without scheduling that newer firing the order would linger PENDING forever. Resends land deep inside the 48h window anyway.
+- *Handing off when no live order exists.* Rejected: violates "Amara closes herself" for the exact failure being fixed; handoff is reserved for fallback closes that fail validation. Installment "never got it" gets the model's schedule explanation, also without handoff.
+- *Touching the linked PENDING_PAYMENT subscription in the lazy-cancel.* Rejected: `get_or_create_pending_subscription` already re-points it at the new order, and #110's 48h bound means a stale one grants nothing.
+- *Sending the "reservation expired" notice in the lazy-cancel.* Rejected: this turn's own close note covers the UX; sending both would confuse.
+
 ## Coolify auto-deploy pipeline (2026-10-31, #85)
 
 **Chose:** push to master runs Tests; `docker-publish.yml` triggers on Tests completion (master, success only) and builds the exact tested SHA, so broken commits never publish. After pushing, CI POSTs the Coolify deploy webhooks for the API + worker image resources (URLs + token in GitHub secrets). Dashboard (hosted on Cloudflare Pages, Git-connected) gets lint+build CI as signal only — Pages deploys on push and can't wait for CI. Rollback stays manual (Coolify redeploy previous / Pages rollback).

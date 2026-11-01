@@ -508,6 +508,9 @@ class Order(Base):
     tunzaa_link = Column(String, nullable=True)
     reserved_until = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    # Touched by every payment dispatch — the resend path throttles repeat
+    # prompts off this (see LLMService._resend_payment_for_order, #113).
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     customer = relationship("Customer", back_populates="orders")
     installments = relationship("Installment", back_populates="order")

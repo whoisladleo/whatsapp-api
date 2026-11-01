@@ -41,15 +41,81 @@ logger = logging.getLogger(__name__)
 RESERVATION_WINDOW = timedelta(hours=48)
 
 _AGREEMENT_RE = re.compile(
-    r"\[AGREEMENT_REACHED:\s*product=(?P<product>.+?)\s+price=(?P<price>[\d.]+)\s+payment=(?P<payment>full|installment)"
+    r"\[AGREEMENT_REACHED:\s*product=(?P<product>.+?)\s+price=(?P<price>[\d.,]+)\s+payment=(?P<payment>full|installment)"
     r"(?:\s+phone=(?P<phone>\S+))?\s*\]",
     re.IGNORECASE,
 )
 
 _QUOTE_RE = re.compile(
-    r"\[QUOTE:\s*product=(?P<product>.+?)\s+price=(?P<price>[\d.]+)\s*\]",
+    r"\[QUOTE:\s*product=(?P<product>.+?)\s+price=(?P<price>[\d.,]+)\s*\]",
     re.IGNORECASE,
 )
+
+_RESEND_RE = re.compile(r"\[RESEND_PAYMENT(?P<params>[^\]]*)\]", re.IGNORECASE)
+_RESEND_PARAMS_RE = re.compile(
+    r":\s*product=(?P<product>.+?)\s+price=(?P<price>[\d.,]+)\s+payment=(?P<payment>full|installment)"
+    r"(?:\s+phone=(?P<phone>\S+))?\s*$",
+    re.IGNORECASE,
+)
+
+# Minimum gap between two Tunzaa prompts for the same order — an
+# impatient buyer mashing "didn't get it" must not machine-gun payment
+# prompts (#113). Keyed off Order.updated_at, which every dispatch
+# touches.
+RESEND_MIN_INTERVAL = timedelta(minutes=5)
+
+
+def _parse_and_strip_resend(text: str):
+    """
+    Extracts the [RESEND_PAYMENT] marker the model emits when the buyer
+    says the payment request never arrived (see the system prompts).
+    The bracket always strips — even with garbage inside, the marker
+    never reaches the customer. Returns a params dict — empty for the
+    bare marker (enough when a live order exists to re-fire against) —
+    or None when no marker is present. Unparseable params degrade to
+    the bare form with a warning.
+    """
+    match = _RESEND_RE.search(text)
+    if not match:
+        return text, None
+    cleaned = _RESEND_RE.sub("", text).strip()
+    raw_params = (match.group("params") or "").strip()
+    if not raw_params:
+        return cleaned, {}
+    params = _RESEND_PARAMS_RE.match(raw_params)
+    if not params:
+        logger.warning("RESEND_PAYMENT with unparseable params; treating as bare: %r", match.group(0))
+        return cleaned, {}
+    try:
+        price = float(params.group("price").replace(",", ""))
+    except ValueError:
+        logger.warning("RESEND_PAYMENT with unparseable price; treating as bare: %r", match.group(0))
+        return cleaned, {}
+    product_name = params.group("product").strip()
+    if not product_name:
+        return cleaned, {}
+    return cleaned, {
+        "product_name": product_name,
+        "price": price,
+        "payment_type": params.group("payment").lower(),
+        "phone": params.group("phone"),
+    }
+
+
+def _hold_expired(order: Order) -> bool:
+    """
+    True when a PENDING order's payment hold has lapsed: past
+    reserved_until, or (when that's NULL — old rows) older than the
+    reservation window. Rows with no timestamp at all fail safe toward
+    "still live". Shared by the reclose guard's lazy-cancel and the
+    resend path's live-order lookup (#113).
+    """
+    deadline = order.reserved_until
+    if deadline is None and order.created_at is not None:
+        deadline = order.created_at + RESERVATION_WINDOW
+    if deadline is None:
+        return False
+    return deadline <= datetime.utcnow()
 
 _COMMENT_REPLY_RE = re.compile(
     r"PUBLIC:\s*(?P<public>.+?)\s*\n+\s*PRIVATE:\s*(?P<private>.+)",
@@ -133,7 +199,7 @@ def _parse_and_strip_quote(text: str):
     cleaned = _QUOTE_RE.sub("", text).strip()
 
     try:
-        price = float(match.group("price"))
+        price = float(match.group("price").replace(",", ""))
     except ValueError:
         return cleaned, None
 
@@ -161,12 +227,21 @@ def _parse_and_strip_agreement(text: str):
     """
     match = _AGREEMENT_RE.search(text)
     if not match:
+        idx = text.upper().find("AGREEMENT_REACHED")
+        if idx != -1:
+            # The model tried to close but the marker didn't parse — the
+            # buyer was told it's a deal with nothing behind it (#113).
+            # Loud on purpose: this class used to fail silently.
+            logger.warning(
+                "Unparseable AGREEMENT_REACHED marker; no order created: %r",
+                text[max(0, idx - 60):idx + 120],
+            )
         return text, None
 
     cleaned = _AGREEMENT_RE.sub("", text).strip()
 
     try:
-        price = float(match.group("price"))
+        price = float(match.group("price").replace(",", ""))
     except ValueError:
         return cleaned, None
 
@@ -286,6 +361,21 @@ _PAYMENT_REQUEST_LINES = {
     "en": "A payment request for TZS {price} has been sent to your phone — please approve it to complete your order.",
 }
 
+_PAYMENT_RESEND_LINES = {
+    "sw": "Nimetuma tena ombi la malipo kwenye simu yako — liangalie na uliidhinishe.",
+    "en": "I've re-sent the payment request to your phone — check for the latest prompt and approve it.",
+}
+
+_PAYMENT_RESEND_THROTTLED_LINES = {
+    "sw": "Ombi limetumwa muda mfupi uliopita — tafadhali angalia simu yako, huenda tayari limefika.",
+    "en": "A request went out just moments ago — please check your phone, it may already be there.",
+}
+
+_PAYMENT_DISPATCH_FAILED_LINES = {
+    "sw": "Kuna tatizo kuanzisha malipo — tafadhali jaribu tena baada ya muda mfupi.",
+    "en": "Something went wrong setting up your payment — please try again in a moment.",
+}
+
 _INSTALLMENT_LINES = {
     "sw": "Mpango wako wa malipo ya awamu umeundwa! Tutawasiliana nawe na maelezo ya malipo.",
     "en": "Your installment plan has been created! We'll be in touch with payment details.",
@@ -351,9 +441,10 @@ def _reclose_guard_note(
     conversation), and every emission used to mint a fresh PENDING
     order plus a fresh Tunzaa dispatch — duplicate charge prompts for
     a single deal. Returns the customer-facing note when this close
-    must NOT proceed, else None. Any PENDING order blocks, even an
-    expired hold — the auto-cancel task cleans those up, and erring
-    toward not charging twice is the safe direction.
+    must NOT proceed, else None. Only a LIVE pending order blocks — an
+    expired hold is retired on the spot (auto-cancel's countdown firing
+    doesn't survive a redeploy, so "the task cleans those up" stopped
+    being something we can rely on — #113).
     """
     open_order = (
         db.query(Order)
@@ -366,15 +457,37 @@ def _reclose_guard_note(
         .first()
     )
     if open_order:
-        logger.warning(
-            "Duplicate close blocked: PENDING order %s already exists for customer %s / product %s.",
-            open_order.id,
-            customer_id,
-            product.id,
-        )
-        return _lang_text(_ALREADY_SENT_LINES, language).format(
-            price=f"{open_order.agreed_price:,.0f}"
-        )
+        if _hold_expired(open_order):
+            # The hold lapsed but auto-cancel never reaped it — countdown
+            # tasks don't survive a redeploy, so expired PENDING rows
+            # linger (seen live: weeks old) and would wedge every future
+            # close for this customer+product behind "already sent".
+            # Retire it here, exactly as the missed firing would have
+            # (minus the "reservation expired" notice — this turn's own
+            # close note covers the UX), then fall through and close
+            # fresh. The linked PENDING_PAYMENT subscription, if any, is
+            # deliberately left alone: get_or_create_pending_subscription
+            # re-points it at the new order (#113).
+            logger.warning(
+                "Reclose guard retiring expired PENDING order %s (customer %s / product %s).",
+                open_order.id,
+                customer_id,
+                product.id,
+            )
+            open_order.status = OrderStatus.CANCELLED
+            if open_order.product_id and not product.is_subscription:
+                product.quantity = (product.quantity or 0) + (open_order.quantity or 1)
+            db.commit()
+        else:
+            logger.warning(
+                "Duplicate close blocked: PENDING order %s already exists for customer %s / product %s.",
+                open_order.id,
+                customer_id,
+                product.id,
+            )
+            return _lang_text(_ALREADY_SENT_LINES, language).format(
+                price=f"{open_order.agreed_price:,.0f}"
+            )
     if product.is_subscription:
         active = (
             db.query(ProductSubscription)
@@ -753,7 +866,41 @@ class LLMService:
             # undoing the out-of-stock sync the claim above queued).
             from app.tasks.catalog_sync import dispatch_catalog_sync
             dispatch_catalog_sync(product.id, "upsert")
-            return "Something went wrong setting up your payment — please try again in a moment."
+            return _lang_text(_PAYMENT_DISPATCH_FAILED_LINES, language)
+
+    async def _resend_payment_for_order(
+        self, db: Session, order: Order, phone: str, language: Optional[str]
+    ) -> Optional[str]:
+        """
+        Re-sends the Tunzaa prompt for an already-placed PENDING order
+        whose buyer says the request never arrived ([RESEND_PAYMENT]).
+        Same order-<id> reference, so an approval of the old prompt or
+        the new one completes the same order; the newest transaction id
+        wins. FULL orders only — installment legs are pushed per Tunzaa's
+        own schedule, not ours — and throttled (see RESEND_MIN_INTERVAL).
+        Returns the note to append, or None when there's nothing to
+        resend (the model's own words go out alone).
+        """
+        from app.services.tunzaa import tunzaa_service
+
+        if order.payment_type != PaymentType.FULL or not order.tunzaa_transaction_id:
+            logger.warning(
+                f"Ignoring RESEND_PAYMENT for order {order.id}: not a dispatched FULL order."
+            )
+            return None
+        if order.updated_at and datetime.utcnow() - order.updated_at < RESEND_MIN_INTERVAL:
+            return _lang_text(_PAYMENT_RESEND_THROTTLED_LINES, language)
+        try:
+            resp = await tunzaa_service.initiate_payment(
+                phone=phone, amount=order.agreed_price, reference=f"order-{order.id}"
+            )
+        except Exception as e:
+            logger.error(f"Tunzaa resend failed for order {order.id}: {e}")
+            return _lang_text(_PAYMENT_DISPATCH_FAILED_LINES, language)
+        order.tunzaa_transaction_id = resp.get("transactionID")
+        order.updated_at = datetime.utcnow()
+        db.commit()
+        return _lang_text(_PAYMENT_RESEND_LINES, language)
 
     def _schedule_reminders(self, order_id: uuid.UUID) -> None:
         from app.tasks.order_reminders import (
@@ -1390,9 +1537,12 @@ RULES:
 7. Currency: all prices are in Tanzanian Shillings (TZS) — always state them exactly as given, including the TZS label. Never say "$", "USD", "dollars", or imply any other currency, and never convert the number into another currency.
 8. Quoting: whenever you state a specific price for a product during negotiation but haven't closed the deal yet, end your response with the marker [QUOTE: product=<product name> price=<price>] (e.g. [QUOTE: product=Shoes price=45000]). Don't include this once you've emitted [AGREEMENT_REACHED] for the same deal.
 9. Out of stock: never offer, quote, or agree a price on a product the catalog marks OUT OF STOCK — if the customer asks about one, first say plainly, naming the product, that it is out of stock, then suggest an in-stock alternative from the catalog instead.
-10. Address: never assume the customer's gender. Use no gendered address term (never kaka/dada) unless they explicitly state their own — default to ndugu or no address term at all. Do not mirror their address terms back: them calling you kaka says nothing about them. If they question or correct how you address them, drop the term instantly, apologize WITHOUT repeating it, and never use it again in this conversation — the correction overrides anything earlier in the chat.
+10. Address: never assume the customer's gender. Use no gendered address term (never kaka/dada) unless they explicitly state their own — default to no address term in English, or ndugu in Swahili. Do not mirror their address terms back: them calling you kaka says nothing about them. If they question or correct how you address them, drop the term instantly, apologize WITHOUT repeating it, and never use it again in this conversation — the correction overrides anything earlier in the chat.
 11. Setup help: if the shop has no Instagram or WhatsApp business account yet, offer to help them set one up for free before starting — never promise the product works without one.
 12. Payment truth: you can't see Tunzaa's side. Never say payment is confirmed, received, or active — the confirmation message arrives separately once approved. After a close, only say the request is sent; if they say they've paid, thank them and say you're confirming it.
+13. Missing payment request: if they say the mobile-money request never arrived on their phone, say you're sorting it out now and end your response with the exact marker [RESEND_PAYMENT: product=<product name> price=<agreed price> payment=<full|installment> phone=<phone number>] repeating the same deal terms and phone number as the original close. The phone number is required — without it nothing can be re-sent. Never claim in your own words that you've re-sent it — the confirmation line is added automatically, and only when a resend actually fires. If the deal was installments, don't emit the marker at all: explain the charges arrive automatically on the payment provider's schedule instead.
+14. Coming back: if they message again after a goodbye, a no, or a quiet spell — even just "Hello" or a new question — treat it as a fresh start. Answer what they actually asked; never reply with another goodbye or keep pushing the old close.
+15. Subscription billing is monthly only — there is no yearly option and no discount for longer terms. If they ask for yearly, say plainly it's monthly-only.
 
 Reply with ONLY the message text (plus whichever marker applies, if any) — no other formatting.
 """
@@ -1430,9 +1580,10 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
             await self._hand_off_instagram(db, account, customer, context, message_body)
             return _holding_reply(None)
 
-        # Stripped up front so the marker can never leak through the early
-        # handoff return below.
+        # Stripped up front so the markers can never leak through the
+        # early handoff return below.
         response_text, quote = _parse_and_strip_quote(response_text)
+        response_text, resend = _parse_and_strip_resend(response_text)
 
         if "[HUMAN_HANDOFF]" in response_text:
             response_text = response_text.replace("[HUMAN_HANDOFF]", "").strip()
@@ -1457,6 +1608,97 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
                 response_text = f"{response_text}\n\n{note}".strip()
         elif quote:
             self._record_quote(db, account.user_id, quote, "instagram_dm", instagram_account_id=account.id)
+
+        # Same payment-resend path as WhatsApp (see generate_response
+        # step 3b) — only the order lookup keys, phone source, and close
+        # call differ. Skipped when this turn already closed (handoff
+        # early-returns above).
+        if resend is not None and not agreement:
+            live_order = (
+                db.query(Order)
+                .filter(
+                    Order.instagram_account_id == account.id,
+                    Order.instagram_customer_id == customer.id,
+                    Order.status == OrderStatus.PENDING,
+                    Order.payment_type == PaymentType.FULL,
+                )
+                .order_by(Order.created_at.desc())
+                .first()
+            )
+            if live_order is not None and _hold_expired(live_order):
+                live_order = None
+            if live_order is not None and (
+                live_order.product is None or live_order.customer is None
+            ):
+                logger.warning(
+                    "Ignoring live IG RESEND_PAYMENT order %s: product or customer row is gone.",
+                    live_order.id,
+                )
+                live_order = None
+            if live_order is not None and resend.get("product_name"):
+                if (
+                    live_order.product.name.lower() != resend["product_name"].lower()
+                    or abs((live_order.agreed_price or 0) - resend["price"]) > 0.01
+                ):
+                    logger.warning(
+                        "IG RESEND_PAYMENT names %r at %s but live order %s is %r at %s; closing fresh.",
+                        resend["product_name"],
+                        resend["price"],
+                        live_order.id,
+                        live_order.product.name,
+                        live_order.agreed_price,
+                    )
+                    live_order = None
+            resend_note = None
+            if live_order is not None and live_order.tunzaa_transaction_id:
+                resend_note = await self._resend_payment_for_order(
+                    db,
+                    live_order,
+                    live_order.customer.phone_number,
+                    live_order.customer.language,
+                )
+            elif live_order is not None:
+                resend_note = await self._dispatch_payment(
+                    db,
+                    live_order,
+                    live_order.product,
+                    live_order.customer.phone_number,
+                    PaymentType.FULL,
+                    live_order.customer.language,
+                )
+            elif resend.get("product_name"):
+                if resend.get("payment_type") == "installment":
+                    logger.warning("Ignoring IG RESEND_PAYMENT for an installment deal; legs are Tunzaa-pushed.")
+                elif not resend.get("phone"):
+                    # Instagram never gives us the number — without it in
+                    # the marker there is no phone to send the fresh prompt
+                    # to. The model's words go out alone.
+                    logger.warning("Ignoring IG RESEND_PAYMENT fallback close: marker carries no phone number.")
+                else:
+                    try:
+                        resend_note = await self._close_instagram_deal(
+                            db,
+                            account,
+                            customer,
+                            {
+                                "product_name": resend["product_name"],
+                                "price": resend["price"],
+                                "payment_type": "full",
+                                "phone": resend["phone"],
+                            },
+                        )
+                    except Exception as deal_err:
+                        (logger.warning if isinstance(deal_err, DealRejected) else logger.error)(
+                            f"IG resend fallback close failed; handing off: {deal_err}"
+                        )
+                        await self._hand_off_instagram(db, account, customer, context, message_body)
+                        return _holding_reply(None)
+            else:
+                logger.warning(
+                    "Ignoring IG RESEND_PAYMENT: no live PENDING order for this chat and no deal terms to close fresh."
+                )
+            if resend_note:
+                response_text = f"{response_text}\n\n{resend_note}".strip()
 
         return response_text
 
@@ -1684,7 +1926,9 @@ OPERATIONAL RULES:
 5. Human Handoff: If the customer is unreasonable, has complex technical questions, or explicitly asks for a human, you must include the exact phrase [HUMAN_HANDOFF] in your response.
 6. Currency: every catalog price above is Tanzanian Shillings, never any other currency. Never say "$", "USD", "dollars", or imply any price is in another currency, and never convert one.
 7. Billing cycle: subscriptions are monthly only — there is no yearly plan, no discount for longer terms, and no free trial. If they ask for yearly or any non-monthly term, say plainly it's monthly-only and offer to start them this month. Never invent a yearly price or multiply the monthly price into one.
-8. Address: never assume the customer's gender. Use no gendered address term (never kaka/dada) unless they explicitly state their own — default to ndugu or no address term at all. Do not mirror their address terms back: them calling you kaka says nothing about them. If they question or correct how you address them, drop the term instantly, apologize WITHOUT repeating it, and never use it again in this conversation — the correction overrides anything earlier in the chat.
+8. Address: never assume the customer's gender. Use no gendered address term (never kaka/dada) unless they explicitly state their own — default to no address term in English, or ndugu in Swahili. Do not mirror their address terms back: them calling you kaka says nothing about them. If they question or correct how you address them, drop the term instantly, apologize WITHOUT repeating it, and never use it again in this conversation — the correction overrides anything earlier in the chat.
+9. Missing payment request: if they say the mobile-money request never arrived on their phone, say you're sorting it out now and end your response with the exact marker [RESEND_PAYMENT: product=<exact plan name from the catalog above> price=<that plan's catalog Max Price> payment=full] repeating the same plan as the original close. Never claim in your own words that you've re-sent it — the confirmation line is added automatically, and only when a resend actually fires.
+10. Coming back: if they message again after a goodbye, a no, or a quiet spell — even just "Hello" or a new question — treat it as a fresh start. Answer what they actually asked; never reply with another goodbye or keep pushing the old close.
 """
         else:
             base_instruction = f"""You are Amara, the 24/7 AI Sales Agent for {account.name}.
@@ -1707,9 +1951,12 @@ RULES:
 7. Human Handoff: If the customer is unreasonable, has complex technical questions, or explicitly asks for a human, you must include the exact phrase [HUMAN_HANDOFF] in your response.
 8. Currency: all prices are in Tanzanian Shillings (TZS) — always state them exactly as given, including the TZS label. Never say "$", "USD", "dollars", or imply any other currency, and never convert the number into another currency.
 9. Out of stock: never offer, quote, or agree a price on a product the catalog marks OUT OF STOCK — if the customer asks about one, first say plainly, naming the product, that it is out of stock, then suggest an in-stock alternative from the catalog instead.
-10. Address: never assume the customer's gender. Use no gendered address term (never kaka/dada) unless they explicitly state their own — default to ndugu or no address term at all. Do not mirror their address terms back: them calling you kaka says nothing about them. If they question or correct how you address them, drop the term instantly, apologize WITHOUT repeating it, and never use it again in this conversation — the correction overrides anything earlier in the chat.
+10. Address: never assume the customer's gender. Use no gendered address term (never kaka/dada) unless they explicitly state their own — default to no address term in English, or ndugu in Swahili. Do not mirror their address terms back: them calling you kaka says nothing about them. If they question or correct how you address them, drop the term instantly, apologize WITHOUT repeating it, and never use it again in this conversation — the correction overrides anything earlier in the chat.
 11. Setup help: if the shop has no Instagram or WhatsApp business account yet, offer to help them set one up for free before starting — never promise the product works without one.
 12. Payment truth: you can't see Tunzaa's side. Never say payment is confirmed, received, or active — the confirmation message arrives separately once approved. After a close, only say the request is sent; if they say they've paid, thank them and say you're confirming it.
+13. Missing payment request: if they say the mobile-money request never arrived on their phone, say you're sorting it out now and end your response with the exact marker [RESEND_PAYMENT: product=<product name> price=<agreed price> payment=<full|installment>] repeating the same deal terms as the original close. Never claim in your own words that you've re-sent it — the confirmation line is added automatically, and only when a resend actually fires. If the deal was installments, don't emit the marker at all: explain the charges arrive automatically on the payment provider's schedule instead.
+14. Coming back: if they message again after a goodbye, a no, or a quiet spell — even just "Hello" or a new question — treat it as a fresh start. Answer what they actually asked; never reply with another goodbye or keep pushing the old close.
+15. Subscription billing is monthly only — there is no yearly option and no discount for longer terms. If they ask for yearly, say plainly it's monthly-only.
 """
 
         base_instruction += """
@@ -1839,6 +2086,109 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
                         note = None
                     if note:
                         response_text = f"{response_text}\n\n{note}".strip()
+
+            # 3b. Payment resend (RESEND_PAYMENT): the buyer says the
+            # request never arrived. Skipped when this turn already
+            # closed (a fresh prompt just went out) or handed off.
+            # Three outcomes, in order: re-fire against this chat's live
+            # order; dispatch onto it if the first attempt never went
+            # out; or — when the close never landed at all (the pre-#113
+            # silent-marker failure) — close fresh from the marker's deal
+            # terms, so Amara is never left telling the buyer "it's on
+            # its way" with nothing behind it.
+            response_text, resend = _parse_and_strip_resend(response_text)
+            if resend is not None and not agreement and context.state != ConversationState.HUMAN_HANDOFF:
+                live_order = (
+                    db.query(Order)
+                    .filter(
+                        Order.account_id == account.id,
+                        Order.customer_id == customer.id,
+                        Order.status == OrderStatus.PENDING,
+                        Order.payment_type == PaymentType.FULL,
+                    )
+                    .order_by(Order.created_at.desc())
+                    .first()
+                )
+                if live_order is not None and _hold_expired(live_order):
+                    # A weeks-old hold, not this deal — the fallback below
+                    # closes fresh (and the reclose guard retires this row
+                    # when it does).
+                    live_order = None
+                if live_order is not None and live_order.product is None:
+                    logger.warning(
+                        "Ignoring live RESEND_PAYMENT order %s: product row is gone.", live_order.id
+                    )
+                    live_order = None
+                if live_order is not None and resend.get("product_name"):
+                    # The marker names a different deal than the live order
+                    # (abandoned cart for A, now closing B) — re-firing the
+                    # wrong prompt would charge for the wrong thing, so fall
+                    # through to a fresh close for the named deal instead.
+                    if (
+                        live_order.product.name.lower() != resend["product_name"].lower()
+                        or abs((live_order.agreed_price or 0) - resend["price"]) > 0.01
+                    ):
+                        logger.warning(
+                            "RESEND_PAYMENT names %r at %s but live order %s is %r at %s; closing fresh.",
+                            resend["product_name"],
+                            resend["price"],
+                            live_order.id,
+                            live_order.product.name,
+                            live_order.agreed_price,
+                        )
+                        live_order = None
+                resend_note = None
+                if live_order is not None and live_order.tunzaa_transaction_id:
+                    resend_note = await self._resend_payment_for_order(
+                        db, live_order, normalized_from_phone, customer.language
+                    )
+                elif live_order is not None:
+                    resend_note = await self._dispatch_payment(
+                        db,
+                        live_order,
+                        live_order.product,
+                        normalized_from_phone,
+                        PaymentType.FULL,
+                        customer.language,
+                    )
+                elif resend.get("product_name"):
+                    if resend.get("payment_type") == "installment":
+                        # Plan legs are pushed on Tunzaa's own schedule —
+                        # re-firing would rebill a leg. The model's own
+                        # words go out alone; the prompt tells it to explain
+                        # the schedule rather than promise a resend.
+                        logger.warning("Ignoring RESEND_PAYMENT for an installment deal; legs are Tunzaa-pushed.")
+                    else:
+                        try:
+                            resend_note = await self._close_deal(
+                                db,
+                                account,
+                                customer,
+                                normalized_from_phone,
+                                {
+                                    "product_name": resend["product_name"],
+                                    "price": resend["price"],
+                                    "payment_type": "full",
+                                    "phone": None,
+                                },
+                                context,
+                            )
+                        except Exception as deal_err:
+                            # Same contract as a failed agreement close: the
+                            # buyer is stuck mid-payment, so a human takes it.
+                            (logger.warning if isinstance(deal_err, DealRejected) else logger.error)(
+                                f"Resend fallback close failed; handing off: {deal_err}"
+                            )
+                            response_text = _holding_reply(customer.language)
+                            await self._trigger_human_handoff(
+                                db, account, context, from_phone, message_body, is_platform_account
+                            )
+                else:
+                    logger.warning(
+                        "Ignoring RESEND_PAYMENT: no live PENDING order for this chat and no deal terms to close fresh."
+                    )
+                if resend_note:
+                    response_text = f"{response_text}\n\n{resend_note}".strip()
 
             # 4. Price quoted but not yet agreed (QUOTE). Superseded by a
             # handoff or an agreement reached in this same turn — either
