@@ -1,5 +1,12 @@
 # Decisions
 
+## test_llm_service.py split by area (2026-11-01, #111b)
+
+**Chose:** the 1,859-line test file is now `tests/unit/llm/` — conftest.py (the 5 shared fixtures, auto-available) plus six area files mirroring the source split (replies, catalog, notify, markers, close, quotes; largest 561 lines). Test bodies byte-identical (span coverage asserted, 79 = 79 collected); the small fake-client block is duplicated per file needing it, matching the codebase's existing precedent for test fakes, with per-file imports pyflakes-trimmed. Validated: full suite 1387 passed / 96.23%, pyflakes clean.
+
+**Considered and rejected:**
+- *A shared fakes module imported across test files.* No importable test-helper chain exists (`tests/` has no `__init__.py`), and completing it would change pytest's module naming for the whole suite — out of proportion for a file-size split. Duplication follows existing precedent (claim/DM/comment tests each carry their own fakes).
+
 ## llm.py split into a package by job (2026-11-01, #111a)
 
 **Chose:** the 2,344-line `app/services/llm.py` is now `app/services/llm/` — constants, prompts (all reply-line dicts), markers (regexes + parsers), helpers (stock/hold/guards/text), providers (SDKs + completion + errors), and the `LLMService` class divided into job mixins (close, notify, replies, replies_dm, replies_wa) combined in service.py. Bodies moved byte-identical (verified by exact span coverage); only headers, mixin class lines, and the facade are new. `__init__.py` re-exports the full 30-name surface (every from-import anywhere, plus the `settings`/`os`/`httpx` monkeypatch targets), every module logs as `app.services.llm`, and the three names tests behavior-patch (`_try_claim_stock`, `_reclose_guard_note`, `match_post_to_product`) are called back through the facade so patches keep landing. Largest file is now 556 lines. Validated: full suite green with zero test edits (1387 passed / 96.23%), pyflakes clean.
