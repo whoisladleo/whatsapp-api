@@ -1,3 +1,11 @@
+import os
+
+# The suite signs/verifies JWTs symmetrically and never needs a real
+# SECRET_KEY — but Settings refuses to construct with a missing/placeholder
+# key outside test mode (fail-fast for misconfigured deploys). Set TESTING
+# before any app.* import so the module-level `settings = Settings()` sees it.
+os.environ["TESTING"] = "true"
+
 import fakeredis
 import pytest
 from fastapi.testclient import TestClient

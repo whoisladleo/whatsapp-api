@@ -45,6 +45,17 @@ def test_get_messages_requires_auth(client, owner_and_account):
     assert resp.status_code == 403 or resp.status_code == 401
 
 
+def test_get_messages_rejects_huge_limit(client, owner_and_account):
+    _, account, headers = owner_and_account
+
+    resp = client.get(
+        "/api/v1/whatsapp/messages?limit=10000000",
+        headers={**headers, "X-WhatsApp-Account-ID": str(account.id)},
+    )
+
+    assert resp.status_code == 422
+
+
 def test_get_messages_404_for_other_users_account_by_id(
     client, owner_and_account, other_user_headers
 ):

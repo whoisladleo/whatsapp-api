@@ -107,6 +107,11 @@ def test_list_orders_empty_for_merchant_with_no_orders(client, merchant_headers)
     assert resp.json() == []
 
 
+def test_list_orders_rejects_huge_limit(client, merchant_headers):
+    resp = client.get(f"{BASE}?limit=10000000", headers=merchant_headers)
+    assert resp.status_code == 422
+
+
 def test_list_orders_returns_merchant_order_with_derived_fields(
     client, merchant_headers, order, product, customer
 ):

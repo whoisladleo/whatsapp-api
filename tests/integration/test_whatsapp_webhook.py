@@ -423,6 +423,52 @@ def test_webhook_forwarding_swallows_request_exceptions(client, db_session, merc
         assert resp.status_code == 200
 
 
+@respx.mock
+def test_webhook_forwarding_runs_after_response_via_background_tasks(
+    client, db_session, merchant_owner, monkeypatch
+):
+    # A slow merchant endpoint must not delay the Meta ACK: the forward is
+    # scheduled via BackgroundTasks (runs after the response) instead of
+    # being awaited inline. Spying add_task proves the scheduling path;
+    # the actual POST still happens (the route mock below) when Starlette
+    # runs the background tasks.
+    import app.api.v1.whatsapp as whatsapp_module
+    from fastapi import BackgroundTasks
+
+    account = WhatsAppAccount(
+        name="Test Shop",
+        phone_number_id="PHONE_CB_BG",
+        access_token="tok",
+        ai_enabled=False,
+        callback_url="http://8.8.8.8/hook",
+        user_id=merchant_owner.id,
+    )
+    db_session.add(account)
+    db_session.commit()
+
+    callback_route = respx.post("http://8.8.8.8/hook").mock(
+        return_value=httpx.Response(200, json={})
+    )
+
+    scheduled = []
+    original_add_task = BackgroundTasks.add_task
+
+    def spy_add_task(self, func, *args, **kwargs):
+        scheduled.append((func, args))
+        return original_add_task(self, func, *args, **kwargs)
+
+    monkeypatch.setattr(BackgroundTasks, "add_task", spy_add_task)
+
+    payload = _text_webhook_payload("PHONE_CB_BG", "255711111111", "hi")
+    resp = client.post(WEBHOOK_URL, json=payload)
+
+    assert resp.status_code == 200
+    assert callback_route.called
+    assert [
+        (func, args[0]) for func, args in scheduled
+    ] == [(whatsapp_module._forward_to_callback, "http://8.8.8.8/hook")]
+
+
 # --- Status updates, knowledge base lookup, Meta send failure ---------------
 
 

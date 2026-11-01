@@ -47,6 +47,10 @@ jobs:
           --health-retries 10
     env:
       SQLALCHEMY_DATABASE_URI: postgresql://postgres:postgres@localhost:5432/postgres
+      # alembic/env.py constructs Settings at import and Settings refuses to
+      # boot without a real SECRET_KEY — migrations never touch JWT, so any
+      # non-placeholder value satisfies the fail-fast check.
+      SECRET_KEY: ci-migrations-dummy-key
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

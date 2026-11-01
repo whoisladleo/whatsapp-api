@@ -113,7 +113,9 @@ async def request_otp(
         # junk row (#83).
         raise HTTPException(status_code=422, detail="Phone number is required")
 
-    if not check_and_increment(f"otp_req:{phone_number}", limit=3, window_seconds=300):
+    # fail_open=False: a Redis outage must deny OTP sends (429), not
+    # unlimit them (WhatsApp cost + victim spam).
+    if not check_and_increment(f"otp_req:{phone_number}", limit=3, window_seconds=300, fail_open=False):
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Too many OTP requests. Please wait a few minutes and try again.",
@@ -155,7 +157,9 @@ def verify_otp(
 ):
     phone_number = normalize_phone(otp_data.username.strip())
 
-    if not check_and_increment(f"otp_verify:{phone_number}", limit=5, window_seconds=300):
+    # fail_open=False: a Redis outage must deny guesses (429), not
+    # unlimit them.
+    if not check_and_increment(f"otp_verify:{phone_number}", limit=5, window_seconds=300, fail_open=False):
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Too many attempts. Please request a new OTP.",
@@ -164,11 +168,14 @@ def verify_otp(
     user = crud_user.get_user_by_username(db, phone_number)
 
     if not user:
+        # Same 401 shape as a bad code — a distinct 404 would let
+        # attackers enumerate which phone numbers are registered.
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found",
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid OTP code",
+            headers={"WWW-Authenticate": "Bearer"},
         )
-        
+
     if not user.otp_code or user.otp_code != otp_data.otp_code:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -288,8 +295,11 @@ async def instagram_login_callback(
 @router.post("/instagram/exchange", response_model=Token)
 def exchange_instagram_login_code(payload: InstagramExchangeRequest, db: Session = Depends(get_db)):
     """Trades the short-lived code from /instagram/callback for a real session token."""
+    # fail_open=False: like OTP verify, a guessing guard that must deny
+    # rather than unlimit during a Redis outage.
     if not check_and_increment(
-        f"ig_login_exchange:{payload.code[-12:]}", limit=5, window_seconds=300
+        f"ig_login_exchange:{payload.code[-12:]}", limit=5, window_seconds=300,
+        fail_open=False,
     ):
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,

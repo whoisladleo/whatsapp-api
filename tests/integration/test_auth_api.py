@@ -161,11 +161,33 @@ def test_verify_otp_wrong_code(client, db_session):
 
 
 def test_verify_otp_unknown_user(client):
+    # Contract change: unknown users get the SAME 401 shape as a bad code
+    # (was 404 "User not found"), so responses don't reveal registration.
     resp = client.post(
         "/api/v1/auth/verify-otp", json={"username": "255700000000", "otp_code": "123456"}
     )
 
-    assert resp.status_code == 404
+    assert resp.status_code == 401
+    assert resp.json()["detail"] == "Invalid OTP code"
+    assert resp.headers["WWW-Authenticate"] == "Bearer"
+
+
+@respx.mock
+def test_verify_otp_unknown_user_matches_bad_code_response(client, db_session):
+    # Unknown-user and bad-code responses must be indistinguishable.
+    _mock_send_text()
+    client.post("/api/v1/auth/request-otp", json={"username": PHONE})
+
+    bad_code = client.post(
+        "/api/v1/auth/verify-otp", json={"username": PHONE, "otp_code": "000000"}
+    )
+    unknown_user = client.post(
+        "/api/v1/auth/verify-otp",
+        json={"username": "255700000000", "otp_code": "000000"},
+    )
+
+    assert bad_code.status_code == unknown_user.status_code == 401
+    assert bad_code.json() == unknown_user.json()
 
 
 @respx.mock
@@ -210,6 +232,44 @@ def test_request_otp_rate_limited_after_three_requests(client):
         assert resp.status_code == 200
 
     resp = client.post("/api/v1/auth/request-otp", json={"username": PHONE})
+
+    assert resp.status_code == 429
+
+
+@respx.mock
+def test_request_otp_denied_when_redis_down(client, monkeypatch):
+    # fail_open=False wiring: a Redis outage must 429 OTP sends, not
+    # unlimit them.
+    import redis
+
+    import app.core.rate_limit as rate_limit_module
+
+    class BrokenRedis:
+        def incr(self, key):
+            raise redis.RedisError("connection refused")
+
+    monkeypatch.setattr(rate_limit_module, "_redis_client", BrokenRedis())
+
+    resp = client.post("/api/v1/auth/request-otp", json={"username": PHONE})
+
+    assert resp.status_code == 429
+
+
+@respx.mock
+def test_verify_otp_denied_when_redis_down(client, db_session, monkeypatch):
+    import redis
+
+    import app.core.rate_limit as rate_limit_module
+
+    class BrokenRedis:
+        def incr(self, key):
+            raise redis.RedisError("connection refused")
+
+    monkeypatch.setattr(rate_limit_module, "_redis_client", BrokenRedis())
+
+    resp = client.post(
+        "/api/v1/auth/verify-otp", json={"username": PHONE, "otp_code": "000000"}
+    )
 
     assert resp.status_code == 429
 

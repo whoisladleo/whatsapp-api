@@ -27,8 +27,8 @@ logger = logging.getLogger(__name__)
 def list_orders(
     status: Optional[OrderStatus] = None,
     account_id: Optional[uuid.UUID] = None,
-    skip: int = 0,
-    limit: int = 100,
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=500),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
