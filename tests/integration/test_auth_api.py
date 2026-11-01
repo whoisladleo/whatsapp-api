@@ -613,21 +613,28 @@ def test_pay_now_creates_order_and_pending_subscription(client, auth_user, db_se
 
 
 @respx.mock
-def test_pay_now_called_twice_reuses_pending_subscription_row(client, auth_user, db_session, monkeypatch):
+def test_pay_now_called_twice_reuses_pending_order(client, auth_user, db_session, monkeypatch):
     """
-    Regression test: clicking Pay Now more than once before the first
-    payment ever confirms (abandoned Tunzaa prompt, page refresh, etc.)
-    must not accumulate one orphaned PENDING_PAYMENT ProductSubscription
-    row per click — see product_subscription.get_or_create_pending_subscription.
+    Regression test (#110): clicking Pay Now more than once before the
+    first payment ever confirms (double-click, page refresh, abandoned
+    Tunzaa prompt) must not mint a second Order — two orders means two
+    real charges, and only one subscription row ever resolves. The second
+    click reuses the pending order but still sends a fresh Tunzaa prompt,
+    whose transaction id wins. (Was
+    test_pay_now_called_twice_reuses_pending_subscription_row, which
+    asserted the two-orders behavior — that expectation was the bug.)
     """
     from app.db.models import Order, ProductSubscription
 
-    _seed_platform_product(db_session)
+    product = _seed_platform_product(db_session)
     _, headers = auth_user
 
     respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "tok-1"}))
     respx.post(PAYMENT_URL).mock(
-        return_value=httpx.Response(200, json={"statusCode": 202, "success": True, "transactionID": "MOCK_TXN_PAYNOW_DUP"})
+        side_effect=[
+            httpx.Response(200, json={"statusCode": 202, "success": True, "transactionID": "MOCK_TXN_FIRST"}),
+            httpx.Response(200, json={"statusCode": 202, "success": True, "transactionID": "MOCK_TXN_SECOND"}),
+        ]
     )
 
     first = client.post("/api/v1/auth/me/subscription/pay", json={}, headers=headers)
@@ -635,16 +642,19 @@ def test_pay_now_called_twice_reuses_pending_subscription_row(client, auth_user,
 
     assert first.status_code == 200
     assert second.status_code == 200
-    assert first.json()["order_id"] != second.json()["order_id"]
+    assert first.json()["order_id"] == second.json()["order_id"]
 
-    orders = db_session.query(Order).filter(
-        Order.id.in_([uuid.UUID(first.json()["order_id"]), uuid.UUID(second.json()["order_id"])])
-    ).all()
-    assert len(orders) == 2
+    orders = db_session.query(Order).all()
+    assert len(orders) == 1
+    assert orders[0].tunzaa_transaction_id == "MOCK_TXN_SECOND"
 
     subscriptions = db_session.query(ProductSubscription).all()
     assert len(subscriptions) == 1
-    assert subscriptions[0].order_id == uuid.UUID(second.json()["order_id"])
+    assert subscriptions[0].order_id == orders[0].id
+
+    # Stock taken once, not per click.
+    db_session.refresh(product)
+    assert product.quantity == 999998
 
 
 @respx.mock
@@ -666,6 +676,99 @@ def test_pay_now_releases_reservation_on_dispatch_failure(client, auth_user, db_
 
     order = db_session.query(Order).filter(Order.product_id == product.id).first()
     assert order.status == OrderStatus.CANCELLED
+
+
+@respx.mock
+def test_pay_now_reused_order_dispatch_failure_restores_no_stock(client, auth_user, db_session, monkeypatch):
+    # Second click reuses the pending order (no stock taken this time), so
+    # a dispatch failure must cancel it without minting a phantom unit.
+    from app.db.models import Order, OrderStatus
+
+    product = _seed_platform_product(db_session)
+    _, headers = auth_user
+
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "tok-1"}))
+    respx.post(PAYMENT_URL).mock(
+        side_effect=[
+            httpx.Response(200, json={"statusCode": 202, "success": True, "transactionID": "MOCK_TXN_OK"}),
+            httpx.Response(500),
+        ]
+    )
+
+    first = client.post("/api/v1/auth/me/subscription/pay", json={}, headers=headers)
+    assert first.status_code == 200
+    db_session.refresh(product)
+    assert product.quantity == 999998
+
+    second = client.post("/api/v1/auth/me/subscription/pay", json={}, headers=headers)
+    assert second.status_code == 502
+
+    orders = db_session.query(Order).all()
+    assert len(orders) == 1
+    assert orders[0].status == OrderStatus.CANCELLED
+    db_session.refresh(product)
+    assert product.quantity == 999998
+
+
+@respx.mock
+def test_pay_now_does_not_reuse_pending_installment_order(client, auth_user, db_session, monkeypatch):
+    # A pending INSTALLMENT order may carry a Tunzaa plan whose legs keep
+    # billing — Pay Now (full payment) must mint its own order, never
+    # repurpose that one (#110).
+    from app.db.models import Customer, Order, OrderStatus, PaymentType
+
+    product = _seed_platform_product(db_session)
+    user, headers = auth_user
+
+    customer = Customer(phone_number=user.username)
+    db_session.add(customer)
+    db_session.commit()
+    db_session.refresh(customer)
+    installment_order = Order(
+        customer_id=customer.id, product_id=product.id, quantity=1,
+        agreed_price=100000, payment_type=PaymentType.INSTALLMENT,
+        status=OrderStatus.PENDING, tunzaa_plan_id="plan-1",
+    )
+    db_session.add(installment_order)
+    db_session.commit()
+
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "tok-1"}))
+    respx.post(PAYMENT_URL).mock(
+        return_value=httpx.Response(200, json={"statusCode": 202, "success": True, "transactionID": "MOCK_TXN_FULL"})
+    )
+
+    resp = client.post("/api/v1/auth/me/subscription/pay", json={}, headers=headers)
+
+    assert resp.status_code == 200
+    assert resp.json()["order_id"] != str(installment_order.id)
+    fresh = db_session.query(Order).filter(Order.id == uuid.UUID(resp.json()["order_id"])).first()
+    assert fresh.payment_type == PaymentType.FULL
+
+
+@respx.mock
+def test_pay_now_schedules_auto_cancel(client, auth_user, db_session, monkeypatch):
+    # Dashboard orders never scheduled expiry (only chat closes did), so an
+    # abandoned Pay Now prompt sat PENDING forever (#110).
+    from app.tasks.order_reminders import auto_cancel_order
+
+    _seed_platform_product(db_session)
+    _, headers = auth_user
+
+    scheduled = []
+    monkeypatch.setattr(
+        auto_cancel_order, "apply_async", lambda *a, **kw: scheduled.append((a, kw))
+    )
+
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "tok-1"}))
+    respx.post(PAYMENT_URL).mock(
+        return_value=httpx.Response(200, json={"statusCode": 202, "success": True, "transactionID": "MOCK_TXN_SCHED"})
+    )
+
+    resp = client.post("/api/v1/auth/me/subscription/pay", json={}, headers=headers)
+
+    assert resp.status_code == 200
+    assert len(scheduled) == 1
+    assert scheduled[0][1]["args"] == [resp.json()["order_id"]]
 
 
 # --- plan choice (#90) ----------------------------------------------------------

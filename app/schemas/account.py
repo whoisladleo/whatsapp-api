@@ -72,6 +72,7 @@ class NumberSubscriptionResponse(BaseModel):
     next_billing_at: Optional[UtcDateTime] = None
     retry_count: int
     created_at: UtcDateTime
+    refund_status: Optional[str] = None
 
     class Config:
         from_attributes = True

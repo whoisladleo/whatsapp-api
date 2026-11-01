@@ -50,12 +50,14 @@ async def pay_now(
     Dashboard-native "Pay Now" for Taskflow's own subscription — no AI
     negotiation needed since the price is fixed (product.max_price ==
     min_price by convention for a subscription product; this charges
-    max_price regardless). Always creates a fresh Order/ProductSubscription
-    pair, the same flow whether this is a first-ever payment, catching up a
-    lapsed (PAST_DUE) one, or resubscribing after CANCELLED — no special-
-    casing, per product decision on #5. Activation happens the normal way,
-    via the Tunzaa webhook's existing order-<id> COMPLETED handling
-    (app/api/v1/tunzaa_webhook.py's _activate_subscription_if_linked).
+    max_price regardless). Same flow whether this is a first-ever payment,
+    catching up a lapsed (PAST_DUE) one, or resubscribing after CANCELLED
+    — no special-casing, per product decision on #5 — except that a
+    repeat click while the previous attempt is still unpaid reuses that
+    pending Order instead of minting a second one (#110). Activation
+    happens the normal way, via the Tunzaa webhook's existing order-<id>
+    COMPLETED handling (app/api/v1/tunzaa_webhook.py's
+    _activate_subscription_if_linked).
     """
     from app.services.subscription_access import get_platform_plans
     from app.services.tunzaa import tunzaa_service
@@ -94,29 +96,71 @@ async def pay_now(
         db.refresh(customer)
 
     price = product.max_price
-    if product.quantity > 0:
-        product.quantity -= 1
-    order = Order(
-        customer_id=customer.id,
-        product_id=product.id,
-        quantity=1,
-        agreed_price=price,
-        payment_type=PaymentType.FULL,
-        status=OrderStatus.PENDING,
-        reserved_until=datetime.utcnow() + RESERVATION_WINDOW,
+    # Idempotency (#110): a repeat click while the first prompt is still
+    # unpaid must not mint a second Order — two orders means two real
+    # charges, and only one subscription row ever resolves, so the second
+    # payment would be silently absorbed. Reuse the still-pending FULL
+    # order; a fresh Tunzaa prompt goes out against it below. Installment
+    # orders are never reused (a Tunzaa plan's legs would keep billing
+    # against a full-pay prompt), nor multi-unit ones (their agreed price
+    # is a negotiated total, not this unit price).
+    order = (
+        db.query(Order)
+        .filter(
+            Order.customer_id == customer.id,
+            Order.product_id == product.id,
+            Order.status == OrderStatus.PENDING,
+            Order.payment_type == PaymentType.FULL,
+            Order.tunzaa_plan_id.is_(None),
+            Order.quantity == 1,
+        )
+        .order_by(Order.created_at.desc())
+        .first()
     )
-    db.add(order)
-    db.commit()
-    db.refresh(order)
+    stock_taken = False
+    if order is None:
+        if product.quantity > 0:
+            product.quantity -= 1
+            stock_taken = True
+        order = Order(
+            customer_id=customer.id,
+            product_id=product.id,
+            quantity=1,
+            agreed_price=price,
+            payment_type=PaymentType.FULL,
+            status=OrderStatus.PENDING,
+            reserved_until=datetime.utcnow() + RESERVATION_WINDOW,
+        )
+        db.add(order)
+        db.commit()
+        db.refresh(order)
 
-    # The decrement above may have taken the last unit.
-    from app.tasks.catalog_sync import dispatch_catalog_sync
-    dispatch_catalog_sync(product.id, "upsert")
+        # The decrement above may have taken the last unit.
+        from app.tasks.catalog_sync import dispatch_catalog_sync
+        dispatch_catalog_sync(product.id, "upsert")
+    else:
+        order.agreed_price = price
+        order.reserved_until = datetime.utcnow() + RESERVATION_WINDOW
+        db.commit()
+        db.refresh(order)
 
     # Reuses an existing unpaid attempt for this customer+product rather
     # than inserting a new row every time Pay Now is clicked — see
     # product_subscription.get_or_create_pending_subscription.
     product_subscription.get_or_create_pending_subscription(db, order, product, customer.id)
+
+    # Dashboard orders never scheduled this (only chat closes did), so an
+    # abandoned Pay Now prompt sat PENDING forever. On the reuse path this
+    # reschedules, extending the deadline from the latest click — matching
+    # the refreshed reserved_until above; the older firing no-ops on the
+    # reservation check (#110).
+    try:
+        from app.tasks.order_reminders import AUTO_CANCEL_DELAY_SECONDS, auto_cancel_order
+        auto_cancel_order.apply_async(
+            args=[str(order.id)], countdown=AUTO_CANCEL_DELAY_SECONDS
+        )
+    except Exception as e:
+        logger.error(f"Failed to schedule auto-cancel for order {order.id}: {e}")
 
     try:
         resp = await tunzaa_service.initiate_payment(
@@ -124,13 +168,13 @@ async def pay_now(
         )
     except Exception as e:
         logger.error(f"Pay Now dispatch failed for order {order.id}: {e}")
-        _release_failed_order(db, order, product)
+        _release_failed_order(db, order, product, stock_taken)
         raise
 
     transaction_id = resp.get("transactionID")
     if not transaction_id:
         logger.error(f"Pay Now dispatch returned no transaction id for order {order.id}: {resp}")
-        _release_failed_order(db, order, product)
+        _release_failed_order(db, order, product, stock_taken)
         raise RuntimeError("Tunzaa did not return a transaction id")
 
     order.tunzaa_transaction_id = transaction_id
@@ -143,8 +187,14 @@ async def pay_now(
     }
 
 
-def _release_failed_order(db: Session, order: Order, product: Product) -> None:
-    product.quantity += order.quantity or 1
+def _release_failed_order(
+    db: Session, order: Order, product: Product, restore_stock: bool
+) -> None:
+    # Only give back stock this attempt actually took: a reused pending
+    # order took none, and neither did a fresh one when the shelf was
+    # already empty — restoring blindly would mint phantom units (#110).
+    if restore_stock:
+        product.quantity += order.quantity or 1
     order.status = OrderStatus.CANCELLED
     db.commit()
     from app.tasks.catalog_sync import dispatch_catalog_sync

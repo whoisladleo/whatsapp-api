@@ -337,10 +337,22 @@ def test_installment_reconciliation_marks_overdue_installment(
     assert installment.status == InstallmentStatus.OVERDUE
 
 
-def test_installment_reconciliation_falls_back_when_get_plan_fails(
+def test_installment_reconciliation_fetch_failure_leaves_order_pending_and_retries(
     client, db_session, plan_order, monkeypatch
 ):
+    # Was test_installment_reconciliation_falls_back_when_get_plan_fails,
+    # which asserted PAID here — that expectation was the #110 bug: a
+    # mid-plan leg plus a transient Tunzaa fetch error marked the entire
+    # order paid. The signed callback still proves the leg, so the leg is
+    # recorded — but the order-level verdict waits for a successful fetch.
     _mock_get_installment_plan(monkeypatch, raise_error=True)
+
+    scheduled = []
+    from app.tasks.product_subscription_billing import retry_installment_reconcile
+    monkeypatch.setattr(
+        retry_installment_reconcile, "apply_async",
+        lambda *a, **kw: scheduled.append((a, kw)),
+    )
 
     resp = _post(
         client,
@@ -349,7 +361,9 @@ def test_installment_reconciliation_falls_back_when_get_plan_fails(
 
     assert resp.status_code == 200
     db_session.refresh(plan_order)
-    assert plan_order.status == OrderStatus.PAID
+    assert plan_order.status == OrderStatus.PENDING
+    assert len(scheduled) == 1
+    assert scheduled[0][1].get("countdown") is not None
 
     installment = (
         db_session.query(Installment)
@@ -708,6 +722,43 @@ def test_failed_then_completed_without_stock_stays_failed(
     assert order.status == OrderStatus.FAILED
     assert product.quantity == 0
     assert order.tunzaa_transaction_id == "T-PAID-RETRY"
+
+
+def test_cancelled_then_completed_reclaims_stock(client, db_session, order, product, monkeypatch):
+    # A prompt approved after expiry (auto-cancel restores the reservation
+    # just like FAILED does) must re-claim before marking paid (#110).
+    _mock_send_text(monkeypatch)
+    _mock_send_template(monkeypatch)
+    order.status = OrderStatus.CANCELLED
+    product.quantity = 2
+    db_session.commit()
+
+    resp = _complete(client, order.id, "T-PAID-LATE")
+
+    assert resp.status_code == 200
+    db_session.refresh(order)
+    db_session.refresh(product)
+    assert order.status == OrderStatus.PAID
+    assert product.quantity == 1
+
+
+def test_cancelled_then_completed_without_stock_stays_cancelled(
+    client, db_session, order, product, monkeypatch
+):
+    _mock_send_text(monkeypatch)
+    _mock_send_template(monkeypatch)
+    order.status = OrderStatus.CANCELLED
+    product.quantity = 0
+    db_session.commit()
+
+    resp = _complete(client, order.id, "T-PAID-LATE")
+
+    assert resp.json() == {"status": "success", "message": "Payment arrived but stock unavailable"}
+    db_session.refresh(order)
+    db_session.refresh(product)
+    assert order.status == OrderStatus.CANCELLED
+    assert product.quantity == 0
+    assert order.tunzaa_transaction_id == "T-PAID-LATE"
 
 
 # --- misc ---------------------------------------------------------------------

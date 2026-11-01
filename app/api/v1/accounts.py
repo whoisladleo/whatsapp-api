@@ -227,6 +227,7 @@ async def purchase_number(
         next_billing_at=subscription.next_billing_at,
         retry_count=subscription.retry_count,
         created_at=subscription.created_at,
+        refund_status=subscription.refund_status,
     )
 
 
@@ -255,4 +256,5 @@ def get_number_subscription(
         next_billing_at=subscription.next_billing_at,
         retry_count=subscription.retry_count,
         created_at=subscription.created_at,
+        refund_status=subscription.refund_status,
     )

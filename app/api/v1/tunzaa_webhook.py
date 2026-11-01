@@ -120,17 +120,19 @@ async def handle_tunzaa_webhook(
             _record_payment_event(db, order, _parse_float(data.get("amount")))
             return {"status": "success", "message": "Order already PAID; payment recorded"}
 
-        if order.status == OrderStatus.FAILED:
-            # Customer paid after an earlier attempt failed — and FAILED
-            # restores the stock reservation. Re-claim before marking paid,
-            # or the sale completes without decrementing. (#77)
+        if order.status in (OrderStatus.FAILED, OrderStatus.CANCELLED):
+            # Customer paid after the order resolved without payment — and
+            # both FAILED and CANCELLED restore the stock reservation
+            # (expiry via auto_cancel_order, or a failed Pay Now dispatch).
+            # Re-claim before marking paid, or the sale completes without
+            # decrementing. (#77, #110)
             if not _try_reclaim_stock(db, order):
                 if transaction_id:
                     order.tunzaa_transaction_id = transaction_id
                 db.commit()
                 logger.error(
                     f"COMPLETED for order {order.id} but no stock to reclaim; "
-                    f"leaving FAILED for merchant review."
+                    f"leaving {order.status.value} for merchant review."
                 )
                 return {"status": "success", "message": "Payment arrived but stock unavailable"}
             order.status = OrderStatus.PENDING
@@ -448,33 +450,14 @@ def _mark_single_installment_paid(db: Session, order: Order, installment_id) -> 
         installment.status = InstallmentStatus.PAID
 
 
-async def _reconcile_installment_plan(db: Session, order: Order, installment_id) -> None:
+def apply_installment_plan_state(db: Session, order: Order, plan_data: dict) -> None:
     """
-    Fetches the plan's authoritative state from Tunzaa (paid_amount/
-    remaining_balance at the plan level, plus each installment's own
-    status) and syncs our local rows from it, rather than trusting this
-    one callback's fields in isolation. Falls back to the simpler
-    single-installment-matching behavior (and marks the order PAID
-    outright, matching this handler's pre-reconciliation behavior) if the
-    Tunzaa call itself fails, so a transient network error doesn't leave
-    the order stuck.
+    Syncs local Installment/Order rows from a Tunzaa plan fetch — plan-level
+    paid_amount/remaining_balance plus each installment's own status. Shared
+    by the webhook reconcile below and the background retry task (which
+    imports this; see app/tasks/product_subscription_billing.py). Mutates
+    without committing — the caller commits.
     """
-    from app.services.tunzaa import tunzaa_service
-
-    try:
-        plan_data = await tunzaa_service.get_installment_plan(
-            order.tunzaa_plan_id, include_payments=True
-        )
-    except Exception as e:
-        logger.warning(
-            f"get_installment_plan failed for order {order.id} "
-            f"(plan {order.tunzaa_plan_id}); falling back to single-"
-            f"installment matching: {e}"
-        )
-        order.status = OrderStatus.PAID
-        _mark_single_installment_paid(db, order, installment_id)
-        return
-
     for inst_data in plan_data.get("installments", []):
         remote_id = inst_data.get("installment_id")
         if remote_id is None:
@@ -500,6 +483,51 @@ async def _reconcile_installment_plan(db: Session, order: Order, installment_id)
     # else: leave order PENDING — the plan still has a balance outstanding,
     # regardless of whether this particular leg was paid exactly, under, or
     # over what was due.
+
+
+async def _reconcile_installment_plan(db: Session, order: Order, installment_id) -> None:
+    """
+    Fetches the plan's authoritative state from Tunzaa (paid_amount/
+    remaining_balance at the plan level, plus each installment's own
+    status) and syncs our local rows from it, rather than trusting this
+    one callback's fields in isolation. If the Tunzaa call itself fails,
+    only the paid leg is recorded and the order stays PENDING while a
+    background task retries the fetch — the order-level verdict must come
+    from Tunzaa's balances, never from a failed lookup (#110).
+    """
+    from app.services.tunzaa import tunzaa_service
+
+    try:
+        plan_data = await tunzaa_service.get_installment_plan(
+            order.tunzaa_plan_id, include_payments=True
+        )
+    except Exception as e:
+        # The callback is signed proof this leg was paid, so record that —
+        # but without the plan's authoritative balances the whole order
+        # must not be marked paid (a mid-plan leg plus a transient fetch
+        # error used to mark the entire order PAID). Settle it from a
+        # background retry instead.
+        logger.warning(
+            f"get_installment_plan failed for order {order.id} "
+            f"(plan {order.tunzaa_plan_id}); marking the leg and retrying: {e}"
+        )
+        _mark_single_installment_paid(db, order, installment_id)
+        try:
+            from app.tasks.product_subscription_billing import (
+                RECONCILE_RETRY_DELAY_SECONDS,
+                retry_installment_reconcile,
+            )
+            retry_installment_reconcile.apply_async(
+                args=[str(order.id), 1],
+                countdown=RECONCILE_RETRY_DELAY_SECONDS,
+            )
+        except Exception as sched_err:
+            logger.error(
+                f"Failed to schedule reconcile retry for order {order.id}: {sched_err}"
+            )
+        return
+
+    apply_installment_plan_state(db, order, plan_data)
 
 
 def _parse_float(value) -> Optional[float]:

@@ -105,6 +105,7 @@ def _no_real_celery_broker(monkeypatch):
     from app.tasks.product_subscription_billing import (
         charge_renewal as charge_product_subscription_renewal,
         check_past_due_grace_expired,
+        retry_installment_reconcile,
     )
 
     monkeypatch.setattr(send_handoff_reminder, "apply_async", lambda *a, **kw: None)
@@ -115,6 +116,7 @@ def _no_real_celery_broker(monkeypatch):
     monkeypatch.setattr(check_past_due_grace_expired, "apply_async", lambda *a, **kw: None)
     monkeypatch.setattr(send_quote_nudge, "apply_async", lambda *a, **kw: None)
     monkeypatch.setattr(charge_product_subscription_renewal, "apply_async", lambda *a, **kw: None)
+    monkeypatch.setattr(retry_installment_reconcile, "apply_async", lambda *a, **kw: None)
     from app.tasks.usage_alerts import send_usage_warning
     monkeypatch.setattr(send_usage_warning, "apply_async", lambda *a, **kw: None)
 

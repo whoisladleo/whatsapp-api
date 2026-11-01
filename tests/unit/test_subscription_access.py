@@ -137,6 +137,20 @@ def test_allowed_when_pending_first_payment(db_session, merchant, merchant_custo
     assert subscription_access.is_merchant_allowed_ai(db_session, merchant) is True
 
 
+def test_denied_when_pending_first_payment_is_stale(db_session, merchant, merchant_customer, platform_product):
+    # An abandoned Pay Now attempt never resolves on its own — without an
+    # age bound, PENDING_PAYMENT granted access forever (#110).
+    sub = _make_subscription(
+        db_session, platform_product, merchant_customer, status=ProductSubscriptionStatus.PENDING_PAYMENT
+    )
+    sub.created_at = datetime.utcnow() - timedelta(
+        hours=subscription_access.PENDING_PAYMENT_ALLOW_HOURS + 1
+    )
+    db_session.commit()
+
+    assert subscription_access.is_merchant_allowed_ai(db_session, merchant) is False
+
+
 def test_denied_when_first_payment_failed(db_session, merchant, merchant_customer, platform_product):
     _make_subscription(db_session, platform_product, merchant_customer, status=ProductSubscriptionStatus.PAYMENT_FAILED)
 

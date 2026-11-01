@@ -295,3 +295,41 @@ def test_auto_cancel_order_notify_failure_still_logs(db_session, pending_order, 
     assert result == "Success"
     logged = db_session.query(Message).filter(Message.status == "failed").first()
     assert logged is not None
+
+
+def test_auto_cancel_order_fails_linked_pending_subscription(db_session, pending_order, monkeypatch):
+    # An abandoned first payment must resolve to PAYMENT_FAILED, never sit
+    # in PENDING_PAYMENT granting access forever (#110).
+    from app.db.models import ProductSubscription, ProductSubscriptionStatus
+
+    _mock_send_text(monkeypatch)
+    sub = ProductSubscription(
+        order_id=pending_order.id, customer_id=pending_order.customer_id,
+        product_id=pending_order.product_id,
+        status=ProductSubscriptionStatus.PENDING_PAYMENT, monthly_amount=45000,
+    )
+    db_session.add(sub)
+    db_session.commit()
+    order_id, sub_id = pending_order.id, sub.id
+
+    result = order_reminders.auto_cancel_order(order_id)
+
+    assert result == "Success"
+    reloaded = db_session.query(ProductSubscription).filter(ProductSubscription.id == sub_id).first()
+    assert reloaded.status == ProductSubscriptionStatus.PAYMENT_FAILED
+
+
+def test_auto_cancel_order_skips_fresh_reservation(db_session, pending_order):
+    # A newer attempt refreshed the reservation after this firing was
+    # scheduled (Pay Now reschedules on reuse) — this firing is stale.
+    from datetime import datetime, timedelta
+
+    pending_order.reserved_until = datetime.utcnow() + timedelta(hours=47)
+    db_session.commit()
+    order_id = pending_order.id
+
+    result = order_reminders.auto_cancel_order(order_id)
+
+    reloaded = db_session.query(Order).filter(Order.id == order_id).first()
+    assert result == "Reservation still active."
+    assert reloaded.status == OrderStatus.PENDING

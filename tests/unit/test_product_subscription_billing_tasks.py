@@ -3,6 +3,8 @@ import pytest
 import app.tasks.product_subscription_billing as product_subscription_tasks
 from app.db.models import (
     Customer,
+    Installment,
+    InstallmentStatus,
     Order,
     OrderStatus,
     PaymentType,
@@ -259,3 +261,110 @@ def test_grace_expired_no_op_if_already_recovered(
 
 def test_grace_expired_missing_subscription_does_not_crash(db_session):
     product_subscription_tasks.check_past_due_grace_expired(999999)  # no exception
+
+
+@pytest.fixture
+def pending_plan_order(db_session, order):
+    order.status = OrderStatus.PENDING
+    order.tunzaa_plan_id = "1001"
+    db_session.add(
+        Installment(
+            order_id=order.id, tunzaa_installment_id="10000", amount_due=15000,
+            due_date=order.created_at, status=InstallmentStatus.PENDING,
+        )
+    )
+    db_session.commit()
+    db_session.refresh(order)
+    return order
+
+
+def _mock_plan_fetch(monkeypatch, response=None, raise_error=False):
+    async def fake(self, plan_id, include_payments=False):
+        if raise_error:
+            raise RuntimeError("network down")
+        return response
+
+    monkeypatch.setattr("app.services.tunzaa.TunzaaService.get_installment_plan", fake)
+
+
+def test_retry_reconcile_applies_plan_state_when_fetch_succeeds(
+    db_session, pending_plan_order, monkeypatch
+):
+    _mock_plan_fetch(
+        monkeypatch,
+        response={
+            "plan": {"plan_id": 1001, "paid_amount": "100000.00", "remaining_balance": "0.00"},
+            "installments": [{"installment_id": 10000, "status": "PAID"}],
+        },
+    )
+
+    order_id = pending_plan_order.id
+    product_subscription_tasks.retry_installment_reconcile(str(order_id), 1)
+
+    reloaded = db_session.query(Order).filter(Order.id == order_id).first()
+    assert reloaded.status == OrderStatus.PAID
+    leg = (
+        db_session.query(Installment)
+        .filter(Installment.order_id == order_id)
+        .first()
+    )
+    assert leg.status == InstallmentStatus.PAID
+
+
+def test_retry_reconcile_reschedules_when_fetch_fails(
+    db_session, pending_plan_order, monkeypatch
+):
+    _mock_plan_fetch(monkeypatch, raise_error=True)
+
+    scheduled = []
+    monkeypatch.setattr(
+        product_subscription_tasks.retry_installment_reconcile, "apply_async",
+        lambda *a, **kw: scheduled.append((a, kw)),
+    )
+
+    order_id = pending_plan_order.id
+    product_subscription_tasks.retry_installment_reconcile(str(order_id), 1)
+
+    reloaded = db_session.query(Order).filter(Order.id == order_id).first()
+    assert reloaded.status == OrderStatus.PENDING
+    assert len(scheduled) == 1
+    assert scheduled[0][1]["args"] == [str(order_id), 2]
+
+
+def test_retry_reconcile_gives_up_after_max_attempts(
+    db_session, pending_plan_order, monkeypatch
+):
+    _mock_plan_fetch(monkeypatch, raise_error=True)
+
+    scheduled = []
+    monkeypatch.setattr(
+        product_subscription_tasks.retry_installment_reconcile, "apply_async",
+        lambda *a, **kw: scheduled.append((a, kw)),
+    )
+
+    order_id = pending_plan_order.id
+    product_subscription_tasks.retry_installment_reconcile(
+        str(order_id), product_subscription_tasks.RECONCILE_MAX_ATTEMPTS
+    )
+
+    reloaded = db_session.query(Order).filter(Order.id == order_id).first()
+    assert reloaded.status == OrderStatus.PENDING
+    assert scheduled == []
+
+
+def test_retry_reconcile_no_op_when_order_resolved(db_session, pending_plan_order, monkeypatch):
+    pending_plan_order.status = OrderStatus.PAID
+    db_session.commit()
+
+    called = []
+
+    async def fake_fetch(self, plan_id, include_payments=False):
+        called.append("fetch")
+        return {}
+
+    monkeypatch.setattr("app.services.tunzaa.TunzaaService.get_installment_plan", fake_fetch)
+
+    order_id = pending_plan_order.id
+    product_subscription_tasks.retry_installment_reconcile(str(order_id), 1)
+
+    assert called == []

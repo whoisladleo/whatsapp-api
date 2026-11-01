@@ -116,12 +116,14 @@ def test_provision_after_payment_failure_refunds(db_session, subscription, monke
     monkeypatch.setattr("app.services.tunzaa.tunzaa_service.refund_payment", fake_refund)
     notify_calls = _mock_notify_merchant(monkeypatch)
 
-    number_billing_tasks.provision_after_payment(subscription.id)
+    sub_id = subscription.id
+    number_billing_tasks.provision_after_payment(sub_id)
 
-    refreshed = db_session.query(NumberSubscription).filter(NumberSubscription.id == subscription.id).first()
+    refreshed = db_session.query(NumberSubscription).filter(NumberSubscription.id == sub_id).first()
     assert refreshed.status == NumberSubscriptionStatus.PROVISIONING_FAILED
     assert refund_calls == [("TXN-PAID", 10000, "Number provisioning failed")]
     assert "refunded" in notify_calls[0]
+    assert refreshed.refund_status == "SUCCEEDED"
 
 
 def test_provision_after_payment_failure_refund_also_fails(db_session, subscription, monkeypatch):
@@ -135,11 +137,13 @@ def test_provision_after_payment_failure_refund_also_fails(db_session, subscript
     monkeypatch.setattr("app.services.tunzaa.tunzaa_service.refund_payment", fake_refund_fails)
     notify_calls = _mock_notify_merchant(monkeypatch)
 
-    number_billing_tasks.provision_after_payment(subscription.id)
+    sub_id = subscription.id
+    number_billing_tasks.provision_after_payment(sub_id)
 
-    refreshed = db_session.query(NumberSubscription).filter(NumberSubscription.id == subscription.id).first()
+    refreshed = db_session.query(NumberSubscription).filter(NumberSubscription.id == sub_id).first()
     assert refreshed.status == NumberSubscriptionStatus.PROVISIONING_FAILED
     assert "contact support" in notify_calls[0]
+    assert refreshed.refund_status == "FAILED"
 
 
 def test_provision_after_payment_missing_subscription_does_not_crash(db_session):

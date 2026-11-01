@@ -1,10 +1,18 @@
 import asyncio
 import logging
+from datetime import datetime
 from app.core.celery_app import celery_app
 from app.core.config import settings
 from app.core.ids import coerce_uuid
 from app.db.session import SessionLocal
-from app.db.models import Order, OrderStatus, Product, WhatsAppAccount
+from app.db.models import (
+    Order,
+    OrderStatus,
+    Product,
+    ProductSubscription,
+    ProductSubscriptionStatus,
+    WhatsAppAccount,
+)
 from app.crud import message as crud_message
 from app.services import usage
 
@@ -173,7 +181,10 @@ def auto_cancel_order(order_id: str):
     """
     T+48h: cancel an unpaid order and release the reserved quantity back to
     Product.quantity (stock is decremented at reservation time, not
-    deferred to payment success — see LLMService._close_deal).
+    deferred to payment success — see LLMService._close_deal). Also fails
+    the linked subscription attempt, if any — an abandoned first payment
+    must resolve to PAYMENT_FAILED, never sit in PENDING_PAYMENT granting
+    access forever (#110).
     """
     logger.info(f"Executing auto cancel for order {order_id}")
     db = SessionLocal()
@@ -182,6 +193,11 @@ def auto_cancel_order(order_id: str):
         order = db.query(Order).filter(Order.id == order_uuid).first() if order_uuid else None
         if not order or order.status != OrderStatus.PENDING:
             return "Order not found or not pending."
+        if order.reserved_until is not None and order.reserved_until > datetime.utcnow():
+            # A newer attempt refreshed the reservation after this firing
+            # was scheduled (Pay Now reschedules on reuse) — this one is
+            # stale; the newer firing will cancel at the new deadline.
+            return "Reservation still active."
 
         order.status = OrderStatus.CANCELLED
 
@@ -193,6 +209,18 @@ def auto_cancel_order(order_id: str):
                 restored_product_id = product.id
 
         db.commit()
+
+        linked = (
+            db.query(ProductSubscription)
+            .filter(
+                ProductSubscription.order_id == order.id,
+                ProductSubscription.status == ProductSubscriptionStatus.PENDING_PAYMENT,
+            )
+            .first()
+        )
+        if linked is not None:
+            from app.services import product_subscription
+            product_subscription.mark_first_payment_failed(db, linked)
 
         if restored_product_id:
             # The release may flip the catalog's availability back to in stock.

@@ -19,6 +19,12 @@ from app.db.models import (
 # point) already gets Amara paused, ahead of full cancellation.
 PAST_DUE_ACCESS_GRACE_DAYS = 7
 
+# A first payment still in flight (PENDING_PAYMENT) allows access only
+# this long — an abandoned attempt never resolves on its own, so without
+# an age bound this was free access forever (#110). Matches the 48h
+# order-reservation window (auto_cancel_order fires at the same moment).
+PENDING_PAYMENT_ALLOW_HOURS = 48
+
 
 def get_platform_plans(db: Session) -> list[Product]:
     """Every Product flagged as a platform plan SKU (#90), oldest first."""
@@ -73,15 +79,23 @@ def find_platform_subscription(db: Session, user: User) -> Optional[ProductSubsc
 def _subscription_allows(subscription: ProductSubscription) -> bool:
     """One subscription's access verdict. CANCELLED or first-payment
     PAYMENT_FAILED deny, the same as each other — "never paid" and
-    "stopped paying" are treated identically. A PAST_DUE subscription
-    still gets a grace period (see PAST_DUE_ACCESS_GRACE_DAYS) before it
-    denies too. ACTIVE, or PENDING_PAYMENT (first payment still in
-    flight), allow."""
+    "stopped paying" are treated identically. PENDING_PAYMENT (first
+    payment still in flight) allows only while the attempt is fresh (see
+    PENDING_PAYMENT_ALLOW_HOURS). A PAST_DUE subscription still gets a
+    grace period (see PAST_DUE_ACCESS_GRACE_DAYS) before it denies too.
+    ACTIVE always allows."""
     if subscription.status in (
         ProductSubscriptionStatus.CANCELLED,
         ProductSubscriptionStatus.PAYMENT_FAILED,
     ):
         return False
+
+    if subscription.status == ProductSubscriptionStatus.PENDING_PAYMENT:
+        if subscription.created_at is None:
+            return True
+        return (datetime.utcnow() - subscription.created_at) < timedelta(
+            hours=PENDING_PAYMENT_ALLOW_HOURS
+        )
 
     if subscription.status == ProductSubscriptionStatus.PAST_DUE:
         if subscription.past_due_since is None:
