@@ -94,8 +94,32 @@ class MerchantListItem(BaseModel):
     business_name: Optional[str] = None
     name: Optional[str] = None
     created_at: Optional[UtcDateTime] = None
+    trial_ends_at: Optional[UtcDateTime] = None
 
     model_config = ConfigDict(from_attributes=True)
+
+class TrialGrantRequest(BaseModel):
+    # Exactly one of days / ends_at: days counts from now (grant or
+    # re-grant), ends_at pins an absolute cutoff. Both set or both
+    # missing is a 422 — the caller must mean one of them.
+    user_id: uuid.UUID
+    days: Optional[int] = None
+    ends_at: Optional[datetime] = None
+
+    @model_validator(mode="after")
+    def _exactly_one_shape(self):
+        if (self.days is None) == (self.ends_at is None):
+            raise ValueError("Provide exactly one of days or ends_at.")
+        if self.days is not None and self.days < 1:
+            raise ValueError("days must be at least 1.")
+        return self
+
+class TrialRead(BaseModel):
+    user_id: uuid.UUID
+    trial_ends_at: Optional[UtcDateTime] = None
+    # Computed post-write, so the admin UI shows the effect immediately
+    # instead of guessing whether the grant took.
+    amara_active: bool
 
 class MerchantListRead(BaseModel):
     # total counts ALL impersonable merchants (post search + post operator

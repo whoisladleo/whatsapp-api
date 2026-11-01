@@ -15,7 +15,11 @@ from app.db.models import (
 )
 from app.db.session import SessionLocal
 from app.services import usage
-from app.services.subscription_access import get_platform_plans, is_merchant_allowed_ai
+from app.services.subscription_access import (
+    get_platform_plans,
+    is_merchant_allowed_ai,
+    sync_ai_access_for_merchant,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -133,28 +137,68 @@ def _send_nudge(to_phone: str) -> bool:
     return True
 
 
+def _switch_off_lapsed_trials(db) -> int:
+    """
+    Trial expiry enforcement: access reads trial_ends_at live, but
+    ai_enabled only flips on sync — so re-sync every merchant whose
+    window lapsed and who still has Amara on anywhere. Merchants
+    already fully off are skipped (sync would be a no-op). Returns the
+    count switched off.
+    """
+    now = datetime.utcnow()
+    switched_off = 0
+    lapsed = (
+        db.query(User)
+        .filter(User.trial_ends_at.isnot(None), User.trial_ends_at <= now)
+        .all()
+    )
+    for trial_user in lapsed:
+        still_on = (
+            db.query(WhatsAppAccount.id)
+            .filter(
+                WhatsAppAccount.user_id == trial_user.id,
+                WhatsAppAccount.ai_enabled.is_(True),
+            )
+            .first()
+            is not None
+            or db.query(InstagramAccount.id)
+            .filter(
+                InstagramAccount.user_id == trial_user.id,
+                InstagramAccount.ai_enabled.is_(True),
+            )
+            .first()
+            is not None
+        )
+        if still_on:
+            sync_ai_access_for_merchant(db, trial_user)
+            switched_off += 1
+    return switched_off
+
+
 @celery_app.task
 def send_subscription_nudges():
     """
     Daily sweep: remind connected-but-unpaid merchants that Amara is paused
     and link them to Settings where Pay Now lives. Targeting mirrors the
-    access decision exactly (paid, in-flight, in-grace, and plan sellers
-    are all skipped via is_merchant_allowed_ai), plus a connected channel
-    and a phone number on file. Sends are recorded as SUBSCRIPTION_NUDGE
-    events — the same rows drive the per-merchant schedule, so a double
-    run can never double-nudge. Merchant-facing, like every other alert:
-    never billable, no record_reply call.
+    access decision exactly (paid, in-flight, in-grace, plan sellers, and
+    active trials are all skipped via is_merchant_allowed_ai), plus a
+    connected channel and a phone number on file. Sends are recorded as
+    SUBSCRIPTION_NUDGE events — the same rows drive the per-merchant
+    schedule, so a double run can never double-nudge. Merchant-facing,
+    like every other alert: never billable, no record_reply call.
+    Also enforces trial expiry (runs before the nudge early-returns, so a
+    missing template or credentials never blocks it).
     """
-    if not settings.WHATSAPP_NUDGE_TEMPLATE_NAME:
-        return "Nudge template not configured; skipping sends."
-    if not settings.WHATSAPP_TOKEN or not settings.PHONE_NUMBER_ID:
-        return "Platform WhatsApp credentials missing; skipping sends."
-
     db = SessionLocal()
     try:
+        expired = _switch_off_lapsed_trials(db)
+        if not settings.WHATSAPP_NUDGE_TEMPLATE_NAME:
+            return f"Switched off {expired} lapsed trials. Nudge template not configured; skipping sends."
+        if not settings.WHATSAPP_TOKEN or not settings.PHONE_NUMBER_ID:
+            return f"Switched off {expired} lapsed trials. Platform WhatsApp credentials missing; skipping sends."
         if not get_platform_plans(db):
             # Gating itself is off — everyone is allowed, nobody to nudge.
-            return "No platform plans configured; nothing to nudge."
+            return f"Switched off {expired} lapsed trials. No platform plans configured; nothing to nudge."
         now = datetime.utcnow()
         sent, skipped = 0, 0
         for user in db.query(User).all():

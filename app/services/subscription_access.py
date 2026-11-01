@@ -117,6 +117,13 @@ def is_merchant_allowed_ai(db: Session, user: User) -> bool:
     if not plans:
         return True
 
+    # Operator-granted trial (demo access): a future trial_ends_at passes
+    # without any subscription. Expiry flips ai_enabled off at the next
+    # sync trigger (account update, subscription transition, or the daily
+    # sweep's lapsed-trial re-sync) — never silently mid-session.
+    if user.trial_ends_at is not None and user.trial_ends_at > datetime.utcnow():
+        return True
+
     # The merchant who *sells* a platform plan can't also be gated by it —
     # there's no one for Taskflow's own account(s) to subscribe to, and
     # this is exactly the account that most needs to keep responding

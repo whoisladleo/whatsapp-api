@@ -524,8 +524,10 @@ def test_operator_lists_impersonable_only(
     assert OPERATOR_PHONE not in resp.text
     assert "255700000002" not in resp.text
     # Identity fields only — never OTP state or anything secret-shaped.
+    # trial_ends_at is display state for the admin trial control, not a secret.
     assert set(body["items"][0]) == {
         "id", "username", "phone_number", "business_name", "name", "created_at",
+        "trial_ends_at",
     }
 
 
