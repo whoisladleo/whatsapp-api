@@ -36,6 +36,19 @@ router = APIRouter()
 # the fields on responses but can never set them.
 _PLAN_FIELDS = {"is_platform_plan", "monthly_reply_limit"}
 
+# Product images are served back from /static (or a public R2 URL), so any
+# file a browser renders as HTML/SVG becomes stored XSS. Only raster image
+# types are accepted; the stored extension is derived from the allowlisted
+# content type, never from the client-supplied filename.
+_PRODUCT_IMAGE_CONTENT_TYPES = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/gif": "gif",
+}
+_PRODUCT_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp", "gif"}
+_PRODUCT_IMAGE_MAX_BYTES = 5 * 1024 * 1024
+
 
 def _require_plan_admin(db: Session, user: User, payload: dict) -> None:
     if _PLAN_FIELDS & payload.keys() and not is_support_operator(db, user):
@@ -153,6 +166,10 @@ def download_csv_template():
         headers={"Content-Disposition": "attachment; filename=products_template.csv"}
     )
 
+_BULK_CSV_MAX_BYTES = 5 * 1024 * 1024
+_BULK_CSV_REQUIRED_COLUMNS = {"name"}
+
+
 @router.post("/bulk/upload", status_code=status.HTTP_200_OK)
 def upload_csv_bulk(
     confirm: bool = False,
@@ -160,12 +177,43 @@ def upload_csv_bulk(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    if not file.filename.endswith('.csv'):
+    filename = file.filename or ""
+    if not filename.lower().endswith('.csv'):
         raise HTTPException(status_code=400, detail="File must be a CSV")
-        
-    content = file.file.read().decode('utf-8')
+
+    # Chunked read with a cap — the whole file must never sit in RAM
+    # uncapped (same 5MB pattern as upload_product_image).
+    size_bytes = 0
+    chunks = []
+    while True:
+        chunk = file.file.read(1024 * 1024)
+        if not chunk:
+            break
+        size_bytes += len(chunk)
+        if size_bytes > _BULK_CSV_MAX_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail="CSV file is too large (max 5MB)",
+            )
+        chunks.append(chunk)
+
+    try:
+        content = b"".join(chunks).decode('utf-8')
+    except UnicodeDecodeError:
+        raise HTTPException(
+            status_code=400, detail="CSV file must be UTF-8 encoded"
+        )
+
     csv_reader = csv.DictReader(io.StringIO(content))
-    
+    if not csv_reader.fieldnames:
+        raise HTTPException(status_code=400, detail="CSV file is empty")
+    missing = _BULK_CSV_REQUIRED_COLUMNS - set(csv_reader.fieldnames)
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"CSV is missing required columns: {', '.join(sorted(missing))}",
+        )
+
     products_data = []
     for row in csv_reader:
         # Clean and convert numeric fields
@@ -275,10 +323,40 @@ def upload_product_image(
     db_product = get_product_by_id(db=db, product_id=product_id, merchant_id=current_user.id)
     if not db_product:
         raise HTTPException(status_code=404, detail="Product not found")
-        
-    file_extension = file.filename.split(".")[-1]
-    filename = f"{current_user.id}_{product_id}_{uuid.uuid4().hex[:8]}.{file_extension}"
-    
+
+    client_filename = file.filename or ""
+    client_extension = (
+        client_filename.rsplit(".", 1)[-1].lower()
+        if "." in client_filename else ""
+    )
+    if client_extension not in _PRODUCT_IMAGE_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="Only JPG, PNG, WebP, or GIF images are allowed",
+        )
+    content_type = (file.content_type or "").split(";")[0].strip().lower()
+    stored_extension = _PRODUCT_IMAGE_CONTENT_TYPES.get(content_type)
+    if stored_extension is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Only JPG, PNG, WebP, or GIF images are allowed",
+        )
+
+    size_bytes = 0
+    while True:
+        chunk = file.file.read(1024 * 1024)
+        if not chunk:
+            break
+        size_bytes += len(chunk)
+        if size_bytes > _PRODUCT_IMAGE_MAX_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail="Image is too large (max 5MB)",
+            )
+    file.file.seek(0)
+
+    filename = f"{current_user.id}_{product_id}_{uuid.uuid4().hex[:8]}.{stored_extension}"
+
     from app.core.config import settings
     if settings.R2_ACCOUNT_ID and settings.R2_BUCKET_NAME:
         import boto3
@@ -291,10 +369,10 @@ def upload_product_image(
             config=Config(signature_version='s3v4'),
         )
         s3.upload_fileobj(
-            file.file, 
-            settings.R2_BUCKET_NAME, 
-            filename, 
-            ExtraArgs={'ContentType': file.content_type}
+            file.file,
+            settings.R2_BUCKET_NAME,
+            filename,
+            ExtraArgs={'ContentType': content_type}
         )
         image_url = f"{settings.R2_PUBLIC_URL.rstrip('/')}/{filename}"
     else:

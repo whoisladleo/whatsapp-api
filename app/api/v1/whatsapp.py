@@ -1,5 +1,5 @@
 import uuid
-from fastapi import APIRouter, Depends, HTTPException, Header, Request, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Header, Request, Query, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import PlainTextResponse
 from sqlalchemy.orm import Session
@@ -84,9 +84,21 @@ async def verify_webhook(
     raise HTTPException(status_code=403, detail="Verification failed")
 
 
+async def _forward_to_callback(callback_url: str, payload: dict) -> None:
+    """Best-effort merchant forward; runs as a BackgroundTasks task after the
+    Meta ACK, so a slow merchant endpoint can't delay it. Failures are
+    logged, never raised."""
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(callback_url, json=payload, timeout=5.0)
+    except Exception as e:
+        print(f"Failed to forward webhook to {callback_url}: {e}")
+
+
 @router.post("/webhook")
 async def handle_webhook(
     request: Request,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     x_hub_signature_256: Optional[str] = Header(None, alias="X-Hub-Signature-256"),
 ):
@@ -223,29 +235,33 @@ async def handle_webhook(
                     db, Message, stored.id,
                 )
 
-        # 3. Forward to callback if configured
+        # 3. Forward to callback if configured — scheduled to run after
+        # the response, so a slow merchant endpoint can't hold up Meta's
+        # ACK (which risks a retried delivery). Chose BackgroundTasks over
+        # a Celery task: this forward is best-effort and must never 500
+        # the webhook the way apply_async_or_rollback does on failure.
         if account_callback_url:
             if not is_safe_external_url(account_callback_url):
                 print(
                     f"Skipping forward to unsafe callback_url: {account_callback_url}"
                 )
             else:
-                async with httpx.AsyncClient() as client:
-                    try:
-                        await client.post(account_callback_url, json=item, timeout=5.0)
-                    except Exception as e:
-                        print(f"Failed to forward webhook to {account_callback_url}: {e}")
+                background_tasks.add_task(_forward_to_callback, account_callback_url, item)
 
     return {"status": "ok"}
 
 
 @router.get("/conversations", response_model=list[ConversationSummary])
 def get_conversations(
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     account: WhatsAppAccount = Depends(get_whatsapp_account),
     db: Session = Depends(get_db),
 ):
     exclude_phone = account.owner.username if account.owner else None
-    return crud_message.get_conversations_for_account(db, account.id, exclude_phone=exclude_phone)
+    return crud_message.get_conversations_for_account(
+        db, account.id, exclude_phone=exclude_phone, limit=limit, offset=offset
+    )
 
 
 @router.get("/stats", response_model=MessageStats)
@@ -283,7 +299,7 @@ def resume_handoff(
 
 @router.get("/messages", response_model=list[MessageRead])
 def get_message_history(
-    limit: int = 100,
+    limit: int = Query(default=100, ge=1, le=500),
     phone: Optional[str] = None,
     account: WhatsAppAccount = Depends(get_whatsapp_account),
     db: Session = Depends(get_db),

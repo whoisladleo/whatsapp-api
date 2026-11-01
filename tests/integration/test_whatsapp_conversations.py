@@ -102,6 +102,52 @@ def test_excludes_merchants_own_number(client, db_session, owner_and_account):
     assert phones == ["255722220005"]
 
 
+def test_pagination_limit_and_offset(client, db_session, owner_and_account):
+    _, account, headers = owner_and_account
+    now = datetime.utcnow()
+    _message(db_session, account, "255722220011", "oldest", "inbound", now - timedelta(hours=2))
+    _message(db_session, account, "255722220012", "newest", "inbound", now)
+    _message(db_session, account, "255722220013", "middle", "inbound", now - timedelta(hours=1))
+
+    resp = client.get(URL, headers=headers, params={"limit": 2})
+    assert resp.status_code == 200
+    assert [c["customer_phone"] for c in resp.json()] == ["255722220012", "255722220013"]
+
+    resp = client.get(URL, headers=headers, params={"limit": 1, "offset": 1})
+    assert resp.status_code == 200
+    assert [c["customer_phone"] for c in resp.json()] == ["255722220013"]
+
+    resp = client.get(URL, headers=headers, params={"limit": 10, "offset": 3})
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+def test_default_limit_is_fifty(client, db_session, owner_and_account):
+    _, account, headers = owner_and_account
+    now = datetime.utcnow()
+    for i in range(55):
+        _message(
+            db_session, account, f"2557333{i:04d}", f"msg {i}", "inbound",
+            now - timedelta(seconds=i),
+        )
+
+    resp = client.get(URL, headers=headers)
+    assert resp.status_code == 200
+    assert len(resp.json()) == 50
+
+    resp = client.get(URL, headers=headers, params={"offset": 50})
+    assert resp.status_code == 200
+    assert len(resp.json()) == 5
+
+
+def test_rejects_out_of_range_pagination(client, owner_and_account):
+    _, _, headers = owner_and_account
+
+    assert client.get(URL, headers=headers, params={"limit": 501}).status_code == 422
+    assert client.get(URL, headers=headers, params={"limit": 0}).status_code == 422
+    assert client.get(URL, headers=headers, params={"offset": -1}).status_code == 422
+
+
 def test_excludes_conversations_belonging_to_other_accounts(client, db_session, owner_and_account):
     _, account, headers = owner_and_account
 

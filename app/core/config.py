@@ -1,15 +1,52 @@
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
+
+
+# Every public placeholder SECRET_KEY that must never boot a real process:
+# the field default below, .env.example, and the docker-compose.prod.yml
+# ${SECRET_KEY:-...} fallback. Exact-match only — a real random key can never
+# equal one of these sentences.
+_FORBIDDEN_SECRET_KEYS = frozenset(
+    {
+        "your-super-secret-key-change-it",
+        "generate_a_random_string_here",
+        "generate_a_very_secure_random_string_here",
+    }
+)
 
 
 class Settings(BaseSettings):
     PROJECT_NAME: str = "WhatsApp Medium"
     API_V1_STR: str = "/api/v1"
 
+    # Test mode. The suite signs/verifies JWTs symmetrically and never needs
+    # a real SECRET_KEY, so tests/conftest.py sets TESTING=true before any
+    # app import. Never true in a real deploy — it disables the fail-fast
+    # SECRET_KEY check below.
+    TESTING: bool = False
+
     # Security
     SECRET_KEY: str = "your-super-secret-key-change-it"
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 7 days
+
+    @model_validator(mode="after")
+    def _reject_placeholder_secret_key(self):
+        if self.TESTING:
+            return self
+        if (
+            not self.SECRET_KEY
+            or not self.SECRET_KEY.strip()
+            or self.SECRET_KEY in _FORBIDDEN_SECRET_KEYS
+        ):
+            raise ValueError(
+                "SECRET_KEY is not configured: refusing to start with a "
+                "missing or public placeholder key (anyone holding it can "
+                "forge JWTs for any user). Set the SECRET_KEY environment "
+                "variable to a random value."
+            )
+        return self
 
     # Support impersonation (#75): comma-separated verified identities
     # allowed to mint impersonation tokens. Phones match User.username

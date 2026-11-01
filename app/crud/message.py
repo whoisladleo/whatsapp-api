@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timedelta
 from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from app.db.models import Customer, Message, ConversationContext, ConversationState
 from typing import Dict, Any, List, Optional
 
@@ -106,7 +106,11 @@ def resume_conversation_for_account(db: Session, account_id: uuid.UUID, phone: s
 
 
 def get_conversations_for_account(
-    db: Session, account_id: uuid.UUID, exclude_phone: Optional[str] = None
+    db: Session,
+    account_id: uuid.UUID,
+    exclude_phone: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
 ) -> List[Dict[str, Any]]:
     """
     Every distinct customer this account has exchanged messages with,
@@ -118,45 +122,81 @@ def get_conversations_for_account(
     exclude_phone filters out the merchant's own number, so a merchant
     testing their account via /manage etc. doesn't show up as a customer
     conversation with themselves.
+
+    Runs in 3 queries regardless of page size: one grouped page of
+    customer phones, one window-function fetch of each phone's latest
+    message, and one bulk customer+state fetch.
     """
     customer_phone = func.coalesce(Message.from_phone, Message.to_phone)
 
-    query = (
-        db.query(customer_phone.label("customer_phone"), func.max(Message.timestamp).label("last_activity_at"))
-        .filter(Message.account_id == account_id, customer_phone.isnot(None))
-        .group_by(customer_phone)
-    )
+    filters = [Message.account_id == account_id, customer_phone.isnot(None)]
     if exclude_phone:
-        query = query.filter(customer_phone != exclude_phone)
+        filters.append(customer_phone != exclude_phone)
 
-    rows = query.order_by(func.max(Message.timestamp).desc()).all()
+    rows = (
+        db.query(customer_phone.label("customer_phone"), func.max(Message.timestamp).label("last_activity_at"))
+        .filter(*filters)
+        .group_by(customer_phone)
+        .order_by(func.max(Message.timestamp).desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    if not rows:
+        return []
+    phones = [row.customer_phone for row in rows]
 
-    results = []
-    for row in rows:
-        phone = row.customer_phone
-        last_message = (
-            db.query(Message)
-            .filter(Message.account_id == account_id, customer_phone == phone)
-            .order_by(Message.timestamp.desc())
-            .first()
+    # Latest message per phone in a single query: ROW_NUMBER partitions by
+    # customer phone ordered by recency, then keep rank 1. Supported by both
+    # Postgres (prod) and SQLite 3.25+ (tests).
+    ranked = (
+        db.query(
+            Message.id.label("msg_id"),
+            customer_phone.label("customer_phone"),
+            func.row_number()
+            .over(partition_by=customer_phone, order_by=Message.timestamp.desc())
+            .label("rn"),
         )
-
-        state = None
-        customer = db.query(Customer).filter(Customer.phone_number == phone).first()
-        if customer and customer.conversation:
-            state = customer.conversation.state.value
-
-        results.append(
-            {
-                "customer_phone": phone,
-                "last_activity_at": row.last_activity_at,
-                "last_message_body": last_message.body if last_message else None,
-                "last_message_direction": last_message.direction if last_message else None,
-                "state": state,
-            }
+        .filter(Message.account_id == account_id, customer_phone.in_(phones))
+        .subquery()
+    )
+    last_messages = {
+        phone: message
+        for message, phone in (
+            db.query(Message, ranked.c.customer_phone)
+            .join(ranked, Message.id == ranked.c.msg_id)
+            .filter(ranked.c.rn == 1)
+            .all()
         )
+    }
 
-    return results
+    customers = (
+        db.query(Customer)
+        .options(joinedload(Customer.conversation))
+        .filter(Customer.phone_number.in_(phones))
+        .all()
+    )
+    states = {
+        customer.phone_number: (
+            customer.conversation.state.value if customer.conversation else None
+        )
+        for customer in customers
+    }
+
+    return [
+        {
+            "customer_phone": row.customer_phone,
+            "last_activity_at": row.last_activity_at,
+            "last_message_body": last_messages[row.customer_phone].body
+            if row.customer_phone in last_messages
+            else None,
+            "last_message_direction": last_messages[row.customer_phone].direction
+            if row.customer_phone in last_messages
+            else None,
+            "state": states.get(row.customer_phone),
+        }
+        for row in rows
+    ]
 
 
 def get_message_stats_for_account(
