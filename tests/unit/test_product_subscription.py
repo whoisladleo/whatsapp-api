@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta
+
 import pytest
 
 from app.db.models import (
@@ -285,6 +287,186 @@ async def test_renewal_pending_status_is_ignored(db_session, whatsapp_order, cus
 
     assert sub.status == ProductSubscriptionStatus.ACTIVE
     assert calls == []
+
+
+def _mock_grace_check(monkeypatch):
+    calls = []
+
+    def fake(*, args, **kwargs):
+        calls.append({"args": args, "kwargs": kwargs})
+
+    monkeypatch.setattr(
+        "app.tasks.product_subscription_billing.check_past_due_grace_expired.apply_async", fake
+    )
+    return calls
+
+
+def _mock_notices(monkeypatch):
+    notices = []
+
+    async def fake_send_text(self, to, body, **kwargs):
+        notices.append((to, body))
+        return {"messages": [{"id": "wamid.1"}]}
+
+    monkeypatch.setattr("app.core.provider.WhatsAppProvider.send_text", fake_send_text)
+    return notices
+
+
+@pytest.mark.parametrize("late_status", ["FAILED", "CANCELLED"])
+async def test_renewal_late_failure_after_completed_is_ignored(
+    db_session, whatsapp_account, whatsapp_order, customer, monkeypatch, late_status
+):
+    """P3: COMPLETED txn-A pays the cycle (ACTIVE + one renewal task T+30d);
+    a late FAILED/CANCELLED with a *different* txn id passes the webhook's
+    same-txn guard but is stale — it must not regress to PAST_DUE, schedule
+    a 36h retry, start the past-due grace clock, or notify anyone."""
+    calls = _mock_apply_async(monkeypatch)
+    grace_calls = _mock_grace_check(monkeypatch)
+    notices = _mock_notices(monkeypatch)
+    sub = ProductSubscription(
+        order_id=whatsapp_order.id, customer_id=customer.id, product_id=whatsapp_order.product_id,
+        status=ProductSubscriptionStatus.ACTIVE, monthly_amount=100000, retry_count=0,
+    )
+    db_session.add(sub)
+    db_session.commit()
+    db_session.refresh(sub)
+
+    await product_subscription.handle_renewal_payment_result(db_session, sub, "COMPLETED", "TXN-A")
+
+    assert sub.status == ProductSubscriptionStatus.ACTIVE
+    assert len(calls) == 1
+    assert calls[0]["kwargs"]["countdown"] == 30 * 86400
+    paid_billing_at = sub.next_billing_at
+
+    await product_subscription.handle_renewal_payment_result(db_session, sub, late_status, "TXN-B")
+
+    assert sub.status == ProductSubscriptionStatus.ACTIVE
+    assert sub.retry_count == 0
+    assert sub.tunzaa_transaction_id == "TXN-A"
+    assert sub.next_billing_at == paid_billing_at
+    assert sub.past_due_since is None
+    assert len(calls) == 1  # no 36h retry scheduled
+    assert grace_calls == []
+    assert notices == []
+
+
+async def test_renewal_duplicate_completed_schedules_only_one_task(
+    db_session, whatsapp_order, customer, monkeypatch
+):
+    """P4: a duplicate renewal COMPLETED with a *different* txn id passes the
+    same-txn guard but is the same paid cycle — it must not reset
+    next_billing_at nor schedule a second renewal task (two tasks would each
+    push next cycle, double-charging)."""
+    calls = _mock_apply_async(monkeypatch)
+    sub = ProductSubscription(
+        order_id=whatsapp_order.id, customer_id=customer.id, product_id=whatsapp_order.product_id,
+        status=ProductSubscriptionStatus.ACTIVE, monthly_amount=100000, retry_count=0,
+    )
+    db_session.add(sub)
+    db_session.commit()
+    db_session.refresh(sub)
+
+    await product_subscription.handle_renewal_payment_result(db_session, sub, "COMPLETED", "TXN-A")
+    first_billing_at = sub.next_billing_at
+
+    await product_subscription.handle_renewal_payment_result(db_session, sub, "COMPLETED", "TXN-B")
+
+    assert sub.status == ProductSubscriptionStatus.ACTIVE
+    assert sub.retry_count == 0
+    assert sub.tunzaa_transaction_id == "TXN-A"
+    assert sub.next_billing_at == first_billing_at
+    assert len(calls) == 1
+
+
+async def test_renewal_failure_after_billing_date_still_retries(
+    db_session, whatsapp_account, whatsapp_order, customer, monkeypatch
+):
+    """P3 guardrail: the stale-FAILED ignore must not swallow a GENUINE
+    next-cycle failure — once next_billing_at is due, FAILED still goes
+    PAST_DUE with a 36h retry."""
+    calls = _mock_apply_async(monkeypatch)
+    grace_calls = _mock_grace_check(monkeypatch)
+    notices = _mock_notices(monkeypatch)
+    sub = ProductSubscription(
+        order_id=whatsapp_order.id, customer_id=customer.id, product_id=whatsapp_order.product_id,
+        status=ProductSubscriptionStatus.ACTIVE, monthly_amount=100000, retry_count=0,
+    )
+    db_session.add(sub)
+    db_session.commit()
+    db_session.refresh(sub)
+
+    await product_subscription.handle_renewal_payment_result(db_session, sub, "COMPLETED", "TXN-A")
+    assert len(calls) == 1
+
+    # A month passes: the scheduled charge fired and its push failed.
+    sub.next_billing_at = datetime.utcnow() - timedelta(days=1)
+    db_session.commit()
+
+    await product_subscription.handle_renewal_payment_result(db_session, sub, "FAILED", "TXN-C")
+
+    assert sub.status == ProductSubscriptionStatus.PAST_DUE
+    assert sub.retry_count == 1
+    assert sub.tunzaa_transaction_id == "TXN-C"
+    assert sub.past_due_since is not None
+    assert len(calls) == 2
+    assert calls[1]["kwargs"]["countdown"] == product_subscription.RENEWAL_RETRY_DELAY_SECONDS
+    assert len(grace_calls) == 1
+    assert len(notices) == 2  # customer + merchant
+
+
+async def test_renewal_completed_with_overdue_billing_date_still_renews(
+    db_session, whatsapp_order, customer, monkeypatch
+):
+    """P4 guardrail: the duplicate-COMPLETED ignore must not swallow a
+    genuine late approval — ACTIVE with an overdue next_billing_at still
+    renews (resets the billing date, schedules the next charge)."""
+    calls = _mock_apply_async(monkeypatch)
+    sub = ProductSubscription(
+        order_id=whatsapp_order.id, customer_id=customer.id, product_id=whatsapp_order.product_id,
+        status=ProductSubscriptionStatus.ACTIVE, monthly_amount=100000, retry_count=0,
+        next_billing_at=datetime.utcnow() - timedelta(days=2),
+    )
+    db_session.add(sub)
+    db_session.commit()
+    db_session.refresh(sub)
+
+    await product_subscription.handle_renewal_payment_result(db_session, sub, "COMPLETED", "TXN-A")
+
+    assert sub.status == ProductSubscriptionStatus.ACTIVE
+    assert sub.retry_count == 0
+    assert sub.next_billing_at > datetime.utcnow()
+    assert len(calls) == 1
+    assert calls[0]["kwargs"]["countdown"] == 30 * 86400
+
+
+@pytest.mark.parametrize("stray_status", ["PENDING", None])
+async def test_renewal_stray_status_does_not_record_transaction_id(
+    db_session, whatsapp_order, customer, monkeypatch, stray_status
+):
+    """P5: a stray-status callback with txn-X must not record the txn id —
+    otherwise the webhook's same-txn guard discards the genuine COMPLETED
+    with txn-X as 'Already processed' and the paid cycle never activates."""
+    calls = _mock_apply_async(monkeypatch)
+    sub = ProductSubscription(
+        order_id=whatsapp_order.id, customer_id=customer.id, product_id=whatsapp_order.product_id,
+        status=ProductSubscriptionStatus.PAST_DUE, monthly_amount=100000, retry_count=1,
+    )
+    db_session.add(sub)
+    db_session.commit()
+    db_session.refresh(sub)
+
+    await product_subscription.handle_renewal_payment_result(db_session, sub, stray_status, "TXN-X")
+
+    assert sub.status == ProductSubscriptionStatus.PAST_DUE
+    assert sub.tunzaa_transaction_id is None
+
+    await product_subscription.handle_renewal_payment_result(db_session, sub, "COMPLETED", "TXN-X")
+
+    assert sub.status == ProductSubscriptionStatus.ACTIVE
+    assert sub.retry_count == 0
+    assert sub.tunzaa_transaction_id == "TXN-X"
+    assert len(calls) == 1
+    assert calls[0]["kwargs"]["countdown"] == 30 * 86400
 
 
 # --- get_or_create_pending_subscription ----------------------------------------

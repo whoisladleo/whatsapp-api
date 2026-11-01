@@ -350,3 +350,22 @@ def test_auto_cancel_order_skips_fresh_reservation(db_session, pending_order):
     reloaded = db_session.query(Order).filter(Order.id == order_id).first()
     assert result == "Reservation still active."
     assert reloaded.status == OrderStatus.PENDING
+
+
+def test_auto_cancel_loses_race_restores_no_stock(db_session, pending_order, product, monkeypatch):
+    # P10: a FAILED callback (or dashboard cancel) that resolved the order
+    # after this firing read it must win alone — the firing restores nothing.
+    _mock_send_text(monkeypatch)
+    db_session.query(Order).filter(Order.id == pending_order.id).update(
+        {Order.status: OrderStatus.CANCELLED}, synchronize_session=False
+    )
+    assert pending_order.status == OrderStatus.PENDING  # stale, as a race loser sees it
+    order_id, product_id = pending_order.id, product.id
+    stock_before = product.quantity
+
+    result = order_reminders.auto_cancel_order(order_id)
+
+    assert result == "Order not found or not pending."
+    reloaded_product = db_session.query(Product).filter(Product.id == product_id).first()
+    db_session.refresh(reloaded_product)
+    assert reloaded_product.quantity == stock_before

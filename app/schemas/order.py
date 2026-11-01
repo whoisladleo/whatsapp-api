@@ -37,6 +37,10 @@ class OrderRead(BaseModel):
     subscription_status: Optional[ProductSubscriptionStatus] = None
     subscription_next_billing_at: Optional[UtcDateTime] = None
     subscription_retry_count: Optional[int] = None
+    # Refund-owed marker — "MANUAL" when a late payment arrived with no
+    # stock to fulfill it (see Order.refund_status). NULL means nothing
+    # is owed. This is the merchant-visibility surface for that case.
+    refund_status: Optional[str] = None
 
 
 class OrderDetail(OrderRead):

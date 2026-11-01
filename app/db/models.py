@@ -534,6 +534,13 @@ class Order(Base):
     status = Column(Enum(OrderStatus), default=OrderStatus.PENDING)
     agreed_price = Column(Float, nullable=True)
     tunzaa_link = Column(String, nullable=True)
+    # Refund state after a COMPLETED arrives with no stock to reclaim
+    # (#110): "MANUAL" means a charge is owed back and support reverses it
+    # by hand (Tunzaa dashboard) — refunds are never attempted
+    # automatically. A support action can flip MANUAL to "SUCCEEDED"
+    # later. NULL means nothing is owed, or the row predates this. Same
+    # convention as NumberSubscription.refund_status.
+    refund_status = Column(String, nullable=True)
     reserved_until = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     # Touched by every payment dispatch — the resend path throttles repeat

@@ -150,9 +150,13 @@ async def pay_now(
         # when quantity drifted above zero (pre-#118 phantoms or a manual
         # merchant edit). stock_taken stays False, so the release path
         # below restores nothing either (#119).
-        if not product.is_subscription and product.quantity > 0:
-            product.quantity -= 1
-            stock_taken = True
+        if not product.is_subscription:
+            # Atomic conditional claim, like _close_deal's (P12): a
+            # check-then-decrement here let two customers racing the last
+            # unit both succeed (quantity went to -1). Called via the
+            # facade so tests patching app.services.llm.* keep landing.
+            from app.services import llm as llm_facade
+            stock_taken = llm_facade._try_claim_stock(db, product)
         order = Order(
             customer_id=customer.id,
             product_id=product.id,
@@ -169,10 +173,14 @@ async def pay_now(
         except IntegrityError:
             # Lost a double-click race — the other click's PENDING order
             # committed first and the partial unique index rejected ours
-            # (#114). The rollback also undoes the decrement above, so
-            # stock_taken resets: restoring it later would mint a phantom
-            # unit on an order that took none (see _release_failed_order).
+            # (#114). Unlike the old inline decrement, the atomic claim
+            # above committed separately, so the rollback does NOT undo
+            # it — give the unit back explicitly, like _race_loser_note,
+            # or every lost race leaks one unit.
             db.rollback()
+            if stock_taken:
+                product.quantity = (product.quantity or 0) + 1
+                db.commit()
             logger.warning(
                 "Pay Now lost a double-click race for customer %s / product %s; reusing the winner.",
                 customer.id,

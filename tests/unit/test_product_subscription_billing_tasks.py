@@ -368,3 +368,96 @@ def test_retry_reconcile_no_op_when_order_resolved(db_session, pending_plan_orde
     product_subscription_tasks.retry_installment_reconcile(str(order_id), 1)
 
     assert called == []
+
+
+def _mock_send_template(monkeypatch, calls, ok=True):
+    async def fake(self, to, name, language_code="en_US", components=None):
+        calls.append({"to": to, "name": name, "components": components})
+        if not ok:
+            raise RuntimeError("network down")
+        return {"messages": [{"id": "wamid.reconcile_giveup"}]}
+
+    monkeypatch.setattr("app.core.provider.WhatsAppProvider.send_template", fake)
+
+
+def _alert_texts(call):
+    header_params = call["components"][0]["parameters"]
+    body_params = call["components"][1]["parameters"]
+    by_name = {p["parameter_name"]: p["text"] for p in header_params + body_params}
+    return by_name["product"], by_name["summary"], by_name["reference"]
+
+
+def test_retry_reconcile_give_up_alerts_merchant(db_session, pending_plan_order, monkeypatch):
+    # P9: giving up after 5 failed plan fetches used to leave PENDING with
+    # only a log line — the order was then auto-cancelled despite possibly
+    # being fully paid, with nobody told. The give-up must alert the
+    # merchant with the order and the amounts on record, so it is actionable.
+    from app.core.config import settings
+
+    _mock_plan_fetch(monkeypatch, raise_error=True)
+    templates = []
+    _mock_send_template(monkeypatch, templates)
+
+    pending_plan_order.paid_amount = 15000.0
+    db_session.commit()
+    order_id = pending_plan_order.id
+
+    product_subscription_tasks.retry_installment_reconcile(
+        str(order_id), product_subscription_tasks.RECONCILE_MAX_ATTEMPTS
+    )
+
+    reloaded = db_session.query(Order).filter(Order.id == order_id).first()
+    assert reloaded.status == OrderStatus.PENDING
+    assert len(templates) == 1
+    assert templates[0]["to"] == "255700000900"  # owner.username
+    assert templates[0]["name"] == settings.WHATSAPP_PAYMENT_ALERT_TEMPLATE_NAME
+    _, summary, reference = _alert_texts(templates[0])
+    assert str(order_id) in reference
+    assert "1001" in reference  # tunzaa_plan_id
+    assert "15,000" in reference  # paid so far
+    assert "100,000" in reference  # agreed total
+    assert "5" in reference  # attempts exhausted
+
+
+def test_retry_reconcile_reschedule_sends_no_alert(
+    db_session, pending_plan_order, monkeypatch
+):
+    # Guardrail: only the final give-up alerts — intermediate retries stay quiet.
+    _mock_plan_fetch(monkeypatch, raise_error=True)
+    templates = []
+    _mock_send_template(monkeypatch, templates)
+
+    scheduled = []
+    monkeypatch.setattr(
+        product_subscription_tasks.retry_installment_reconcile, "apply_async",
+        lambda *a, **kw: scheduled.append((a, kw)),
+    )
+
+    order_id = pending_plan_order.id
+    product_subscription_tasks.retry_installment_reconcile(str(order_id), 1)
+
+    assert len(scheduled) == 1
+    assert templates == []
+
+
+def test_retry_reconcile_give_up_alert_failure_stays_best_effort(
+    db_session, pending_plan_order, monkeypatch
+):
+    # A failing give-up alert (down WhatsApp API, unrenderable order) must
+    # not crash the task — the order stays PENDING either way.
+    import app.api.v1.tunzaa_webhook as tunzaa_webhook
+
+    _mock_plan_fetch(monkeypatch, raise_error=True)
+
+    async def _boom(db, order, attempts):
+        raise RuntimeError("template render failed")
+
+    monkeypatch.setattr(tunzaa_webhook, "notify_merchant_of_reconcile_giveup", _boom)
+
+    order_id = pending_plan_order.id
+    product_subscription_tasks.retry_installment_reconcile(
+        str(order_id), product_subscription_tasks.RECONCILE_MAX_ATTEMPTS
+    )
+
+    reloaded = db_session.query(Order).filter(Order.id == order_id).first()
+    assert reloaded.status == OrderStatus.PENDING
