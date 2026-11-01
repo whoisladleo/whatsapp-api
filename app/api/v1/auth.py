@@ -596,9 +596,12 @@ def get_my_subscription(
     current_user: User = Depends(get_current_user),
 ):
     """Self-service status view — see app/services/self_service_billing.py."""
+    from app.services import subscription_access
+
+    amara_active = subscription_access.is_merchant_allowed_ai(db, current_user)
     subscription = self_service_billing.get_my_subscription(db, current_user)
     if not subscription:
-        return MySubscriptionRead()
+        return MySubscriptionRead(amara_active=amara_active)
 
     return MySubscriptionRead(
         status=subscription.status.value,
@@ -606,6 +609,7 @@ def get_my_subscription(
         next_billing_at=subscription.next_billing_at,
         retry_count=subscription.retry_count,
         past_due_since=subscription.past_due_since,
+        amara_active=amara_active,
     )
 
 
