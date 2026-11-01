@@ -127,6 +127,10 @@ def _no_real_celery_broker(monkeypatch):
     monkeypatch.setattr(retry_installment_reconcile, "apply_async", lambda *a, **kw: None)
     from app.tasks.usage_alerts import send_usage_warning
     monkeypatch.setattr(send_usage_warning, "apply_async", lambda *a, **kw: None)
+    # The subscription-nudge sweep is dispatched from every verified webhook;
+    # without this it would run inline in eager mode on every webhook test.
+    from app.tasks.subscription_nudges import send_subscription_nudges
+    monkeypatch.setattr(send_subscription_nudges, "apply_async", lambda *a, **kw: None)
 
 
 @pytest.fixture

@@ -777,7 +777,7 @@ def test_get_my_subscription_none_when_no_subscription(client, auth_user, db_ses
     assert resp.status_code == 200
     assert resp.json() == {
         "status": None, "monthly_amount": None, "next_billing_at": None,
-        "retry_count": None, "past_due_since": None,
+        "retry_count": None, "past_due_since": None, "amara_active": False,
     }
 
 

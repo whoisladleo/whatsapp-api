@@ -57,6 +57,7 @@ class AmaraEventKind(enum.Enum):
     PAYMENT = "PAYMENT"
     USAGE_WARNING = "USAGE_WARNING"
     LIMIT_BLOCKED = "LIMIT_BLOCKED"  # first Amara reply refused this period (#90)
+    SUBSCRIPTION_NUDGE = "SUBSCRIPTION_NUDGE"  # platform reminder to an unpaid merchant (not billable)
 
 class SupportAccessKind(enum.Enum):
     START = "START"  # operator minted an impersonation token

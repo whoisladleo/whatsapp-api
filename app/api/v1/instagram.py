@@ -260,6 +260,12 @@ async def handle_webhook(
         # never answered — the opener is answered only when the customer
         # replies to it, with the opener already in history.
 
+    # Traffic-triggered daily sweep (no Celery Beat in this stack): at most
+    # one webhook per rolling 24h actually queues it; never raises.
+    from app.tasks.subscription_nudges import maybe_dispatch_daily_sweep
+
+    maybe_dispatch_daily_sweep()
+
     return {"status": "ok"}
 
 

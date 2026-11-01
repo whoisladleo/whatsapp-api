@@ -116,6 +116,10 @@ class MySubscriptionRead(BaseModel):
     next_billing_at: Optional[UtcDateTime] = None
     retry_count: Optional[int] = None
     past_due_since: Optional[UtcDateTime] = None
+    # The backend's own access verdict (grace periods, plan-seller
+    # exemption, no-plans-configured) — the dashboard banner keys off this
+    # rather than reimplementing subscription_access.is_merchant_allowed_ai.
+    amara_active: bool = True
 
 class PayNowRequest(BaseModel):
     # Only needed if no phone is already on file (User.username/phone_number)
