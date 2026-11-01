@@ -6,8 +6,8 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
+from app.crud import message as crud_message
 from app.db.models import (
-    ConversationContext,
     Customer,
     InstagramAccount,
     InstagramConversationContext,
@@ -119,14 +119,7 @@ def _channel_parties(db: Session, order: Order):
     customer = db.query(Customer).filter(Customer.id == order.customer_id).first()
     if not account or not customer:
         return None
-    context = (
-        db.query(ConversationContext).filter(ConversationContext.customer_id == customer.id).first()
-    )
-    if not context:
-        context = ConversationContext(customer_id=customer.id)
-        db.add(context)
-        db.commit()
-        db.refresh(context)
+    context = crud_message.get_or_create_context(db, customer.id, account.id)
     return (account, customer, context, customer.phone_number, False)
 
 

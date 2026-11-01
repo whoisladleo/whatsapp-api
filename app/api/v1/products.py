@@ -169,6 +169,97 @@ def download_csv_template():
 _BULK_CSV_MAX_BYTES = 5 * 1024 * 1024
 _BULK_CSV_REQUIRED_COLUMNS = {"name"}
 
+# Columns a sheet may write. Anything else in the header — merchant_id, id,
+# slug, created_at, is_draft, plan fields, installment_mode (a raw string
+# can't become the enum), or a merchant's own extra columns — is dropped and
+# counted in stats["ignored_columns"], never a 400: merchants have messy
+# sheets, and a stray column must not fail an upload (or, worse, TypeError
+# the insert into a 500 as merchant_id/slug used to).
+_BULK_CSV_ALLOWED_COLUMNS = {
+    "name", "description", "max_price", "min_price", "quantity",
+    "category", "sku", "barcode", "cost_price", "weight", "image_url",
+    "is_active", "is_subscription", "allow_installments",
+}
+_BULK_CSV_BOOL_COLUMNS = {"is_active", "is_subscription", "allow_installments"}
+_BULK_CSV_TRUE_VALUES = {"true", "1", "yes", "y"}
+_BULK_CSV_FALSE_VALUES = {"false", "0", "no", "n"}
+
+
+def _parse_bulk_number(raw, field: str, row_number: int, *, is_int: bool):
+    """Coerces one CSV cell to float/int; blank means 'not given' (None)."""
+    text = raw.strip() if isinstance(raw, str) else raw
+    if text is None or text == "":
+        return None
+    try:
+        return int(text) if is_int else float(text)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Row {row_number}: invalid numeric value for '{field}': {raw!r}",
+        )
+
+
+def _parse_bulk_row(row: dict, row_number: int) -> dict:
+    """
+    Filters one CSV row to allowed columns and coerces/validates it.
+    Runs before bulk_upsert_products, so the checks below cover both the
+    insert and the update branch. Every failure names its row (header is
+    row 1, so data starts at row 2).
+    """
+    clean = {k: v for k, v in row.items() if k in _BULK_CSV_ALLOWED_COLUMNS}
+
+    max_price = _parse_bulk_number(clean.get("max_price"), "max_price", row_number, is_int=False)
+    min_price = _parse_bulk_number(clean.get("min_price"), "min_price", row_number, is_int=False)
+    quantity = _parse_bulk_number(clean.get("quantity"), "quantity", row_number, is_int=True)
+    cost_price = _parse_bulk_number(clean.get("cost_price"), "cost_price", row_number, is_int=False)
+    weight = _parse_bulk_number(clean.get("weight"), "weight", row_number, is_int=False)
+    # Missing/blank numerics keep their historical defaults: inserts need
+    # values for the NOT NULL price columns, and updates keep the old
+    # zero-the-missing-cell behavior.
+    clean["max_price"] = max_price if max_price is not None else 0.0
+    clean["min_price"] = min_price if min_price is not None else 0.0
+    clean["quantity"] = quantity if quantity is not None else 0
+    clean["cost_price"] = cost_price
+    clean["weight"] = weight
+
+    for field in ("max_price", "min_price", "quantity", "cost_price", "weight"):
+        value = clean[field]
+        if value is not None and value < 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Row {row_number}: '{field}' must be >= 0 (got {value})",
+            )
+    if clean["min_price"] > clean["max_price"]:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Row {row_number}: min_price ({clean['min_price']}) must be "
+                f"<= max_price ({clean['max_price']})"
+            ),
+        )
+
+    for field in _BULK_CSV_BOOL_COLUMNS:
+        if field not in clean:
+            continue
+        raw = clean[field]
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            # Blank means 'not given': the insert keeps the model default
+            # and the update leaves the stored value alone.
+            del clean[field]
+            continue
+        text = raw.strip().lower() if isinstance(raw, str) else raw
+        if text in _BULK_CSV_TRUE_VALUES:
+            clean[field] = True
+        elif text in _BULK_CSV_FALSE_VALUES:
+            clean[field] = False
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Row {row_number}: invalid boolean value for '{field}': {raw!r}",
+            )
+
+    return clean
+
 
 @router.post("/bulk/upload", status_code=status.HTTP_200_OK)
 def upload_csv_bulk(
@@ -214,25 +305,22 @@ def upload_csv_bulk(
             detail=f"CSV is missing required columns: {', '.join(sorted(missing))}",
         )
 
-    products_data = []
-    for row in csv_reader:
-        # Clean and convert numeric fields
-        try:
-            row['max_price'] = float(row['max_price']) if row.get('max_price') else 0.0
-            row['min_price'] = float(row['min_price']) if row.get('min_price') else 0.0
-            row['quantity'] = int(row['quantity']) if row.get('quantity') else 0
-            row['cost_price'] = float(row['cost_price']) if row.get('cost_price') else None
-            row['weight'] = float(row['weight']) if row.get('weight') else None
-            products_data.append(row)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid numeric data in CSV")
-            
+    ignored_columns = sum(
+        1 for header in (csv_reader.fieldnames or [])
+        if header not in _BULK_CSV_ALLOWED_COLUMNS
+    )
+    products_data = [
+        _parse_bulk_row(row, row_number)
+        for row_number, row in enumerate(csv_reader, start=2)
+    ]
+
     stats = bulk_upsert_products(
-        db=db, 
-        merchant_id=current_user.id, 
+        db=db,
+        merchant_id=current_user.id,
         products_data=products_data,
         dry_run=not confirm
     )
+    stats["ignored_columns"] = ignored_columns
     
     if not confirm:
         return stats

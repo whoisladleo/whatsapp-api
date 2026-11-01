@@ -54,7 +54,7 @@ def _reload(db_session, account_id):
 
 def test_needs_refresh_matrix():
     assert crud_instagram.token_needs_refresh(
-        InstagramAccount(access_token="", token_refreshed_at=None)
+        InstagramAccount(access_token=None, token_refreshed_at=None)
     ) is False
     assert crud_instagram.token_needs_refresh(
         InstagramAccount(access_token="t", token_refreshed_at=None)
@@ -141,6 +141,6 @@ def test_refresh_task_unknown_and_disconnected(db_session, owner):
     assert task_module.refresh_account_token("not-a-uuid") == "Account not found."
 
     account = _account(db_session, owner, None)
-    account.access_token = ""
+    account.access_token = None
     db_session.commit()
     assert task_module.refresh_account_token(str(account.id)) == "Account gone or disconnected."

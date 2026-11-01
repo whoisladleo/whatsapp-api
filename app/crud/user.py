@@ -3,7 +3,7 @@ from typing import List, Optional
 
 from sqlalchemy import or_
 from sqlalchemy.orm import Session, selectinload
-from app.core.security import normalize_phone
+from app.core.security import normalize_phone, sha256_hex, verify_sha256_hex
 from app.db.models import User
 from datetime import datetime
 
@@ -54,12 +54,20 @@ def create_instagram_user(db: Session, name: Optional[str]) -> User:
 
 
 def set_user_otp(db: Session, user: User, otp_code: str, expires_at: datetime) -> User:
-    user.otp_code = otp_code
+    # The DB holds the sha256 of the code, never the code itself — a read
+    # of this row (backup, log, admin query) must not yield a live login.
+    user.otp_code = sha256_hex(otp_code)
     user.otp_expires_at = expires_at
     db.add(user)
     db.commit()
     db.refresh(user)
     return user
+
+
+def verify_user_otp(user: User, otp_code: str) -> bool:
+    """Constant-time check of a submitted code against the stored hash.
+    False when no code is set — callers treat that like a wrong guess."""
+    return verify_sha256_hex(user.otp_code, otp_code)
 
 
 def clear_user_otp(db: Session, user: User) -> User:

@@ -6,9 +6,9 @@ from app.core.celery_app import celery_app
 from app.core.config import settings
 from app.core.ids import coerce_uuid
 from app.core.security import normalize_phone
+from app.crud import message as crud_message
 from app.db.models import (
     AmaraEventKind,
-    ConversationContext,
     ConversationState,
     Customer,
     InstagramAccount,
@@ -301,6 +301,8 @@ def _handoff_conversation(db, channel: str, account, context) -> None:
     """
     from app.services import usage as usage_service
 
+    if channel == "whatsapp" and context.account_id is None:
+        context.account_id = account.id
     context.state = ConversationState.HUMAN_HANDOFF
     context.handoff_at = datetime.utcnow()
     db.commit()
@@ -496,10 +498,10 @@ def _verify(
                 .filter(Customer.phone_number == normalize_phone(customer_ref))
                 .first()
             )
+            # Scoped to this account: another shop's handoff/quote state for
+            # the same phone must not skip or misattribute verification.
             context = (
-                db.query(ConversationContext)
-                .filter(ConversationContext.customer_id == customer.id)
-                .first()
+                crud_message.get_context_for_account(db, customer.id, account_uuid)
                 if customer
                 else None
             )

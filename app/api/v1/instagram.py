@@ -43,7 +43,7 @@ async def get_instagram_account(
     """
     account = (
         db.query(InstagramAccount)
-        .filter(InstagramAccount.user_id == current_user.id, InstagramAccount.access_token != "")
+        .filter(InstagramAccount.user_id == current_user.id, InstagramAccount.access_token.isnot(None))
         .first()
     )
     if not account:
@@ -129,9 +129,12 @@ async def handle_webhook(
         )
 
     data = await request.json()
-    print(f"Instagram webhook payload: {data}")
+    # Never log the raw payload — it carries buyer PII (usernames, message
+    # bodies). Counts plus opaque ids only.
+    entries = data.get("entry", [])
+    print(f"Instagram webhook: {len(entries)} entries")
     parsed_comments = InstagramWebhookParser.parse_inbound(data)
-    print(f"Parsed {len(parsed_comments)} comment(s) from payload")
+    print(f"Parsed {len(parsed_comments)} comment(s): {[c.get('comment_id') for c in parsed_comments]}")
 
     for item in parsed_comments:
         account = crud_instagram.get_account_by_ig_business_id(
@@ -159,7 +162,7 @@ async def handle_webhook(
             )
 
     parsed_messages = InstagramWebhookParser.parse_inbound_messages(data)
-    print(f"Parsed {len(parsed_messages)} DM(s) from payload")
+    print(f"Parsed {len(parsed_messages)} DM(s): {[m.get('ig_message_id') for m in parsed_messages]}")
 
     for item in parsed_messages:
         account = crud_instagram.get_account_by_ig_business_id(
@@ -204,7 +207,7 @@ async def handle_webhook(
             )
 
     parsed_echoes = InstagramWebhookParser.parse_outbound_echoes(data)
-    print(f"Parsed {len(parsed_echoes)} echo(s) from payload")
+    print(f"Parsed {len(parsed_echoes)} echo(s): {[e.get('ig_message_id') for e in parsed_echoes]}")
 
     for item in parsed_echoes:
         account = crud_instagram.get_account_by_ig_business_id(
@@ -406,7 +409,7 @@ def resume_handoff(
 @router.get("/messages", response_model=list[InstagramMessageRead])
 def get_message_history(
     customer_id: uuid.UUID,
-    limit: int = 100,
+    limit: int = Query(default=100, ge=1, le=500),
     account: InstagramAccount = Depends(get_instagram_account),
     db: Session = Depends(get_db),
 ):

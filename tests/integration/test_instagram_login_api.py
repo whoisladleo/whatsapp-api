@@ -292,6 +292,23 @@ def test_exchange_unknown_user_is_not_found(client):
     assert resp.status_code == 404
 
 
+def test_exchange_success_returns_short_lived_access_and_refresh(client, auth_user):
+    user, _ = auth_user
+    code = create_access_token(user.id)
+
+    resp = client.post("/api/v1/auth/instagram/exchange", json={"code": code})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    payload = jwt.decode(
+        body["access_token"], settings.SECRET_KEY, algorithms=[settings.ALGORITHM]
+    )
+    assert uuid.UUID(payload["sub"]) == user.id
+    exp = datetime.utcfromtimestamp(payload["exp"])
+    assert timedelta(minutes=55) < exp - datetime.utcnow() < timedelta(minutes=65)
+    assert body["refresh_token"]
+
+
 def test_exchange_rate_limits_per_code(client):
     for _ in range(5):
         assert (

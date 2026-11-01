@@ -162,6 +162,24 @@ def test_webhook_accepts_correct_signature_when_secret_configured(client, monkey
     assert resp.status_code == 200
 
 
+# --- Webhook logging carries ids, never buyer PII -------------------------------
+
+
+def test_webhook_logs_ids_not_payload_bodies(client, capsys):
+    dm = _dm_payload("ig_does_not_exist", "mid_secret_1", text="my-secret-dm-body-xyz")
+    comment = _comment_payload("ig_does_not_exist", "comment_secret_1", text="my-secret-comment-body-xyz")
+
+    assert client.post(WEBHOOK_URL, json=dm).status_code == 200
+    assert client.post(WEBHOOK_URL, json=comment).status_code == 200
+
+    out = capsys.readouterr().out
+    assert "my-secret-dm-body-xyz" not in out
+    assert "my-secret-comment-body-xyz" not in out
+    assert "commenter1" not in out
+    assert "mid_secret_1" in out
+    assert "comment_secret_1" in out
+
+
 # --- Account resolution + dispatch --------------------------------------------
 
 def test_unknown_ig_business_id_ignored(client, db_session):

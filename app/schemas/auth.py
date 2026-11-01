@@ -22,6 +22,20 @@ class UserInDB(UserBase):
 class Token(BaseModel):
     access_token: str
     token_type: str
+    # Present on real logins (OTP verify, IG exchange) — the dashboard keeps
+    # it in an httpOnly cookie and rotates it via POST /auth/refresh. None
+    # for impersonation tokens, which stay short-lived and non-refreshable.
+    refresh_token: Optional[str] = None
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
+class LogoutRequest(BaseModel):
+    # Optional so logout never fails for lack of one — no token just means
+    # there's nothing server-side left to revoke.
+    refresh_token: Optional[str] = None
 
 class TokenPayload(BaseModel):
     sub: Optional[str] = None

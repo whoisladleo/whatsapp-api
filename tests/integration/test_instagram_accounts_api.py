@@ -50,7 +50,7 @@ def test_list_accounts_returns_only_current_users_accounts(client, db_session, a
 def test_list_accounts_excludes_disconnected_accounts(client, db_session, auth_user):
     user, headers = auth_user
     db_session.add(
-        InstagramAccount(ig_business_id="ig_gone", access_token="", username="old_shop", user_id=user.id)
+        InstagramAccount(ig_business_id="ig_gone", access_token=None, username="old_shop", user_id=user.id)
     )
     db_session.commit()
 
@@ -96,7 +96,7 @@ def test_disconnect_clears_token_and_removes_from_list(client, db_session, auth_
     assert route.called
 
     db_session.refresh(account)
-    assert account.access_token == ""
+    assert account.access_token is None
     assert account.ai_enabled is False
 
     list_resp = client.get(URL, headers=headers)
@@ -123,7 +123,7 @@ def test_disconnect_still_succeeds_when_meta_unsubscribe_fails(client, db_sessio
 
     assert resp.status_code == 200
     db_session.refresh(account)
-    assert account.access_token == ""
+    assert account.access_token is None
 
 
 def test_disconnect_404_for_unknown_account(client, auth_user):

@@ -8,9 +8,22 @@ import respx
 
 from app.core.config import settings
 from app.core.security import create_access_token
-from app.db.models import User
+from app.db.models import RefreshToken, User
 
 PHONE = "255712345678"
+
+# The DB stores the sha256 of the OTP, never the code itself — tests that
+# need the plaintext pin the generator to this known value instead of
+# reading it back out of the row (which is exactly what must be impossible).
+OTP_CODE = "123456"
+
+
+@pytest.fixture
+def fixed_otp(monkeypatch):
+    from app.core import security as security_module
+
+    monkeypatch.setattr(security_module, "generate_otp", lambda length=6: OTP_CODE)
+    return OTP_CODE
 
 
 def _mock_send_text():
@@ -21,7 +34,9 @@ def _mock_send_text():
 
 
 @respx.mock
-def test_request_otp_creates_user_and_sends_message(client, db_session):
+def test_request_otp_creates_user_and_sends_message(client, db_session, fixed_otp):
+    import hashlib
+
     route = _mock_send_text()
 
     resp = client.post("/api/v1/auth/request-otp", json={"username": PHONE})
@@ -29,9 +44,22 @@ def test_request_otp_creates_user_and_sends_message(client, db_session):
     assert resp.status_code == 200
     user = db_session.query(User).filter(User.username == PHONE).first()
     assert user is not None
-    assert user.otp_code is not None
-    assert len(user.otp_code) == 6
+    # The row holds the sha256 of the code — the plaintext must not be
+    # recoverable from the DB (backup, log, admin query).
+    assert user.otp_code == hashlib.sha256(fixed_otp.encode()).hexdigest()
+    assert len(user.otp_code) == 64
     assert route.called
+
+
+@respx.mock
+def test_stored_otp_is_hash_not_plaintext(client, db_session, fixed_otp):
+    _mock_send_text()
+    client.post("/api/v1/auth/request-otp", json={"username": PHONE})
+
+    user = db_session.query(User).filter(User.username == PHONE).first()
+
+    assert user.otp_code != fixed_otp
+    assert not user.otp_code.isdigit()
 
 
 @respx.mock
@@ -101,7 +129,7 @@ def test_request_otp_does_not_promote_a_different_users_phone_number(client, db_
 
 @respx.mock
 def test_request_and_verify_otp_with_different_phone_formats_match_same_user(
-    client, db_session
+    client, db_session, fixed_otp
 ):
     """
     A merchant who requests an OTP typing their number in local format
@@ -114,10 +142,9 @@ def test_request_and_verify_otp_with_different_phone_formats_match_same_user(
     client.post("/api/v1/auth/request-otp", json={"username": "0712345678"})
     user = db_session.query(User).filter(User.username == PHONE).first()
     assert user is not None
-    otp_code = user.otp_code
 
     resp = client.post(
-        "/api/v1/auth/verify-otp", json={"username": PHONE, "otp_code": otp_code}
+        "/api/v1/auth/verify-otp", json={"username": PHONE, "otp_code": fixed_otp}
     )
 
     assert resp.status_code == 200
@@ -125,14 +152,13 @@ def test_request_and_verify_otp_with_different_phone_formats_match_same_user(
 
 
 @respx.mock
-def test_verify_otp_success_returns_token(client, db_session):
+def test_verify_otp_success_returns_token(client, db_session, fixed_otp):
     _mock_send_text()
     client.post("/api/v1/auth/request-otp", json={"username": PHONE})
     user = db_session.query(User).filter(User.username == PHONE).first()
-    otp_code = user.otp_code
 
     resp = client.post(
-        "/api/v1/auth/verify-otp", json={"username": PHONE, "otp_code": otp_code}
+        "/api/v1/auth/verify-otp", json={"username": PHONE, "otp_code": fixed_otp}
     )
 
     assert resp.status_code == 200
@@ -191,7 +217,7 @@ def test_verify_otp_unknown_user_matches_bad_code_response(client, db_session):
 
 
 @respx.mock
-def test_verify_otp_expired_code(client, db_session):
+def test_verify_otp_expired_code(client, db_session, fixed_otp):
     from datetime import datetime, timedelta
 
     _mock_send_text()
@@ -201,11 +227,35 @@ def test_verify_otp_expired_code(client, db_session):
     db_session.commit()
 
     resp = client.post(
-        "/api/v1/auth/verify-otp", json={"username": PHONE, "otp_code": user.otp_code}
+        "/api/v1/auth/verify-otp", json={"username": PHONE, "otp_code": fixed_otp}
     )
 
     assert resp.status_code == 401
-    assert "expired" in resp.json()["detail"].lower()
+    # One message for wrong and expired alike — a distinct "expired" reply
+    # tells an attacker a guessed code was otherwise correct.
+    assert resp.json()["detail"] == "Invalid OTP code"
+
+
+@respx.mock
+def test_verify_otp_expired_matches_wrong_code_response(client, db_session, fixed_otp):
+    # Expired-but-correct and wrong responses must be indistinguishable.
+    from datetime import datetime, timedelta
+
+    _mock_send_text()
+    client.post("/api/v1/auth/request-otp", json={"username": PHONE})
+    user = db_session.query(User).filter(User.username == PHONE).first()
+    user.otp_expires_at = datetime.utcnow() - timedelta(minutes=1)
+    db_session.commit()
+
+    expired_correct = client.post(
+        "/api/v1/auth/verify-otp", json={"username": PHONE, "otp_code": fixed_otp}
+    )
+    wrong = client.post(
+        "/api/v1/auth/verify-otp", json={"username": PHONE, "otp_code": "000000"}
+    )
+
+    assert expired_correct.status_code == wrong.status_code == 401
+    assert expired_correct.json() == wrong.json()
 
 
 @respx.mock
@@ -234,6 +284,29 @@ def test_request_otp_rate_limited_after_three_requests(client):
     resp = client.post("/api/v1/auth/request-otp", json={"username": PHONE})
 
     assert resp.status_code == 429
+
+
+@respx.mock
+def test_request_otp_per_ip_limit_across_distinct_numbers(client):
+    # The per-recipient guard alone lets one caller fan out to unlimited
+    # distinct numbers — the per-caller-IP guard (mirroring ig_login_start)
+    # bounds that at 30 per 5 minutes.
+    _mock_send_text()
+
+    for i in range(30):
+        resp = client.post(
+            "/api/v1/auth/request-otp", json={"username": f"255700{i:06d}"}
+        )
+        assert resp.status_code == 200
+
+    resp = client.post(
+        "/api/v1/auth/request-otp", json={"username": "255700999999"}
+    )
+
+    assert resp.status_code == 429
+    assert resp.json()["detail"] == (
+        "Too many OTP requests. Please wait a few minutes and try again."
+    )
 
 
 @respx.mock
@@ -292,8 +365,194 @@ def test_verify_otp_rate_limited_after_five_attempts(client, db_session):
     assert resp.status_code == 429
 
 
+# --- refresh + logout --------------------------------------------------------
+
+
+def _login_via_otp(client, phone=PHONE, code=OTP_CODE):
+    client.post("/api/v1/auth/request-otp", json={"username": phone})
+    resp = client.post(
+        "/api/v1/auth/verify-otp", json={"username": phone, "otp_code": code}
+    )
+    assert resp.status_code == 200
+    return resp.json()
+
+
 @respx.mock
-def test_request_otp_sends_authentication_template_with_code(client, db_session):
+def test_verify_otp_returns_short_lived_access_and_refresh(client, db_session, fixed_otp):
+    import hashlib
+    from datetime import datetime, timedelta
+
+    _mock_send_text()
+    body = _login_via_otp(client)
+
+    # Access is short-lived (60 min, was 7 days)...
+    payload = jwt.decode(
+        body["access_token"], settings.SECRET_KEY, algorithms=[settings.ALGORITHM]
+    )
+    exp = datetime.utcfromtimestamp(payload["exp"])
+    assert timedelta(minutes=55) < exp - datetime.utcnow() < timedelta(minutes=65)
+
+    # ... with an opaque refresh bearer backed by a server-side hash record.
+    assert body["refresh_token"]
+    assert body["refresh_token"].count(".") == 0  # not a JWT
+    record = (
+        db_session.query(RefreshToken)
+        .filter(
+            RefreshToken.token_hash
+            == hashlib.sha256(body["refresh_token"].encode()).hexdigest()
+        )
+        .one()
+    )
+    assert record.revoked_at is None
+    assert (
+        timedelta(days=6, hours=23)
+        < record.expires_at - datetime.utcnow()
+        < timedelta(days=7, hours=1)
+    )
+
+
+@respx.mock
+def test_refresh_rotates_tokens_single_use(client, db_session, fixed_otp):
+    _mock_send_text()
+    first = _login_via_otp(client)
+
+    resp = client.post(
+        "/api/v1/auth/refresh", json={"refresh_token": first["refresh_token"]}
+    )
+
+    assert resp.status_code == 200
+    second = resp.json()
+    # (Access JWTs minted within the same second are byte-identical — second
+    # resolution, no jti — so only the random refresh bearer must differ.)
+    assert second["refresh_token"] != first["refresh_token"]
+
+    # The new access token works...
+    me = client.get(
+        "/api/v1/auth/me",
+        headers={"Authorization": f"Bearer {second['access_token']}"},
+    )
+    assert me.status_code == 200
+
+    # ... the old refresh bearer is spent (single-use rotation)...
+    replay = client.post(
+        "/api/v1/auth/refresh", json={"refresh_token": first["refresh_token"]}
+    )
+    assert replay.status_code == 401
+
+    # ... and the new one rotates again.
+    again = client.post(
+        "/api/v1/auth/refresh", json={"refresh_token": second["refresh_token"]}
+    )
+    assert again.status_code == 200
+
+
+def test_refresh_rejects_unknown_token(client):
+    resp = client.post(
+        "/api/v1/auth/refresh", json={"refresh_token": "not-a-real-token"}
+    )
+
+    assert resp.status_code == 401
+    assert resp.json()["detail"] == "Invalid or expired refresh token"
+
+
+@respx.mock
+def test_refresh_rejects_expired_record(client, db_session, fixed_otp):
+    import hashlib
+    from datetime import datetime, timedelta
+
+    _mock_send_text()
+    body = _login_via_otp(client)
+    record = (
+        db_session.query(RefreshToken)
+        .filter(
+            RefreshToken.token_hash
+            == hashlib.sha256(body["refresh_token"].encode()).hexdigest()
+        )
+        .one()
+    )
+    record.expires_at = datetime.utcnow() - timedelta(minutes=1)
+    db_session.commit()
+
+    resp = client.post(
+        "/api/v1/auth/refresh", json={"refresh_token": body["refresh_token"]}
+    )
+
+    assert resp.status_code == 401
+    assert resp.json()["detail"] == "Invalid or expired refresh token"
+
+
+@respx.mock
+def test_refresh_rejects_token_for_deleted_user(client, db_session, fixed_otp):
+    _mock_send_text()
+    body = _login_via_otp(client)
+    db_session.query(User).delete()
+    db_session.commit()
+
+    resp = client.post(
+        "/api/v1/auth/refresh", json={"refresh_token": body["refresh_token"]}
+    )
+
+    assert resp.status_code == 401
+
+
+@respx.mock
+def test_logout_revokes_refresh_token(client, db_session, fixed_otp):
+    import hashlib
+
+    _mock_send_text()
+    body = _login_via_otp(client)
+
+    resp = client.post(
+        "/api/v1/auth/logout", json={"refresh_token": body["refresh_token"]}
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"success": True}
+    record = (
+        db_session.query(RefreshToken)
+        .filter(
+            RefreshToken.token_hash
+            == hashlib.sha256(body["refresh_token"].encode()).hexdigest()
+        )
+        .one()
+    )
+    assert record.revoked_at is not None
+
+    # A logged-out bearer refreshes nothing.
+    assert (
+        client.post(
+            "/api/v1/auth/refresh", json={"refresh_token": body["refresh_token"]}
+        ).status_code
+        == 401
+    )
+
+
+def test_logout_always_succeeds(client):
+    # Unknown, already-spent, or missing tokens just mean there's nothing
+    # left to revoke — logout itself never fails.
+    assert (
+        client.post(
+            "/api/v1/auth/logout", json={"refresh_token": "not-a-real-token"}
+        ).status_code
+        == 200
+    )
+    assert client.post("/api/v1/auth/logout", json={}).status_code == 200
+
+
+def test_refresh_rate_limited_per_ip(client):
+    for _ in range(30):
+        resp = client.post(
+            "/api/v1/auth/refresh", json={"refresh_token": "guess"}
+        )
+        assert resp.status_code == 401
+
+    resp = client.post("/api/v1/auth/refresh", json={"refresh_token": "guess"})
+
+    assert resp.status_code == 429
+
+
+@respx.mock
+def test_request_otp_sends_authentication_template_with_code(client, db_session, fixed_otp):
     route = respx.post(url__regex=r"https://graph\.facebook\.com/.+/messages$").mock(
         return_value=httpx.Response(200, json={"messages": [{"id": "wamid.otp"}]})
     )
@@ -313,7 +572,7 @@ def test_request_otp_sends_authentication_template_with_code(client, db_session)
     user = db_session.query(User).filter(User.username == PHONE).first()
     components = payload["template"]["components"]
     assert components[0]["type"] == "body"
-    assert components[0]["parameters"][0]["text"] == user.otp_code
+    assert components[0]["parameters"][0]["text"] == fixed_otp
     assert components[1]["type"] == "button"
     # taskflow_login's OTP button is registered as a "url"-type button
     # under the hood (Meta error 132018 confirmed this live — the Manager
@@ -321,7 +580,9 @@ def test_request_otp_sends_authentication_template_with_code(client, db_session)
     # the code goes through as a plain text button parameter instead of
     # coupon_code.
     assert components[1]["sub_type"] == "url"
-    assert components[1]["parameters"][0]["text"] == user.otp_code
+    assert components[1]["parameters"][0]["text"] == fixed_otp
+    # ... while the row itself holds only the hash, never this plaintext.
+    assert user.otp_code != fixed_otp
 
 
 @respx.mock

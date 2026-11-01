@@ -757,3 +757,235 @@ def test_generate_429_when_daily_limit_hit(client, auth_user, monkeypatch):
     )
 
     assert resp.status_code == 429
+
+
+# --- payload validation (batch D finding 5) --------------------------------------
+
+
+def test_create_product_rejects_blank_name(client, auth_user):
+    _, headers = auth_user
+
+    for bad_name in ("", "   "):
+        resp = client.post(BASE, json=_product_payload(name=bad_name), headers=headers)
+
+        assert resp.status_code == 422
+
+
+def test_create_product_strips_name(client, auth_user):
+    _, headers = auth_user
+
+    resp = client.post(BASE, json=_product_payload(name="  Shoes  "), headers=headers)
+
+    assert resp.status_code == 201
+    assert resp.json()["name"] == "Shoes"
+
+
+def test_create_product_rejects_negative_numbers(client, auth_user):
+    _, headers = auth_user
+
+    bad_payloads = [
+        _product_payload(max_price=-1),
+        _product_payload(min_price=-5),
+        _product_payload(quantity=-2),
+        _product_payload(cost_price=-0.5),
+        _product_payload(weight=-1.5),
+    ]
+    for payload in bad_payloads:
+        resp = client.post(BASE, json=payload, headers=headers)
+
+        assert resp.status_code == 422
+
+
+def test_create_product_rejects_min_above_max(client, auth_user):
+    _, headers = auth_user
+
+    resp = client.post(
+        BASE, json=_product_payload(max_price=10000, min_price=20000), headers=headers
+    )
+
+    assert resp.status_code == 422
+
+
+def test_create_product_allows_zero_prices(client, auth_user):
+    # Zeros are valid — drafts legitimately carry 0.
+    _, headers = auth_user
+
+    resp = client.post(
+        BASE, json=_product_payload(max_price=0, min_price=0, quantity=0), headers=headers
+    )
+
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["max_price"] == 0
+    assert body["min_price"] == 0
+
+
+def test_update_product_rejects_blank_name_and_bad_numbers(client, auth_user):
+    _, headers = auth_user
+    created = client.post(BASE, json=_product_payload(), headers=headers).json()
+
+    bad_updates = [
+        {"name": "   "},
+        {"max_price": -1},
+        {"min_price": -1},
+        {"quantity": -1},
+        {"max_price": 10000, "min_price": 20000},
+    ]
+    for bad in bad_updates:
+        resp = client.put(f"{BASE}/{created['id']}", json=bad, headers=headers)
+
+        assert resp.status_code == 422
+
+
+def test_update_product_strips_name_and_allows_single_sided_price(client, auth_user):
+    _, headers = auth_user
+    created = client.post(BASE, json=_product_payload(), headers=headers).json()
+
+    resp = client.put(
+        f"{BASE}/{created['id']}",
+        json={"name": "  Boots  ", "max_price": 60000},
+        headers=headers,
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["name"] == "Boots"
+    assert body["max_price"] == 60000
+
+
+# --- bulk upload columns + validation (batch D finding 4) ------------------------
+
+
+def _csv_files(csv_content):
+    return {"file": ("p.csv", io.BytesIO(csv_content.encode()), "text/csv")}
+
+
+def test_bulk_upload_ignores_unknown_columns_and_counts_them(client, auth_user, db_session):
+    user, headers = auth_user
+    csv_content = (
+        "name,max_price,min_price,quantity,sku,notes,merchant_id\n"
+        "Shirt,20000,15000,3,SKU-X,hello,whatever\n"
+    )
+
+    dry = client.post(f"{BASE}/bulk/upload", files=_csv_files(csv_content), headers=headers)
+    assert dry.status_code == 200
+    assert dry.json()["ignored_columns"] == 2
+
+    resp = client.post(f"{BASE}/bulk/upload?confirm=true", files=_csv_files(csv_content), headers=headers)
+
+    assert resp.status_code == 200
+    assert resp.json()["stats"]["ignored_columns"] == 2
+    row = db_session.query(Product).filter(Product.sku == "SKU-X").one()
+    assert row.merchant_id == user.id
+    assert row.name == "Shirt"
+
+
+def test_bulk_upload_strips_identity_columns_without_500(client, auth_user, db_session):
+    user, headers = auth_user
+    csv_content = (
+        "name,max_price,min_price,quantity,sku,id,slug,merchant_id,created_at,is_draft\n"
+        f"Shirt,20000,15000,3,SKU-Y,{uuid.uuid4()},hacked,{uuid.uuid4()},2020-01-01,true\n"
+    )
+
+    resp = client.post(
+        f"{BASE}/bulk/upload?confirm=true", files=_csv_files(csv_content), headers=headers
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["stats"]["ignored_columns"] == 5
+    row = db_session.query(Product).filter(Product.sku == "SKU-Y").one()
+    assert row.merchant_id == user.id
+    assert row.slug != "hacked"
+    assert row.is_draft is False
+
+
+def test_bulk_upload_rejects_negative_numbers_with_row_number(client, auth_user):
+    _, headers = auth_user
+    csv_content = (
+        "name,max_price,min_price,quantity,sku\n"
+        "Good,20000,15000,3,SKU-G\n"
+        "Bad,20000,15000,-3,SKU-B\n"
+    )
+
+    resp = client.post(f"{BASE}/bulk/upload?confirm=true", files=_csv_files(csv_content), headers=headers)
+
+    assert resp.status_code == 400
+    detail = resp.json()["detail"].lower()
+    assert "row 3" in detail
+    assert "quantity" in detail
+
+
+def test_bulk_upload_rejects_min_above_max_with_row_number(client, auth_user):
+    _, headers = auth_user
+    csv_content = "name,max_price,min_price,quantity,sku\nBad,10000,20000,3,SKU-B\n"
+
+    resp = client.post(f"{BASE}/bulk/upload?confirm=true", files=_csv_files(csv_content), headers=headers)
+
+    assert resp.status_code == 400
+    detail = resp.json()["detail"].lower()
+    assert "row 2" in detail
+    assert "min_price" in detail
+
+
+def test_bulk_upload_update_path_validates_numerics(client, auth_user, db_session):
+    _, headers = auth_user
+    client.post(
+        f"{BASE}/bulk/upload?confirm=true",
+        files=_csv_files("name,max_price,min_price,quantity,sku\nShirt,20000,15000,3,SKU-U\n"),
+        headers=headers,
+    )
+
+    bad_update = "name,max_price,min_price,quantity,sku\nShirt,20000,15000,-9,SKU-U\n"
+    resp = client.post(
+        f"{BASE}/bulk/upload?confirm=true", files=_csv_files(bad_update), headers=headers
+    )
+
+    assert resp.status_code == 400
+    assert "row 2" in resp.json()["detail"].lower()
+    # The whole upload is validated before anything writes.
+    assert db_session.query(Product).filter(Product.sku == "SKU-U").one().quantity == 3
+
+
+def test_bulk_upload_coerces_booleans(client, auth_user, db_session):
+    _, headers = auth_user
+    csv_content = (
+        "name,max_price,min_price,quantity,sku,is_subscription,is_active\n"
+        "Sub,20000,15000,3,SKU-S,TRUE,false\n"
+    )
+
+    resp = client.post(
+        f"{BASE}/bulk/upload?confirm=true", files=_csv_files(csv_content), headers=headers
+    )
+
+    assert resp.status_code == 200
+    row = db_session.query(Product).filter(Product.sku == "SKU-S").one()
+    assert row.is_subscription is True
+    assert row.is_active is False
+
+    # And "false" flips it back off — pre-fix the raw string was truthy.
+    flip = (
+        "name,max_price,min_price,quantity,sku,is_subscription\n"
+        "Sub,20000,15000,3,SKU-S,false\n"
+    )
+    resp = client.post(
+        f"{BASE}/bulk/upload?confirm=true", files=_csv_files(flip), headers=headers
+    )
+
+    assert resp.status_code == 200
+    db_session.refresh(row)
+    assert row.is_subscription is False
+
+
+def test_bulk_upload_rejects_boolean_garbage_with_row_number(client, auth_user):
+    _, headers = auth_user
+    csv_content = (
+        "name,max_price,min_price,quantity,sku,is_subscription\n"
+        "Sub,20000,15000,3,SKU-S,maybe\n"
+    )
+
+    resp = client.post(
+        f"{BASE}/bulk/upload?confirm=true", files=_csv_files(csv_content), headers=headers
+    )
+
+    assert resp.status_code == 400
+    assert "row 2" in resp.json()["detail"].lower()

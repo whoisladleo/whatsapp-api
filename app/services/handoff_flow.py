@@ -4,7 +4,7 @@ import os
 import uuid
 
 import redis
-from sqlalchemy import exists
+from sqlalchemy import and_, exists, or_
 from sqlalchemy.orm import Session
 
 from app.core.security import normalize_phone
@@ -139,10 +139,18 @@ def list_pending_handoffs(db: Session, merchant: User) -> list:
             Message.from_phone == Customer.phone_number,
             Message.account_id == account.id,
         )
+        # Scoped rows attribute directly; legacy NULL-account rows fall back
+        # to the history check, as before.
         rows = (
             db.query(Customer, ConversationContext)
             .join(ConversationContext, ConversationContext.customer_id == Customer.id)
-            .filter(ConversationContext.state == ConversationState.HUMAN_HANDOFF, has_history)
+            .filter(
+                ConversationContext.state == ConversationState.HUMAN_HANDOFF,
+                or_(
+                    ConversationContext.account_id == account.id,
+                    and_(ConversationContext.account_id.is_(None), has_history),
+                ),
+            )
             .all()
         )
         for customer, context in rows:
@@ -159,7 +167,7 @@ def list_pending_handoffs(db: Session, merchant: User) -> list:
 
     ig_accounts = (
         db.query(InstagramAccount)
-        .filter(InstagramAccount.user_id == merchant.id, InstagramAccount.access_token != "")
+        .filter(InstagramAccount.user_id == merchant.id, InstagramAccount.access_token.isnot(None))
         .all()
     )
     for ig_account in ig_accounts:
@@ -206,14 +214,27 @@ def target_still_pending(db: Session, target: dict) -> bool:
         )
         return context is not None and context.state == ConversationState.HUMAN_HANDOFF
     if target.get("channel") == "whatsapp" and target.get("ref"):
+        from app.crud import message as crud_message
+
         customer = db.query(Customer).filter(Customer.phone_number == target["ref"]).first()
         if not customer:
             return False
-        context = (
-            db.query(ConversationContext)
-            .filter(ConversationContext.customer_id == customer.id)
-            .first()
-        )
+        if not target.get("account_id"):
+            # Alert predates per-account targets — any waiting row counts.
+            return (
+                db.query(ConversationContext)
+                .filter(
+                    ConversationContext.customer_id == customer.id,
+                    ConversationContext.state == ConversationState.HUMAN_HANDOFF,
+                )
+                .first()
+                is not None
+            )
+        try:
+            account_uuid = uuid.UUID(target["account_id"])
+        except ValueError:
+            return False
+        context = crud_message.get_context_for_account(db, customer.id, account_uuid)
         return context is not None and context.state == ConversationState.HUMAN_HANDOFF
     return False
 
@@ -405,6 +426,35 @@ async def relay_to_whatsapp_customer(db: Session, account: WhatsAppAccount, phon
     return f"Sent to {phone}."
 
 
+def resolve_instagram_customer(
+    db: Session, merchant_id, identifier: str
+) -> tuple[InstagramAccount | None, InstagramCustomer | None]:
+    """
+    The merchant's connected InstagramAccount plus the customer matching
+    `identifier` by username or ig_scoped_id. One lookup for the
+    resume/resend/relay paths: the caller-facing ref is whichever one the
+    customer actually has (the scoped id for a brand-new customer whose
+    display-name backfill hasn't run yet). Either half may be None — the
+    caller reports which one is missing.
+    """
+    ig_account = (
+        db.query(InstagramAccount)
+        .filter(InstagramAccount.user_id == merchant_id, InstagramAccount.access_token.isnot(None))
+        .first()
+    )
+    if not ig_account:
+        return None, None
+    ig_customer = (
+        db.query(InstagramCustomer)
+        .filter(
+            InstagramCustomer.account_id == ig_account.id,
+            (InstagramCustomer.username == identifier) | (InstagramCustomer.ig_scoped_id == identifier),
+        )
+        .first()
+    )
+    return ig_account, ig_customer
+
+
 async def relay_to_instagram_customer(db: Session, merchant: User, ig_username: str, reply_text: str) -> str:
     """
     Lets a merchant reply to an Instagram DM customer from their WhatsApp
@@ -412,32 +462,14 @@ async def relay_to_instagram_customer(db: Session, merchant: User, ig_username: 
     Amara/Taskflow, even for a conversation actually happening on a
     different channel. Scoped to this merchant's own connected
     InstagramAccount and an InstagramCustomer who has actually messaged it.
-
-    `ig_username` also matches against ig_scoped_id as a fallback — the
-    handoff alert uses whichever one it actually has for that customer,
-    which is the scoped id for a brand-new customer whose display-name
-    backfill hasn't run yet.
     """
     from app.core.instagram_provider import InstagramProvider
     from app.crud import instagram as crud_instagram
 
     merchant_id = merchant.id if merchant is not None else None
-    ig_account = (
-        db.query(InstagramAccount)
-        .filter(InstagramAccount.user_id == merchant_id, InstagramAccount.access_token != "")
-        .first()
-    )
+    ig_account, ig_customer = resolve_instagram_customer(db, merchant_id, ig_username)
     if not ig_account:
         return "No Instagram account connected."
-
-    ig_customer = (
-        db.query(InstagramCustomer)
-        .filter(
-            InstagramCustomer.account_id == ig_account.id,
-            (InstagramCustomer.username == ig_username) | (InstagramCustomer.ig_scoped_id == ig_username),
-        )
-        .first()
-    )
     if not ig_customer:
         return f"No Instagram conversation with @{ig_username} found."
 

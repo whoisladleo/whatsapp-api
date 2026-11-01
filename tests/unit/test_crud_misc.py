@@ -25,6 +25,47 @@ def test_crud_user_get_user(db_session):
     assert missing is None
 
 
+def test_crud_user_otp_round_trip_hashes_and_verifies(db_session):
+    from datetime import datetime, timedelta
+
+    user = User(username="255700000702")
+    db_session.add(user)
+    db_session.commit()
+
+    crud_user.set_user_otp(
+        db_session, user, "123456", datetime.utcnow() + timedelta(minutes=5)
+    )
+
+    assert user.otp_code != "123456"
+    assert crud_user.verify_user_otp(user, "123456") is True
+    assert crud_user.verify_user_otp(user, "000000") is False
+
+    crud_user.clear_user_otp(db_session, user)
+    assert crud_user.verify_user_otp(user, "123456") is False
+
+
+def test_crud_refresh_token_create_get_revoke(db_session):
+    import hashlib
+    from datetime import datetime, timedelta
+
+    from app.crud import refresh_token as crud_refresh
+
+    user = User(username="255700000703")
+    db_session.add(user)
+    db_session.commit()
+
+    token_hash = hashlib.sha256(b"raw-bearer").hexdigest()
+    record = crud_refresh.create_refresh_token(
+        db_session, user.id, token_hash, datetime.utcnow() + timedelta(days=7)
+    )
+
+    assert crud_refresh.get_refresh_token_by_hash(db_session, token_hash).id == record.id
+    assert crud_refresh.get_refresh_token_by_hash(db_session, "nope") is None
+
+    crud_refresh.revoke_refresh_token(db_session, record)
+    assert record.revoked_at is not None
+
+
 def test_crud_account_delete_account(db_session):
     user = User(username="255700000701")
     db_session.add(user)
@@ -250,6 +291,144 @@ def test_merchant_lock_renders_for_update_on_postgres_only():
 
     assert "FOR UPDATE" in pg_sql
     assert "FOR UPDATE" not in sqlite_sql
+
+
+def test_create_product_retries_slug_on_integrity_error(db_session, monkeypatch):
+    """
+    generate_slug is check-then-insert: a concurrent create can commit the
+    same slug between our check and our flush. The create must retry once
+    with a fresh suffix instead of 500ing on the IntegrityError.
+    """
+    from app.db.models import Product
+    from app.schemas.product import ProductCreate
+
+    user = User(username="255700000709")
+    db_session.add(user)
+    db_session.commit()
+    crud_product.create_product(
+        db_session,
+        ProductCreate(name="Shoes", max_price=10, min_price=5),
+        user.id,
+    )
+
+    # Force every slug check to collide with the committed row.
+    monkeypatch.setattr(crud_product, "generate_slug", lambda db, name: "shoes")
+
+    created = crud_product.create_product(
+        db_session,
+        ProductCreate(name="Other", max_price=10, min_price=5),
+        user.id,
+    )
+
+    assert created.slug != "shoes"
+    assert created.slug.startswith("shoes-")
+    assert db_session.query(Product).count() == 2
+
+
+def test_create_product_raises_after_single_slug_retry(db_session, monkeypatch):
+    from sqlalchemy.exc import IntegrityError
+
+    from app.schemas.product import ProductCreate
+
+    user = User(username="255700000710")
+    db_session.add(user)
+    db_session.commit()
+
+    calls = []
+
+    def failing_commit():
+        calls.append(1)
+        raise IntegrityError("INSERT", {}, Exception("boom"))
+
+    monkeypatch.setattr(db_session, "commit", failing_commit)
+
+    with pytest.raises(IntegrityError):
+        crud_product.create_product(
+            db_session,
+            ProductCreate(name="Shoes", max_price=10, min_price=5),
+            user.id,
+        )
+
+    # One initial attempt plus exactly one retry.
+    assert len(calls) == 2
+
+
+def test_bulk_upsert_products_holds_merchant_lock(db_session, monkeypatch):
+    """
+    Same wiring pin as the import-lock test above: simultaneous bulk
+    uploads for one merchant must serialize on the merchant row, or both
+    miss each other's uncommitted sku rows and insert duplicates.
+    """
+    user = User(username="255700000711")
+    db_session.add(user)
+    db_session.commit()
+
+    calls = []
+    real_with_for_update = Query.with_for_update
+
+    def recording_with_for_update(self, *args, **kwargs):
+        calls.append((args, kwargs))
+        return real_with_for_update(self, *args, **kwargs)
+
+    monkeypatch.setattr(Query, "with_for_update", recording_with_for_update)
+
+    crud_product.bulk_upsert_products(
+        db_session,
+        user.id,
+        [{"name": "Kettle", "max_price": 1.0, "min_price": 1.0, "sku": "K-1"}],
+    )
+
+    assert len(calls) == 1
+
+
+def test_bulk_upsert_dry_run_skips_merchant_lock(db_session, monkeypatch):
+    user = User(username="255700000712")
+    db_session.add(user)
+    db_session.commit()
+
+    calls = []
+    real_with_for_update = Query.with_for_update
+
+    def recording_with_for_update(self, *args, **kwargs):
+        calls.append((args, kwargs))
+        return real_with_for_update(self, *args, **kwargs)
+
+    monkeypatch.setattr(Query, "with_for_update", recording_with_for_update)
+
+    crud_product.bulk_upsert_products(
+        db_session,
+        user.id,
+        [{"name": "Kettle", "max_price": 1.0, "min_price": 1.0, "sku": "K-1"}],
+        dry_run=True,
+    )
+
+    assert calls == []
+
+
+def test_bulk_upsert_insert_strips_protected_and_unknown_keys(db_session):
+    from app.db.models import Product
+
+    user = User(username="255700000713")
+    db_session.add(user)
+    db_session.commit()
+
+    other_id = uuid.uuid4()
+    crud_product.bulk_upsert_products(
+        db_session,
+        user.id,
+        [{
+            "name": "Shirt", "max_price": 10.0, "min_price": 5.0,
+            "id": str(other_id), "slug": "hacked",
+            "merchant_id": str(uuid.uuid4()), "created_at": "2020-01-01",
+            "is_draft": True, "bogus_column": "x",
+        }],
+    )
+
+    row = db_session.query(Product).one()
+    assert row.id != other_id
+    assert row.slug != "hacked"
+    assert row.merchant_id == user.id
+    assert row.is_draft is False
 
 
 def test_crud_message_create_message_stores_attachments(db_session):

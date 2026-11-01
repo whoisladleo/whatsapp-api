@@ -60,7 +60,7 @@ class TunzaaService:
         """
         payload = {
             "customer_msisdn": phone,
-            "amount": str(int(amount)),
+            "amount": str(round(amount)),
             "reference": reference
         }
 

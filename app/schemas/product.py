@@ -1,6 +1,6 @@
 from app.schemas.common import UtcDateTime
 import uuid
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Optional
 from datetime import datetime
 from app.db.models import InstallmentMode
@@ -33,27 +33,70 @@ class ProductBase(BaseModel):
     monthly_reply_limit: Optional[int] = None
 
 class ProductCreate(ProductBase):
-    pass
     # slug is auto-generated
+    #
+    # Validation lives here (and on ProductUpdate), not on ProductBase:
+    # ProductResponse shares the base, and reads of legacy rows must never
+    # 500 just because an old row predates these rules. Zeros are valid
+    # everywhere — drafts legitimately carry 0 prices/quantity.
+    name: str = Field(min_length=1)
+    max_price: float = Field(ge=0)
+    min_price: float = Field(ge=0)
+    quantity: int = Field(default=0, ge=0)
+    cost_price: Optional[float] = Field(default=None, ge=0)
+    weight: Optional[float] = Field(default=None, ge=0)
+    monthly_reply_limit: Optional[int] = Field(default=None, ge=0)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def _strip_name(cls, v):
+        if isinstance(v, str):
+            v = v.strip()
+        return v
+
+    @model_validator(mode="after")
+    def _check_price_floor(self):
+        if self.min_price > self.max_price:
+            raise ValueError("min_price must be <= max_price")
+        return self
 
 class ProductUpdate(BaseModel):
-    name: Optional[str] = None
-    max_price: Optional[float] = None
-    min_price: Optional[float] = None
-    quantity: Optional[int] = None
+    name: Optional[str] = Field(default=None, min_length=1)
+    max_price: Optional[float] = Field(default=None, ge=0)
+    min_price: Optional[float] = Field(default=None, ge=0)
+    quantity: Optional[int] = Field(default=None, ge=0)
     description: Optional[str] = None
     category: Optional[str] = None
     image_url: Optional[str] = None
     sku: Optional[str] = None
     barcode: Optional[str] = None
-    cost_price: Optional[float] = None
-    weight: Optional[float] = None
+    cost_price: Optional[float] = Field(default=None, ge=0)
+    weight: Optional[float] = Field(default=None, ge=0)
     is_active: Optional[bool] = None
     is_subscription: Optional[bool] = None
     allow_installments: Optional[bool] = None
     installment_mode: Optional[InstallmentMode] = None
     is_platform_plan: Optional[bool] = None
-    monthly_reply_limit: Optional[int] = None
+    monthly_reply_limit: Optional[int] = Field(default=None, ge=0)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def _strip_name(cls, v):
+        if isinstance(v, str):
+            v = v.strip()
+        return v
+
+    @model_validator(mode="after")
+    def _check_price_floor(self):
+        # Partial updates carry only one side — the schema can't see the
+        # stored other half, so only the both-present case is checkable here.
+        if (
+            self.min_price is not None
+            and self.max_price is not None
+            and self.min_price > self.max_price
+        ):
+            raise ValueError("min_price must be <= max_price")
+        return self
 
 class ProductStockUpdate(BaseModel):
     # Narrow PATCH body for PATCH /products/{id}/stock: only stock fields.

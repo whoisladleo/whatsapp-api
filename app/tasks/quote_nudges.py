@@ -65,6 +65,15 @@ def send_quote_nudge(context_id: str, account_id: str, scheduled_quote_at_iso: s
         if not account:
             return "Account not found."
 
+        # Per-account staleness: a legacy NULL-account row quoted by this
+        # account is adopted (the schedule args prove the quote is ours),
+        # but a row since adopted by a *different* shop must not fire here —
+        # its product and credentials would both be the wrong shop's.
+        if context.account_id is None:
+            context.account_id = account.id
+        elif context.account_id != account.id:
+            return "Quote moved to a different account; skipping stale nudge."
+
         from app.core.provider import WhatsAppProvider
         from app.db.models import Product
         from app.services import usage

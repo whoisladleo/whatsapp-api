@@ -1103,3 +1103,178 @@ def test_handoff_tap_routing_accepts_title_as_id(client, db_session, merchant_ow
     assert send_route.called
     outbound = db_session.query(Message).filter(Message.direction == "outbound").first()
     assert "Nothing in progress" in outbound.body
+
+
+def _button_type_tap_payload(phone_number_id, from_phone, text, msg_id):
+    # Template quick-reply taps may arrive as type "button" (no payload
+    # id — the title IS the payload) instead of type "interactive".
+    return {
+        "entry": [
+            {
+                "id": "entry1",
+                "changes": [
+                    {
+                        "value": {
+                            "messaging_product": "whatsapp",
+                            "metadata": {
+                                "display_phone_number": "255700000000",
+                                "phone_number_id": phone_number_id,
+                            },
+                            "messages": [
+                                {
+                                    "from": from_phone,
+                                    "id": msg_id,
+                                    "timestamp": "1700000000",
+                                    "type": "button",
+                                    "button": {"text": text, "payload": text},
+                                }
+                            ],
+                        },
+                        "field": "messages",
+                    }
+                ],
+            }
+        ]
+    }
+
+
+def _platform_plus_handoff(db_session, merchant_owner, platform_phone_id):
+    from app.db.models import ConversationContext, ConversationState, Customer
+
+    platform = WhatsAppAccount(
+        name="Taskflow",
+        phone_number_id=platform_phone_id,
+        access_token="tok",
+        ai_enabled=True,
+        is_platform_account=True,
+        user_id=merchant_owner.id,
+    )
+    db_session.add(platform)
+    business = WhatsAppAccount(
+        name="Shop",
+        phone_number_id=f"BIZ_{platform_phone_id}",
+        access_token="tok",
+        ai_enabled=True,
+        user_id=merchant_owner.id,
+    )
+    db_session.add(business)
+    db_session.commit()
+
+    customer = Customer(phone_number="255711111111")
+    db_session.add(customer)
+    db_session.commit()
+    db_session.refresh(customer)
+    db_session.add(
+        ConversationContext(customer_id=customer.id, state=ConversationState.HUMAN_HANDOFF)
+    )
+    db_session.add(
+        Message(
+            whatsapp_message_id=f"wamid.hist_{platform_phone_id}",
+            from_phone="255711111111",
+            type="text",
+            body="hello?",
+            direction="inbound",
+            status="delivered",
+            account_id=business.id,
+        )
+    )
+    db_session.commit()
+    return customer
+
+
+@respx.mock
+def test_button_type_reply_tap_arms_and_next_text_relays(
+    client, db_session, merchant_owner, monkeypatch
+):
+    import fakeredis
+
+    import app.services.handoff_flow as flow_module
+
+    monkeypatch.setattr(flow_module, "redis_client", fakeredis.FakeRedis())
+    _platform_plus_handoff(db_session, merchant_owner, "PHONE_BTN1")
+    # The eager task closes the request session, detaching merchant_owner
+    # — capture plain values before posting, as the tap test above does.
+    owner_id = merchant_owner.id
+    owner_username = merchant_owner.username
+
+    # One distinct id per send (confirm, relay, sent-receipt):
+    # create_message dedups on whatsapp_message_id, so a single canned
+    # id would collapse all three outbound rows into one.
+    send_route = respx.post(url__regex=MESSAGES_URL_RE).mock(
+        side_effect=[
+            httpx.Response(200, json={"messages": [{"id": "wamid.btnconfirm"}]}),
+            httpx.Response(200, json={"messages": [{"id": "wamid.btnrelay"}]}),
+            httpx.Response(200, json={"messages": [{"id": "wamid.btnsent"}]}),
+        ]
+    )
+
+    tap = client.post(
+        WEBHOOK_URL,
+        json=_button_type_tap_payload(
+            "PHONE_BTN1", owner_username, "Reply", "wamid.btntap1"
+        ),
+    )
+    assert tap.status_code == 200
+    assert send_route.called
+    assert flow_module.get_reply_mode(owner_id)["ref"] == "255711111111"
+    confirm = db_session.query(Message).filter(Message.direction == "outbound").first()
+    assert "You're replying to 255711111111" in confirm.body
+
+    # The merchant's next plain-text message on the platform chat relays
+    # to the customer instead of hitting "Unknown command".
+    text = client.post(
+        WEBHOOK_URL,
+        json=_text_webhook_payload(
+            "PHONE_BTN1", owner_username, "Yes, still available!", msg_id="wamid.btntxt1"
+        ),
+    )
+    assert text.status_code == 200
+    assert flow_module.get_reply_mode(owner_id) is None
+
+    bodies = [json.loads(call.request.content) for call in send_route.calls]
+    assert any(
+        call.get("to") == "255711111111"
+        and call.get("text", {}).get("body") == "Yes, still available!"
+        for call in bodies
+    )
+    merchant_replies = db_session.query(Message).filter(
+        Message.direction == "outbound", Message.to_phone == owner_username
+    ).all()
+    assert any("Sent to 255711111111." in m.body for m in merchant_replies)
+
+
+@respx.mock
+def test_button_type_takeover_tap_resumes_and_confirms(
+    client, db_session, merchant_owner, monkeypatch
+):
+    import fakeredis
+
+    import app.services.handoff_flow as flow_module
+    from app.db.models import ConversationContext, ConversationState, Customer
+
+    monkeypatch.setattr(flow_module, "redis_client", fakeredis.FakeRedis())
+    _platform_plus_handoff(db_session, merchant_owner, "PHONE_BTN2")
+    owner_username = merchant_owner.username
+
+    send_route = respx.post(url__regex=MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "wamid.btn2"}]})
+    )
+
+    tap = client.post(
+        WEBHOOK_URL,
+        json=_button_type_tap_payload(
+            "PHONE_BTN2", owner_username, "Amara, take over.", "wamid.btntap2"
+        ),
+    )
+    assert tap.status_code == 200
+    assert send_route.called
+
+    context = (
+        db_session.query(ConversationContext)
+        .join(Customer, ConversationContext.customer_id == Customer.id)
+        .filter(Customer.phone_number == "255711111111")
+        .first()
+    )
+    assert context.state == ConversationState.NEGOTIATING
+    outbound = db_session.query(Message).filter(Message.direction == "outbound").first()
+    assert "Amara is back on 255711111111" in outbound.body

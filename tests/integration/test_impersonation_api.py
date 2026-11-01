@@ -80,6 +80,21 @@ def _audit_rows(db_session, kind=None):
 # Mint matrix
 
 
+def test_impersonation_token_is_non_refreshable(client, operator, target):
+    # Impersonation stays short-lived with no refresh path: no bearer is
+    # minted, and the JWT itself is useless at POST /auth/refresh.
+    resp = _mint(client, _headers(operator))
+
+    assert resp.status_code == 200
+    assert resp.json()["refresh_token"] is None
+
+    refresh = client.post(
+        "/api/v1/auth/refresh",
+        json={"refresh_token": resp.json()["access_token"]},
+    )
+    assert refresh.status_code == 401
+
+
 def test_operator_mints_for_merchant(client, db_session, operator, target):
     resp = _mint(client, _headers(operator))
 
