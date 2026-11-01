@@ -205,3 +205,7 @@ Production-tier decisions only — what was chosen, what was considered and reje
 - *Bigger static caps.* Rejected: raises cost on every turn and still fails closed wrong (partial text sent); retry-on-cut spends the extra cap only when needed.
 - *Outage reply on double cut.* Rejected: same failure class as empty content, so same message + handoff keeps one consistent "Amara failed, human follows" path.
 - *Fuzzy product/price acceptance for rejected closes (v2 A2).* Rejected: guessing payment targets or products risks charging wrong; reject + handoff stays, with the reason now captured in sim summaries.
+
+## Amara closes the loop herself (2026-11-01, #104)
+
+**Chose:** no handover-at-interest flow — Amara runs the whole close (your call: handing off defeats her purpose). The post-payment wording contradiction is fixed at the source instead: all three prompts gain a payment-truth rule (never claim confirmed/received/active — the webhook confirmation arrives separately; on "I've paid" thank + say confirming). The webhook confirmation itself is now subscription-aware (no delivery line for plans; "subscription is now active" — the one place that may truthfully say so) with sw/en/bilingual variants. Handoff recipient stays `username or phone_number` (username wins, dashboard edits the fallback only) — no change; flagged as a possible follow-up.

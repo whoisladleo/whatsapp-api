@@ -2,6 +2,7 @@ import uuid
 from fastapi import APIRouter, Depends, Header, Request, HTTPException
 from typing import Optional
 from sqlalchemy.orm import Session
+from app.services.llm import _lang_text
 from app.core.config import settings
 from app.core.security import verify_tunzaa_signature
 from app.core.provider import WhatsAppProvider
@@ -547,17 +548,53 @@ def _try_reclaim_stock(db: Session, order: Order) -> bool:
     return claimed > 0
 
 
-def _payment_notification_body(kind: str) -> str:
-    if kind == "payment_complete":
-        return (
-            "🎉 Payment confirmed! Thank you for your order. "
-            "We'll be in touch shortly about delivery."
-        )
-    return (
+_PAYMENT_COMPLETE_LINES = {
+    "sw": "🎉 Malipo yamethibitishwa! Asante kwa oda yako.",
+    "en": "🎉 Payment confirmed! Thank you for your order.",
+}
+
+_PAYMENT_COMPLETE_DELIVERY = {
+    "sw": "Tutawasiliana nawe hivi punde kuhusu kupelekewa.",
+    "en": "We'll be in touch shortly about delivery.",
+}
+
+_PAYMENT_COMPLETE_SUBSCRIPTION = {
+    "sw": "Usajili wako umeanza — karibu!",
+    "en": "Your subscription is now active — welcome!",
+}
+
+_PAYMENT_FAILED_LINES = {
+    "sw": (
+        "Malipo yako hayakukamilika, kwa hivyo oda hii imefutwa. "
+        "Tuma ujumbe tena ukitaka kujaribu tena."
+    ),
+    "en": (
         "Your payment could not be completed, so this order has been "
         "cancelled and the item released. Message us again if you'd "
         "like to try again."
-    )
+    ),
+}
+
+
+def _payment_notification_body(kind: str, order: Order) -> str:
+    language = order.customer.language if order.customer else None
+    if kind == "payment_complete":
+        body = _lang_text(_PAYMENT_COMPLETE_LINES, language)
+        # Subscriptions have nothing to deliver — and this confirmation
+        # is the one place that may truthfully say the subscription is
+        # active, since Tunzaa just confirmed it (#104).
+        if order.product is not None and order.product.is_subscription:
+            tail = _lang_text(_PAYMENT_COMPLETE_SUBSCRIPTION, language)
+        else:
+            tail = _lang_text(_PAYMENT_COMPLETE_DELIVERY, language)
+        if language in ("sw", "en"):
+            return f"{body} {tail}"
+        # Unknown language: both halves are sw/en stacks — join per
+        # language to keep the message readable.
+        sw_body, en_body = body.split("\n\n")
+        sw_tail, en_tail = tail.split("\n\n")
+        return f"{sw_body} {sw_tail}\n\n{en_body} {en_tail}"
+    return _lang_text(_PAYMENT_FAILED_LINES, language)
 
 
 async def _notify_customer(db: Session, order: Order, kind: str) -> None:
@@ -583,7 +620,7 @@ async def _notify_customer_whatsapp(db: Session, order: Order, kind: str) -> Non
     if not account:
         return
 
-    body = _payment_notification_body(kind)
+    body = _payment_notification_body(kind, order)
 
     provider = WhatsAppProvider(account.access_token, account.phone_number_id)
     try:
@@ -617,7 +654,7 @@ async def _notify_customer_instagram(db: Session, order: Order, kind: str) -> No
     if not ig_customer or not account:
         return
 
-    body = _payment_notification_body(kind)
+    body = _payment_notification_body(kind, order)
 
     provider = InstagramProvider(account.access_token)
     try:
