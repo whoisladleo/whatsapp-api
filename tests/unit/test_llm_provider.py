@@ -62,6 +62,37 @@ def test_muse_provider_without_key_has_no_client():
     assert service.client is None
 
 
+@pytest.mark.parametrize("provider", ["claude", "muse"])
+def test_providers_disable_http_keepalive(monkeypatch, provider):
+    # Pooled connections bind to their creating loop; workers run every
+    # task in a fresh asyncio.run, so reuse dies with "Event loop is
+    # closed" (#121). Both providers must hand the SDK an httpx client
+    # with keep-alive off and the SDK-default 600s timeout.
+    # A real subclass: the SDKs isinstance-check http_client against
+    # httpx.AsyncClient, so a plain recording function breaks them.
+    seen = []
+
+    class _RecordingAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            seen.append(kwargs)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr("app.services.llm.httpx.AsyncClient", _RecordingAsyncClient)
+    LLMService(api_key="k", provider=provider)
+
+    (kwargs,) = seen
+    assert kwargs["limits"].keepalive_expiry == 0.0
+    assert kwargs["timeout"].connect == 600.0
+    assert kwargs["timeout"].read == 600.0
+
+
+@pytest.mark.parametrize("provider", ["claude", "muse"])
+def test_providers_hand_sdk_the_configured_http_client(provider):
+    service = LLMService(api_key="k", provider=provider)
+
+    assert isinstance(service.client._client, httpx.AsyncClient)
+
+
 def test_unknown_provider_warns_and_falls_back_to_claude(caplog):
     with caplog.at_level(logging.WARNING, logger="app.services.llm"):
         service = LLMService(api_key=None, provider="msue")

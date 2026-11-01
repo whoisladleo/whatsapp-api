@@ -1,4 +1,5 @@
 import anthropic
+import httpx
 import logging
 import math
 import openai
@@ -625,6 +626,24 @@ def _outage_reply(language: Optional[str]) -> str:
     return f"{_OUTAGE_REPLIES['sw']}\n\n{_OUTAGE_REPLIES['en']}"
 
 
+def _no_keepalive_http_client() -> httpx.AsyncClient:
+    """
+    Shared HTTP client for both model SDKs with connection reuse
+    disabled (#121). Pooled connections bind to the loop that created
+    them, and every worker task runs inside its own asyncio.run — so a
+    pooled connection outlives its loop and the next task's reuse dies
+    with "Event loop is closed" (measured alternating 5/10 failures on
+    rapid sequential calls). With keep-alive off every call opens a
+    fresh connection: correct at ~100-300ms per call, dwarfed by
+    inference time. Timeout mirrors the SDK defaults (600s) so slow
+    generations behave exactly as before.
+    """
+    return httpx.AsyncClient(
+        timeout=httpx.Timeout(600.0),
+        limits=httpx.Limits(keepalive_expiry=0.0),
+    )
+
+
 class LLMProvider:
     """
     One model backend behind LLMService. complete() takes the same shape
@@ -650,7 +669,9 @@ class ClaudeProvider(LLMProvider):
 
     def __init__(self, api_key: Optional[str]):
         super().__init__(
-            client=anthropic.AsyncAnthropic(api_key=api_key) if api_key else None
+            client=anthropic.AsyncAnthropic(api_key=api_key, http_client=_no_keepalive_http_client())
+            if api_key
+            else None
         )
 
     async def complete(self, *, system: str, messages: list, max_tokens: int) -> str:
@@ -684,7 +705,9 @@ class MuseProvider(LLMProvider):
 
     def __init__(self, api_key: Optional[str]):
         super().__init__(
-            client=openai.AsyncOpenAI(api_key=api_key, base_url=self.base_url)
+            client=openai.AsyncOpenAI(
+                api_key=api_key, base_url=self.base_url, http_client=_no_keepalive_http_client()
+            )
             if api_key
             else None
         )
