@@ -975,26 +975,23 @@ class LLMService:
         Returns the note to append, or None when there's nothing to
         resend (the model's own words go out alone).
         """
-        from app.services.tunzaa import tunzaa_service
+        from app.services.payment_resend import ResendOutcome, resend_live_order
 
         if order.payment_type != PaymentType.FULL or not order.tunzaa_transaction_id:
             logger.warning(
                 f"Ignoring RESEND_PAYMENT for order {order.id}: not a dispatched FULL order."
             )
             return None
-        if order.updated_at and datetime.utcnow() - order.updated_at < RESEND_MIN_INTERVAL:
+        # The Tunzaa call, throttle, and transaction bookkeeping live in
+        # the shared core now (#117) — this path only renders the note.
+        result = await resend_live_order(db, order, phone)
+        if result.outcome is ResendOutcome.THROTTLED:
             return _lang_text(_PAYMENT_RESEND_THROTTLED_LINES, language)
-        try:
-            resp = await tunzaa_service.initiate_payment(
-                phone=phone, amount=order.agreed_price, reference=f"order-{order.id}"
-            )
-        except Exception as e:
-            logger.error(f"Tunzaa resend failed for order {order.id}: {e}")
+        if result.outcome is ResendOutcome.RESENT:
+            return _lang_text(_PAYMENT_RESEND_LINES, language)
+        if result.outcome is ResendOutcome.TUNZAA_ERROR:
             return _lang_text(_PAYMENT_DISPATCH_FAILED_LINES, language)
-        order.tunzaa_transaction_id = resp.get("transactionID")
-        order.updated_at = datetime.utcnow()
-        db.commit()
-        return _lang_text(_PAYMENT_RESEND_LINES, language)
+        return None  # installment_refused: unreachable (pre-checked above), fail silent
 
     def _schedule_reminders(self, order_id: uuid.UUID) -> None:
         from app.tasks.order_reminders import (
