@@ -196,3 +196,12 @@ Production-tier decisions only — what was chosen, what was considered and reje
 - *Bilingual notes everywhere.* Rejected: doubles every payment message; language-aware with stacked fallback keeps known-language messages short.
 - *Per-message language detection for IG.* Rejected for v1: no detector exists; the stacked fallback is honest and matches existing holding/outage behavior.
 - *Handoff-fallback lines language-aware.* Deferred: bare-marker handoffs are rare and a human follows immediately; the holding/outage replies that accompany them are already language-aware.
+
+## Length-cutoff replies (2026-11-01, #103)
+
+**Chose:** providers raise `LLMLengthCutoff` on a length stop (Muse `finish_reason=length`, Claude `stop_reason=max_tokens`) and withhold the partial text; `_complete_with_retry` retries once with a doubled cap; a second cut hands off with the holding reply (DM/WA) or stays silent (comments, the designed failure there) or raises `GenerationError` (draft generation, 502 as before). V2 sims showed mid-sentence cuts (G1 t2/t3, C2 t6) that the old code sent as complete; reasoning tokens share the `max_tokens` budget, so small visible output does NOT rule out a cap hit.
+
+**Considered and rejected:**
+- *Bigger static caps.* Rejected: raises cost on every turn and still fails closed wrong (partial text sent); retry-on-cut spends the extra cap only when needed.
+- *Outage reply on double cut.* Rejected: same failure class as empty content, so same message + handoff keeps one consistent "Amara failed, human follows" path.
+- *Fuzzy product/price acceptance for rejected closes (v2 A2).* Rejected: guessing payment targets or products risks charging wrong; reject + handoff stays, with the reason now captured in sim summaries.

@@ -89,15 +89,20 @@ async def generate_drafts(db: Session, merchant_id, summary: str) -> list[Produc
     no LLM client is configured. Suggested SKUs are kept only when they
     don't collide with this merchant's existing ones.
     """
-    from app.services.llm import llm_service
+    from app.services.llm import LLMLengthCutoff, _complete_with_retry, llm_service
 
     if llm_service is None or llm_service.provider is None:
         raise RuntimeError("No LLM client configured.")
-    reply = await llm_service.provider.complete(
-        system=GENERATION_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": summary}],
-        max_tokens=2048,
-    )
+    try:
+        reply = await _complete_with_retry(
+            llm_service.provider,
+            system=GENERATION_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": summary}],
+            max_tokens=2048,
+        )
+    except LLMLengthCutoff:
+        # Cut off even at the doubled cap — partial JSON is unusable (#103).
+        raise GenerationError("Model reply was cut off before completing.") from None
     items = [_clean_item(raw) for raw in parse_generated_items(reply)]
     items = [item for item in items if item]
     if not items:
