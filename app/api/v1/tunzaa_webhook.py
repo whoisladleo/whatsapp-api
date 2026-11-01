@@ -566,7 +566,9 @@ def _release_reservation(db: Session, order: Order) -> Optional[uuid.UUID]:
     if not order.product_id:
         return None
     product = db.query(Product).filter(Product.id == order.product_id).first()
-    if product:
+    # Same subscription guard as cancel_order (#118): plans never reserve
+    # units, so a failed first payment restores nothing.
+    if product and not product.is_subscription:
         product.quantity += order.quantity or 1
         return product.id
     return None

@@ -277,6 +277,23 @@ def test_auto_cancel_order_cancels_and_releases_stock(db_session, pending_order,
     assert reloaded_product.quantity == stock_before + 1
 
 
+def test_auto_cancel_subscription_order_restores_no_stock(db_session, pending_order, product, monkeypatch):
+    _mock_send_text(monkeypatch)
+    product.is_subscription = True
+    product.quantity = 0
+    db_session.commit()
+    order_id = pending_order.id
+    product_id = product.id
+
+    result = order_reminders.auto_cancel_order(order_id)
+
+    assert result == "Success"
+    reloaded_order = db_session.query(Order).filter(Order.id == order_id).first()
+    reloaded_product = db_session.query(Product).filter(Product.id == product_id).first()
+    assert reloaded_order.status == OrderStatus.CANCELLED
+    assert reloaded_product.quantity == 0
+
+
 def test_auto_cancel_order_without_product_link_still_cancels(db_session, pending_order_no_account):
     result = order_reminders.auto_cancel_order(pending_order_no_account.id)
 

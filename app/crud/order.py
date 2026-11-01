@@ -130,7 +130,9 @@ def cancel_order(db: Session, order: Order) -> None:
     restored_product_id = None
     if order.product_id:
         product = db.query(Product).filter(Product.id == order.product_id).first()
-        if product:
+        # Subscriptions never claim stock at close, so there is nothing
+        # to give back — restoring would mint phantom units (#118).
+        if product and not product.is_subscription:
             product.quantity += order.quantity or 1
             restored_product_id = product.id
     db.commit()

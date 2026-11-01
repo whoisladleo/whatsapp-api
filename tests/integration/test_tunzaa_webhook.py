@@ -616,6 +616,21 @@ def test_payment_failed_releases_stock_and_notifies(client, db_session, order, p
     assert notice is not None
 
 
+def test_payment_failed_on_subscription_restores_no_stock(client, db_session, order, product, monkeypatch):
+    _mock_send_text(monkeypatch)
+    product.is_subscription = True
+    product.quantity = 0
+    db_session.commit()
+
+    resp = _post(client, {"status": "FAILED", "reference_id": f"order-{order.id}", "transaction_id": "T2"})
+
+    assert resp.status_code == 200
+    db_session.refresh(order)
+    db_session.refresh(product)
+    assert order.status == OrderStatus.FAILED
+    assert product.quantity == 0
+
+
 def test_payment_cancelled_treated_same_as_failed(client, db_session, order):
     resp = _post(client, {"status": "CANCELLED", "reference_id": f"order-{order.id}"})
 

@@ -204,7 +204,9 @@ def auto_cancel_order(order_id: str):
         restored_product_id = None
         if order.product_id:
             product = db.query(Product).filter(Product.id == order.product_id).first()
-            if product:
+            # Same subscription guard as cancel_order (#118): no claim at
+            # close means no restore here.
+            if product and not product.is_subscription:
                 product.quantity += order.quantity or 1
                 restored_product_id = product.id
 
