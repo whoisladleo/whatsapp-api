@@ -14,7 +14,16 @@ import pytest
 
 from app.core.config import settings
 from app.core.security import create_access_token
-from app.db.models import InstagramAccount, Product, SupportAccessEvent, SupportAccessKind, User
+from app.db.models import (
+    InstagramAccount,
+    NumberSubscription,
+    NumberSubscriptionStatus,
+    Product,
+    SupportAccessEvent,
+    SupportAccessKind,
+    User,
+    WhatsAppAccount,
+)
 from app.services.support_access import IMPERSONATOR_CLAIM
 
 OPERATOR_PHONE = "255700000001"
@@ -565,3 +574,77 @@ def test_merchant_list_includes_phoneless_ig_merchant(
     assert resp.status_code == 200
     assert resp.json()["total"] == 2
     assert "255733344455" in resp.text
+
+
+def _manual_refund_setup(db_session, target, refund_status="MANUAL"):
+    account = WhatsAppAccount(
+        name="Target Shop", phone_number_id="MASKPHONE", access_token="tok",
+        user_id=target.id,
+    )
+    db_session.add(account)
+    db_session.commit()
+    db_session.refresh(account)
+    sub = NumberSubscription(
+        account_id=account.id, status=NumberSubscriptionStatus.PROVISIONING_FAILED,
+        monthly_amount=10000, tunzaa_transaction_id="TXN-1", refund_status=refund_status,
+    )
+    db_session.add(sub)
+    db_session.commit()
+    db_session.refresh(sub)
+    return account, sub
+
+
+def _mask_headers(client, operator):
+    mint = _mint(client, _headers(operator))
+    assert mint.status_code == 200
+    return {"Authorization": f"Bearer {mint.json()['access_token']}"}
+
+
+def test_mark_refunded_flips_manual_to_succeeded(client, db_session, operator, target):
+    account, sub = _manual_refund_setup(db_session, target)
+
+    resp = client.post(
+        f"/api/v1/accounts/{account.id}/number-subscription/mark-refunded",
+        headers=_mask_headers(client, operator),
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["refund_status"] == "SUCCEEDED"
+    writes = _audit_rows(db_session, SupportAccessKind.WRITE)
+    assert any("mark-refunded" in (row.path or "") for row in writes)
+
+
+def test_mark_refunded_forbidden_for_merchant_own_token(client, db_session, target):
+    account, sub = _manual_refund_setup(db_session, target)
+
+    resp = client.post(
+        f"/api/v1/accounts/{account.id}/number-subscription/mark-refunded",
+        headers=_headers(target),
+    )
+
+    assert resp.status_code == 403
+    db_session.refresh(sub)
+    assert sub.refund_status == "MANUAL"
+
+
+def test_mark_refunded_400_when_nothing_owed(client, db_session, operator, target):
+    account, sub = _manual_refund_setup(db_session, target, refund_status=None)
+
+    resp = client.post(
+        f"/api/v1/accounts/{account.id}/number-subscription/mark-refunded",
+        headers=_mask_headers(client, operator),
+    )
+
+    assert resp.status_code == 400
+
+
+def test_mark_refunded_idempotent_when_already_succeeded(client, db_session, operator, target):
+    account, sub = _manual_refund_setup(db_session, target, refund_status="SUCCEEDED")
+
+    resp = client.post(
+        f"/api/v1/accounts/{account.id}/number-subscription/mark-refunded",
+        headers=_mask_headers(client, operator),
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["refund_status"] == "SUCCEEDED"

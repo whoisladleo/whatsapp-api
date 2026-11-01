@@ -229,3 +229,9 @@ Production-tier decisions only — what was chosen, what was considered and reje
 - *Backfilling legacy stale rows.* Rejected: age-bounded allowance denies them access already; legacy chat rows had auto-cancel scheduled; legacy Pay Now rows hold 1 unit of 999999 — negligible.
 
 **Correction to the audit report:** finding 3 said "nothing ever expires a PENDING order" — wrong for chat orders, which always had `auto_cancel_order` (stock facet covered, modulo queue loss). The real gaps were subscriptions never resolving on abandonment and Pay Now never scheduling expiry. Fixed above.
+
+## Support mark-refunded action (2026-11-01, #112)
+
+**Chose:** `POST /accounts/{id}/number-subscription/mark-refunded`, impersonated-operator sessions only — the merchant's own token gets 403 (they must not mark their own refund), and the mask keeps the audit ledger's WRITE row attributing operator + target for free. MANUAL flips to SUCCEEDED; NULL is 400 (nothing owed); re-marking is an idempotent no-op. Dashboard shows the button on the purchase card only while impersonating a MANUAL row.
+
+**Considered and rejected:** an admin-page pending-refunds list with operator-direct marking — bigger build (second list endpoint + UI) and operator-direct writes aren't audit-logged today, so the trail would be worse. Also rejected letting merchants mark their own: unverifiable self-attestation on financial records.

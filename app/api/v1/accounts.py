@@ -2,7 +2,7 @@ import uuid
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
-from typing import List
+from typing import List, Optional
 
 from app.db.session import get_db
 from app.db.models import NumberSubscription, NumberSubscriptionStatus, User
@@ -14,7 +14,7 @@ from app.crud.account import (
     create_account, get_account_by_id, get_accounts_by_user,
     update_account, delete_account,
 )
-from app.api.deps import forbid_impersonated, get_current_user
+from app.api.deps import Impersonation, forbid_impersonated, get_current_user, get_impersonation
 from app.core.config import settings
 from app.services import number_billing
 
@@ -249,6 +249,52 @@ def get_number_subscription(
     if not subscription:
         raise HTTPException(status_code=404, detail="No number subscription for this account.")
 
+    return NumberSubscriptionResponse(
+        id=subscription.id,
+        status=subscription.status.value,
+        monthly_amount=subscription.monthly_amount,
+        next_billing_at=subscription.next_billing_at,
+        retry_count=subscription.retry_count,
+        created_at=subscription.created_at,
+        refund_status=subscription.refund_status,
+    )
+
+
+@router.post("/{account_id}/number-subscription/mark-refunded", response_model=NumberSubscriptionResponse)
+def mark_number_subscription_refunded(
+    account_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    impersonation: Optional[Impersonation] = Depends(get_impersonation),
+):
+    """Support marks a MANUAL number-purchase refund done (#112).
+
+    Impersonated-operator sessions only, by design: the merchant must not
+    be able to mark their own refund (their own token gets 403), and the
+    mask keeps the audit ledger's WRITE row attributing operator +
+    target. Only MANUAL flips — NULL means nothing was ever owed (400);
+    re-marking SUCCEEDED is an idempotent no-op.
+    """
+    if impersonation is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Marking a refund is a support action — impersonate the merchant first.",
+        )
+    db_account = get_account_by_id(db=db, account_id=account_id, user_id=current_user.id)
+    if not db_account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    subscription = (
+        db.query(NumberSubscription).filter(NumberSubscription.account_id == db_account.id).first()
+    )
+    if not subscription:
+        raise HTTPException(status_code=404, detail="No number subscription for this account.")
+    if subscription.refund_status is None:
+        raise HTTPException(status_code=400, detail="No refund is owed on this subscription.")
+
+    subscription.refund_status = "SUCCEEDED"
+    db.commit()
+    db.refresh(subscription)
     return NumberSubscriptionResponse(
         id=subscription.id,
         status=subscription.status.value,
