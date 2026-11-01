@@ -1,6 +1,6 @@
 import enum
 import uuid
-from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, JSON, Boolean, Float, Enum, Index, Uuid
+from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, JSON, Boolean, Float, Enum, Index, Uuid, text
 from sqlalchemy.orm import relationship, DeclarativeBase
 from datetime import datetime
 
@@ -472,6 +472,29 @@ class Customer(Base):
 
 class Order(Base):
     __tablename__ = "orders"
+
+    # One PENDING order per customer+product+payment-type, enforced by the
+    # database — the reclose guard's read-then-write check can't see a
+    # concurrent close, and sandbox data showed the same-second double-mint
+    # that results in (#114). Deliberately channel-blind: Pay Now orders
+    # carry no channel at all, and its own reuse query already treats a
+    # chat PENDING order as reusable, so a channel-scoped key would leave
+    # the overlap unprotected. payment_type is in the key (not the
+    # predicate) so a FULL order can still sit alongside an in-flight
+    # installment plan for the same deal — pinned behavior (#110). Mirrored
+    # by migration e7f1a3c4d9b2 for prod (tests build the schema via
+    # create_all, never migrations).
+    __table_args__ = (
+        Index(
+            "ix_orders_one_pending_per_deal",
+            "customer_id",
+            "product_id",
+            "payment_type",
+            unique=True,
+            postgresql_where=text("status = 'PENDING'"),
+            sqlite_where=text("status = 'PENDING'"),
+        ),
+    )
 
     id = Column(UUIDType, primary_key=True, default=uuid.uuid4, index=True)
     customer_id = Column(UUIDType, ForeignKey("customers.id"))

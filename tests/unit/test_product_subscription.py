@@ -313,9 +313,11 @@ def test_get_or_create_pending_subscription_reuses_existing_pending_row(
     clicks, re-negotiating a later chat) must not accumulate one orphaned
     PENDING_PAYMENT row per attempt.
     """
+    # CANCELLED: this helper never reads order status, and the
+    # one-pending-per-deal index (#114) forbids two PENDING rows here.
     first_order = Order(
         customer_id=customer.id, product_id=product.id, account_id=whatsapp_account.id,
-        quantity=1, agreed_price=100000, payment_type=PaymentType.FULL, status=OrderStatus.PENDING,
+        quantity=1, agreed_price=100000, payment_type=PaymentType.FULL, status=OrderStatus.CANCELLED,
     )
     db_session.add(first_order)
     db_session.commit()
@@ -354,9 +356,11 @@ def test_get_or_create_pending_subscription_does_not_reuse_active_row(
     )
     db_session.commit()
 
+    # CANCELLED: this helper never reads order status, and the
+    # whatsapp_order fixture already holds this deal's PENDING row (#114).
     new_order = Order(
         customer_id=customer.id, product_id=product.id,
-        quantity=1, agreed_price=100000, payment_type=PaymentType.FULL, status=OrderStatus.PENDING,
+        quantity=1, agreed_price=100000, payment_type=PaymentType.FULL, status=OrderStatus.CANCELLED,
     )
     db_session.add(new_order)
     db_session.commit()
@@ -371,9 +375,11 @@ def test_get_or_create_pending_subscription_does_not_reuse_active_row(
 def test_get_or_create_pending_subscription_sets_instagram_customer_id_on_reuse(
     db_session, whatsapp_account, product, customer, ig_customer
 ):
+    # CANCELLED: this helper never reads order status, and the
+    # one-pending-per-deal index (#114) forbids two PENDING rows here.
     first_order = Order(
         customer_id=customer.id, product_id=product.id, account_id=whatsapp_account.id,
-        quantity=1, agreed_price=100000, payment_type=PaymentType.FULL, status=OrderStatus.PENDING,
+        quantity=1, agreed_price=100000, payment_type=PaymentType.FULL, status=OrderStatus.CANCELLED,
     )
     db_session.add(first_order)
     db_session.commit()

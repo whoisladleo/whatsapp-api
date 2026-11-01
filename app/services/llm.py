@@ -10,6 +10,7 @@ from typing import List, Optional
 from app.core.attachments import describe_attachments
 from app.core.config import settings
 from app.core.security import normalize_phone
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from app.db.models import (
     Customer,
@@ -444,7 +445,9 @@ def _reclose_guard_note(
     must NOT proceed, else None. Only a LIVE pending order blocks — an
     expired hold is retired on the spot (auto-cancel's countdown firing
     doesn't survive a redeploy, so "the task cleans those up" stopped
-    being something we can rely on — #113).
+    being something we can rely on — #113). For subscriptions, any PAID
+    order also blocks: a paid-for plan is owned even before its
+    subscription row reaches ACTIVE (#114).
     """
     open_order = (
         db.query(Order)
@@ -506,7 +509,81 @@ def _reclose_guard_note(
                 product.id,
             )
             return _lang_text(_ALREADY_ACTIVE_LINES, language).format(product=product.name)
+        # A plan already paid for is owned, even when the subscription row
+        # hasn't reached ACTIVE yet (webhook lag, or a confirmation that
+        # never landed) — a re-emitted close past this point is a second
+        # real charge, as the sandbox 4x-PAID pile proved (#114). Keyed
+        # globally per customer+product, not per channel: a plan bought
+        # over WhatsApp is the same plan over Instagram. Consumables are
+        # deliberately exempt — buying the same thing twice is legitimate.
+        paid = (
+            db.query(Order)
+            .filter(
+                Order.customer_id == customer_id,
+                Order.product_id == product.id,
+                Order.status == OrderStatus.PAID,
+            )
+            .first()
+        )
+        if paid:
+            logger.warning(
+                "Duplicate close blocked: PAID order %s already exists for customer %s / product %s.",
+                paid.id,
+                customer_id,
+                product.id,
+            )
+            return _lang_text(_ALREADY_ACTIVE_LINES, language).format(product=product.name)
     return None
+
+
+def _race_loser_note(
+    db: Session,
+    customer_id,
+    product: Product,
+    payment_type: PaymentType,
+    language: Optional[str] = None,
+) -> str:
+    """
+    Builds the already-sent note for a close that lost the double-close
+    race: the partial unique index rejected this attempt's PENDING insert
+    because a concurrent close committed first (#114). The caller has
+    already rolled back; this restores the stock unit the loser's claim
+    took (that commit landed separately, before the insert) and reads the
+    winner back channel-blind — the winning order may be a channel-less
+    Pay Now row the channel-scoped guard never saw — but filtered to the
+    loser's payment type, since a FULL order can legitimately sit next to
+    an installment one for the same deal (#110). Raises DealRejected when
+    no winner exists (no winner means no constraint violation to explain,
+    so something else is wrong and a human should look).
+    """
+    if not product.is_subscription:
+        product.quantity = (product.quantity or 0) + 1
+        db.commit()
+    winner = (
+        db.query(Order)
+        .filter(
+            Order.customer_id == customer_id,
+            Order.product_id == product.id,
+            Order.payment_type == payment_type,
+            Order.status == OrderStatus.PENDING,
+        )
+        .order_by(Order.created_at.desc())
+        .first()
+    )
+    if winner is None:
+        raise DealRejected(
+            "Close lost the double-close race but no winning PENDING order exists "
+            f"for customer {customer_id} / product {product.id}"
+        )
+    logger.warning(
+        "Duplicate close lost race: PENDING order %s won for customer %s / product %s.",
+        winner.id,
+        customer_id,
+        product.id,
+    )
+    return _lang_text(_ALREADY_SENT_LINES, language).format(
+        price=f"{winner.agreed_price:,.0f}"
+    )
 
 
 class LLMUnavailable(Exception):
@@ -738,7 +815,15 @@ class LLMService:
             reserved_until=datetime.utcnow() + RESERVATION_WINDOW,
         )
         db.add(order)
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError:
+            # Lost the double-close race — a concurrent close for this
+            # customer+product committed its PENDING order first and the
+            # partial unique index rejected ours (#114). Same outcome as
+            # the guard catching it, one message later.
+            db.rollback()
+            return _race_loser_note(db, customer.id, product, payment_type, customer.language)
         db.refresh(order)
 
         self._create_subscription_if_needed(db, order, product, customer)
@@ -1443,7 +1528,12 @@ Match the customer's language (Swahili or English). Keep both lines to one sente
             reserved_until=datetime.utcnow() + RESERVATION_WINDOW,
         )
         db.add(order)
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError:
+            # Same double-close race as _close_deal above (#114).
+            db.rollback()
+            return _race_loser_note(db, customer.id, product, payment_type, customer.language)
         db.refresh(order)
 
         self._create_subscription_if_needed(db, order, product, customer, ig_customer)

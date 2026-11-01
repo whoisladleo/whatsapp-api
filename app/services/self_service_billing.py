@@ -2,6 +2,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Optional
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -104,20 +105,9 @@ async def pay_now(
     # orders are never reused (a Tunzaa plan's legs would keep billing
     # against a full-pay prompt), nor multi-unit ones (their agreed price
     # is a negotiated total, not this unit price).
-    order = (
-        db.query(Order)
-        .filter(
-            Order.customer_id == customer.id,
-            Order.product_id == product.id,
-            Order.status == OrderStatus.PENDING,
-            Order.payment_type == PaymentType.FULL,
-            Order.tunzaa_plan_id.is_(None),
-            Order.quantity == 1,
-        )
-        .order_by(Order.created_at.desc())
-        .first()
-    )
+    order = _find_reusable_order(db, customer, product)
     stock_taken = False
+    fresh_order = False
     if order is None:
         if product.quantity > 0:
             product.quantity -= 1
@@ -132,7 +122,27 @@ async def pay_now(
             reserved_until=datetime.utcnow() + RESERVATION_WINDOW,
         )
         db.add(order)
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError:
+            # Lost a double-click race — the other click's PENDING order
+            # committed first and the partial unique index rejected ours
+            # (#114). The rollback also undoes the decrement above, so
+            # stock_taken resets: restoring it later would mint a phantom
+            # unit on an order that took none (see _release_failed_order).
+            db.rollback()
+            logger.warning(
+                "Pay Now lost a double-click race for customer %s / product %s; reusing the winner.",
+                customer.id,
+                product.id,
+            )
+            stock_taken = False
+            order = _find_reusable_order(db, customer, product)
+            if order is None:
+                raise
+        else:
+            fresh_order = True
+    if fresh_order:
         db.refresh(order)
 
         # The decrement above may have taken the last unit.
@@ -185,6 +195,23 @@ async def pay_now(
         "message": f"A payment request for TZS {price:,.0f} has been sent to {normalized_phone} — "
         "approve it on your phone to activate your subscription.",
     }
+
+
+def _find_reusable_order(db: Session, customer: Customer, product: Product):
+    """Latest still-pending FULL single-unit order for this customer+product, if any."""
+    return (
+        db.query(Order)
+        .filter(
+            Order.customer_id == customer.id,
+            Order.product_id == product.id,
+            Order.status == OrderStatus.PENDING,
+            Order.payment_type == PaymentType.FULL,
+            Order.tunzaa_plan_id.is_(None),
+            Order.quantity == 1,
+        )
+        .order_by(Order.created_at.desc())
+        .first()
+    )
 
 
 def _release_failed_order(
