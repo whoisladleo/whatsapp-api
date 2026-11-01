@@ -17,10 +17,11 @@ from app.db.models import (
     WhatsAppAccount,
 )
 from app.services import support_access
-from app.services.llm import LLMService
+from app.services.llm import DealRejected, LLMService
 from app.services.merchant_handler import handle_merchant_message
 from app.services.payment_resend import (
     ResendOutcome,
+    _fresh_clone,
     merchant_resend_order,
     resend_live_order,
 )
@@ -353,6 +354,141 @@ async def test_instagram_order_without_phone_has_nowhere_to_prompt(
     assert result.outcome is ResendOutcome.NO_PHONE
 
 
+async def test_clone_refuses_when_channel_rows_are_gone(db_session, monkeypatch, customer, product, account):
+    _closer(monkeypatch)
+    old = _order(db_session, customer, product, account=account, hold_hours=-3)
+    db_session.delete(account)
+    db_session.commit()
+
+    result = await merchant_resend_order(db_session, old)
+
+    assert result.outcome is ResendOutcome.DEAL_INVALID
+    assert "channel is gone" in result.detail
+
+
+async def test_clone_refuses_when_instagram_account_is_gone(
+    db_session, monkeypatch, customer, product, ig_account, ig_customer
+):
+    _closer(monkeypatch)
+    old = _order(db_session, customer, product, ig=(ig_account, ig_customer), hold_hours=-3)
+    db_session.delete(ig_account)
+    db_session.commit()
+
+    result = await merchant_resend_order(db_session, old)
+
+    assert result.outcome is ResendOutcome.DEAL_INVALID
+
+
+async def test_clone_unavailable_without_closer(db_session, monkeypatch, customer, product, account):
+    monkeypatch.setattr("app.services.llm.llm_service", None)
+    old = _order(db_session, customer, product, account=account, hold_hours=-3)
+
+    result = await merchant_resend_order(db_session, old)
+
+    assert result.outcome is ResendOutcome.TUNZAA_ERROR
+
+
+async def test_clone_refuses_repriced_deal(db_session, monkeypatch, customer, product, account):
+    _closer(monkeypatch)
+    old = _order(db_session, customer, product, account=account, hold_hours=-3)
+    product.max_price = 10000
+    product.min_price = 5000
+    db_session.commit()
+
+    result = await merchant_resend_order(db_session, old)
+
+    assert result.outcome is ResendOutcome.DEAL_INVALID
+    assert "no longer matches" in result.detail
+    db_session.refresh(old)
+    assert old.status == OrderStatus.PENDING
+
+
+def _crashing_closer(monkeypatch, error):
+    service = LLMService(api_key=None)
+
+    async def _boom(*args, **kwargs):
+        raise error
+
+    service._close_deal = _boom
+    service._close_instagram_deal = _boom
+    monkeypatch.setattr("app.services.llm.llm_service", service)
+
+
+async def test_clone_restores_row_on_close_crash(db_session, monkeypatch, customer, product, account):
+    _crashing_closer(monkeypatch, RuntimeError("tunzaa down"))
+    old = _order(db_session, customer, product, account=account, hold_hours=-3)
+    db_session.refresh(product)
+    stock_before = product.quantity
+
+    result = await merchant_resend_order(db_session, old)
+
+    assert result.outcome is ResendOutcome.TUNZAA_ERROR
+    db_session.refresh(old)
+    assert old.status == OrderStatus.PENDING
+    assert old.reserved_until < datetime.utcnow()
+    db_session.refresh(product)
+    assert product.quantity == stock_before
+
+
+async def test_clone_restores_row_on_late_stockout(db_session, monkeypatch, customer, product, account):
+    _crashing_closer(monkeypatch, DealRejected("AGREEMENT_REACHED for 'Widget' but it's out of stock"))
+    old = _order(db_session, customer, product, account=account, hold_hours=-3)
+
+    result = await merchant_resend_order(db_session, old)
+
+    assert result.outcome is ResendOutcome.OUT_OF_STOCK
+    db_session.refresh(old)
+    assert old.status == OrderStatus.PENDING
+
+
+async def test_clone_restores_row_on_late_rejection(db_session, monkeypatch, customer, product, account):
+    _crashing_closer(monkeypatch, DealRejected("AGREEMENT_REACHED for 'Widget' but it's an uncompleted draft"))
+    old = _order(db_session, customer, product, account=account, hold_hours=-3)
+
+    result = await merchant_resend_order(db_session, old)
+
+    assert result.outcome is ResendOutcome.DEAL_INVALID
+    db_session.refresh(old)
+    assert old.status == OrderStatus.PENDING
+
+
+async def test_clone_without_landing_order_restores_and_reports_owned(
+    db_session, monkeypatch, customer, product, account
+):
+    # Defensive path: the close returned a note but no new PENDING row
+    # exists (the PAID-subscription guard shape) — the old row comes
+    # back exactly, stock adjustment reversed.
+    service = LLMService(api_key=None)
+
+    async def _note_only(*args, **kwargs):
+        return "already on its way"
+
+    service._close_deal = _note_only
+    monkeypatch.setattr("app.services.llm.llm_service", service)
+    old = _order(db_session, customer, product, account=account, hold_hours=-3)
+    db_session.refresh(product)
+    stock_before = product.quantity
+
+    result = await merchant_resend_order(db_session, old)
+
+    assert result.outcome is ResendOutcome.ALREADY_OWNED
+    db_session.refresh(old)
+    assert old.status == OrderStatus.PENDING
+    db_session.refresh(product)
+    assert product.quantity == stock_before
+
+
+async def test_fresh_clone_directly_refuses_phoneless_parties(
+    db_session, monkeypatch, customer, product, account
+):
+    _closer(monkeypatch)
+    old = _order(db_session, customer, product, account=account, hold_hours=-3)
+
+    result = await _fresh_clone(db_session, old, (account, customer, None, None, False))
+
+    assert result.outcome is ResendOutcome.NO_PHONE
+
+
 # --- /resend command ---
 
 
@@ -440,6 +576,71 @@ async def test_resend_command_refires_instagram_order(
     reply = await handle_merchant_message(db_session, account, "/resend @resender", "255700000920")
 
     assert reply == "Payment prompt re-sent to @resender for Widget (TZS 50,000)."
+
+
+async def test_resend_command_reports_throttle_wait(db_session, account, customer, product):
+    order = _order(db_session, customer, product, account=account, updated_hours_ago=0)
+    order.updated_at = datetime.utcnow() - timedelta(minutes=1)
+    db_session.commit()
+
+    reply = await handle_merchant_message(db_session, account, "/resend 255722220001", "255700000920")
+
+    assert "try again in" in reply
+    assert reply.endswith("s.")
+
+
+async def test_resend_command_instagram_without_connected_account(db_session, account):
+    assert (
+        await handle_merchant_message(db_session, account, "/resend @shopper", "255700000920")
+        == "No Instagram account connected."
+    )
+
+
+async def test_resend_command_instagram_installment_only(
+    db_session, customer, product, account, ig_account, ig_customer
+):
+    _order(db_session, customer, product, ig=(ig_account, ig_customer), payment_type=PaymentType.INSTALLMENT)
+
+    reply = await handle_merchant_message(db_session, account, "/resend @resender", "255700000920")
+
+    assert "installment plan" in reply
+
+
+async def test_resend_command_instagram_no_pending_orders(db_session, account, ig_account, ig_customer):
+    assert (
+        await handle_merchant_message(db_session, account, "/resend @resender", "255700000920")
+        == "No pending orders for @resender."
+    )
+
+
+async def test_resend_command_instagram_ambiguous_lists_candidates(
+    db_session, owner, customer, product, account, ig_account, ig_customer
+):
+    other = Product(
+        slug="resend-ig-gadget", name="Gadget", max_price=30000, min_price=25000,
+        quantity=5, merchant_id=owner.id,
+    )
+    db_session.add(other)
+    db_session.commit()
+    _order(db_session, customer, product, ig=(ig_account, ig_customer))
+    _order(db_session, customer, other, ig=(ig_account, ig_customer))
+
+    reply = await handle_merchant_message(db_session, account, "/resend @resender", "255700000920")
+
+    assert "more than one pending order" in reply
+    assert "Widget — TZS 50,000" in reply
+
+
+def test_render_resend_result_falls_back_without_detail(db_session, customer, product, account):
+    from app.services.merchant_handler import _render_resend_result
+    from app.services.payment_resend import ResendResult
+
+    order = _order(db_session, customer, product, account=account)
+
+    assert (
+        _render_resend_result("255722220001", order, ResendResult(ResendOutcome.NOT_PENDING))
+        == "This order can't be resent right now."
+    )
 
 
 async def test_resend_command_ignores_other_accounts_orders(db_session, account, customer, product, owner):
@@ -572,6 +773,45 @@ def test_resend_endpoint_403_while_impersonating(client, db_session, auth_user, 
     )
 
     assert resp.status_code == 403
+
+
+@respx.mock
+def test_resend_endpoint_502_on_tunzaa_outage(client, db_session, auth_user, customer):
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "t"}))
+    respx.post(PAYMENT_URL).mock(return_value=httpx.Response(500, json={}))
+    merchant, headers, acct = _authed_merchant(db_session, auth_user)
+    product = Product(
+        slug="api-widget7", name="Widget", max_price=50000, min_price=40000,
+        quantity=5, merchant_id=merchant.id,
+    )
+    db_session.add(product)
+    db_session.commit()
+    order = _order(db_session, customer, product, account=acct)
+
+    resp = client.post(f"/api/v1/orders/{order.id}/resend", headers=headers)
+
+    assert resp.status_code == 502
+
+
+@respx.mock
+def test_resend_endpoint_500_when_order_vanishes_after_resend(
+    client, db_session, auth_user, customer, monkeypatch
+):
+    _mock_tunzaa()
+    merchant, headers, acct = _authed_merchant(db_session, auth_user)
+    product = Product(
+        slug="api-widget8", name="Widget", max_price=50000, min_price=40000,
+        quantity=5, merchant_id=merchant.id,
+    )
+    db_session.add(product)
+    db_session.commit()
+    order = _order(db_session, customer, product, account=acct)
+    monkeypatch.setattr("app.api.v1.orders.get_order_detail_for_merchant", lambda *a: None)
+
+    resp = client.post(f"/api/v1/orders/{order.id}/resend", headers=headers)
+
+    assert resp.status_code == 500
+    assert "could not be reloaded" in resp.json()["detail"]
 
 
 @respx.mock

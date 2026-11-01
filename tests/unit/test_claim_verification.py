@@ -421,6 +421,231 @@ def test_judge_receives_ground_truth_facts(monkeypatch):
     assert "YES or NO" in seen["system"]
 
 
+# --- Fail-open and defensive branches ---
+
+
+def test_throttle_fails_open_on_redis_outage(monkeypatch):
+    class _BrokenRedis:
+        def get(self, key):
+            raise RuntimeError("redis down")
+
+        def set(self, *args, **kwargs):
+            raise RuntimeError("redis down")
+
+    monkeypatch.setattr("app.core.rate_limit._redis_client", _BrokenRedis())
+    assert claim_verification._throttle_hit("k") is False
+    assert claim_verification._throttle_set("k") is True
+
+
+def test_judge_fails_silent_when_complete_crashes(monkeypatch):
+    async def _fake_complete(provider, **kwargs):
+        raise RuntimeError("provider down")
+
+    monkeypatch.setattr("app.services.llm._complete_with_retry", _fake_complete)
+    monkeypatch.setattr(
+        "app.services.llm.llm_service",
+        type("FakeService", (), {"client": object(), "provider": object()})(),
+    )
+    import asyncio
+
+    assert asyncio.run(claim_verification._judge_payment_claim("It's on its way.", False)) is False
+
+
+@respx.mock
+def test_task_survives_alert_send_failure(db_session, account, customer, context, monkeypatch):
+    async def _fake_judge(outbound_body, prior_paid):
+        return True
+
+    monkeypatch.setattr(claim_verification, "_judge_payment_claim", _fake_judge)
+    monkeypatch.setattr(settings, "OPS_ALERT_PHONE", None)
+
+    async def _boom(self, *a, **kw):
+        raise RuntimeError("meta down")
+
+    monkeypatch.setattr("app.core.provider.WhatsAppProvider.send_template", _boom)
+
+    assert (
+        claim_verification.verify_payment_claim(
+            "whatsapp", str(account.id), customer.phone_number, "where is it?", OCT31_PHANTOMS[1],
+        )
+        == "Flagged: merchant alerted (0 send(s))."
+    )
+
+
+@respx.mock
+def test_task_survives_alert_rejection(db_session, account, customer, context, monkeypatch):
+    async def _fake_judge(outbound_body, prior_paid):
+        return True
+
+    monkeypatch.setattr(claim_verification, "_judge_payment_claim", _fake_judge)
+    monkeypatch.setattr(settings, "OPS_ALERT_PHONE", None)
+
+    async def _fake_send_template(self, *a, **kw):
+        return {"error": {"message": "rejected"}}
+
+    monkeypatch.setattr(
+        "app.core.provider.WhatsAppProvider.send_template", _fake_send_template
+    )
+
+    assert (
+        claim_verification.verify_payment_claim(
+            "whatsapp", str(account.id), customer.phone_number, "where is it?", OCT31_PHANTOMS[1],
+        )
+        == "Flagged: merchant alerted (0 send(s))."
+    )
+
+
+def test_task_unknown_account_id():
+    assert (
+        claim_verification.verify_payment_claim("whatsapp", "not-a-uuid", "x", None, None)
+        == "Account not found."
+    )
+
+
+def test_task_unknown_channel():
+    import uuid
+
+    assert (
+        claim_verification.verify_payment_claim("sms", str(uuid.uuid4()), "x", None, None)
+        == "Unknown channel."
+    )
+
+
+def test_task_missing_customer(db_session, account):
+    assert (
+        claim_verification.verify_payment_claim(
+            "whatsapp", str(account.id), "255700000000", "where is it?", OCT31_PHANTOMS[1],
+        )
+        == "Account, customer, or conversation not found."
+    )
+
+
+def test_task_throttled_on_lost_set_race(db_session, account, customer, context, monkeypatch):
+    async def _fake_judge(outbound_body, prior_paid):
+        return True
+
+    monkeypatch.setattr(claim_verification, "_judge_payment_claim", _fake_judge)
+    monkeypatch.setattr(claim_verification, "_throttle_hit", lambda key: False)
+    monkeypatch.setattr(claim_verification, "_throttle_set", lambda key: False)
+
+    assert (
+        claim_verification.verify_payment_claim(
+            "whatsapp", str(account.id), customer.phone_number, "where is it?", OCT31_PHANTOMS[1],
+        )
+        == "Throttled: alert already sent."
+    )
+
+
+@respx.mock
+def test_task_truncates_long_preview_in_alert(db_session, account, customer, context, monkeypatch):
+    async def _fake_judge(outbound_body, prior_paid):
+        return True
+
+    monkeypatch.setattr(claim_verification, "_judge_payment_claim", _fake_judge)
+    monkeypatch.setattr(settings, "OPS_ALERT_PHONE", None)
+    calls = []
+
+    async def _fake_send_template(self, to, template, language_code=None, components=None):
+        calls.append(components)
+        return {"messages": [{"id": "wamid.alert.long"}]}
+
+    monkeypatch.setattr(
+        "app.core.provider.WhatsAppProvider.send_template", _fake_send_template
+    )
+
+    long_phantom = "It's on its way to your phone, please approve it now. " * 10
+    result = claim_verification.verify_payment_claim(
+        "whatsapp", str(account.id), customer.phone_number, "where is it?", long_phantom,
+    )
+
+    assert result == "Flagged: merchant alerted (1 send(s))."
+    flagged_text = calls[0][1]["parameters"][0]["text"]
+    assert long_phantom not in flagged_text
+    assert '...". Check the chat.' in flagged_text
+
+
+@respx.mock
+def test_whatsapp_pipeline_survives_verify_enqueue_failure(
+    db_session, monkeypatch, account, customer, context
+):
+    import app.tasks.webhook_processing as webhook_processing
+
+    respx.post(url__regex=MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "wamid.claim2"}]})
+    )
+
+    async def fake_generate_response(**kwargs):
+        return OCT31_PHANTOMS[1]
+
+    class FakeLLMService:
+        generate_response = staticmethod(fake_generate_response)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("broker down")
+
+    monkeypatch.setattr(claim_verification.verify_payment_claim, "apply_async", _boom)
+
+    original = webhook_processing.llm_service
+    webhook_processing.llm_service = FakeLLMService()
+    try:
+        result = webhook_processing.process_inbound_message(
+            str(account.id), customer.phone_number, "I still haven't got the request"
+        )
+    finally:
+        webhook_processing.llm_service = original
+
+    assert result == "Success"
+
+
+@respx.mock
+def test_instagram_pipeline_survives_verify_enqueue_failure(
+    db_session, monkeypatch, ig_account, ig_customer, ig_context
+):
+    import app.tasks.instagram_dm_processing as dm_processing
+
+    dm = InstagramDirectMessage(
+        account_id=ig_account.id,
+        customer_id=ig_customer.id,
+        direction="inbound",
+        body="I still haven't got the request",
+        ig_message_id="mid_claim2",
+    )
+    db_session.add(dm)
+    db_session.commit()
+    db_session.refresh(dm)
+
+    async def fake_generate_dm_response(**kwargs):
+        return OCT31_PHANTOMS[1]
+
+    class FakeLLMService:
+        generate_dm_response = staticmethod(fake_generate_dm_response)
+
+    class FakeProvider:
+        def __init__(self, access_token, response=None):
+            pass
+
+        async def send_direct_message(self, ig_business_id, recipient_id, message):
+            return {"message_id": "mid_out_claim2"}
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("broker down")
+
+    monkeypatch.setattr(claim_verification.verify_payment_claim, "apply_async", _boom)
+    monkeypatch.setattr(dm_processing, "SessionLocal", lambda: db_session)
+    monkeypatch.setattr(dm_processing, "InstagramProvider", FakeProvider)
+
+    original = dm_processing.llm_service
+    dm_processing.llm_service = FakeLLMService()
+    try:
+        result = dm_processing.process_inbound_dm(
+            str(ig_account.id), str(ig_customer.id), str(dm.id)
+        )
+    finally:
+        dm_processing.llm_service = original
+
+    assert result == "Processed."
+
+
 # --- Turn-outcome threading ---
 
 
