@@ -257,6 +257,15 @@ def _parse_and_strip_agreement(text: str):
         "phone": match.group("phone"),
     }
 
+
+def _mark_turn_outcome(turn_outcome: Optional[dict], key: str) -> None:
+    # Records what this turn did for the post-send payment-claim check
+    # (#116): "markers_seen" when an agreement/resend marker parsed (even
+    # one that ends up ignored), "order_action" when the order machinery
+    # ran and produced its note. Callers that don't care pass nothing.
+    if turn_outcome is not None:
+        turn_outcome[key] = True
+
 # The model only ever sees a floor 10% above the real min_price, so whatever
 # it leaks or concedes in free text is still above what the merchant
 # approved. _close_deal/_close_instagram_deal still enforce the real
@@ -1555,6 +1564,7 @@ Match the customer's language (Swahili or English). Keep both lines to one sente
         account_name: str = "the shop",
         knowledge_content: Optional[str] = None,
         retry_on_outage: bool = False,
+        turn_outcome: Optional[dict] = None,
     ) -> Optional[str]:
         """
         Generates Amara's reply to an ongoing Instagram DM conversation:
@@ -1684,6 +1694,7 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
 
         response_text, agreement = _parse_and_strip_agreement(response_text)
         if agreement:
+            _mark_turn_outcome(turn_outcome, "markers_seen")
             try:
                 note = await self._close_instagram_deal(db, account, customer, agreement)
             except Exception as deal_err:
@@ -1695,6 +1706,7 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
                 await self._hand_off_instagram(db, account, customer, context, message_body)
                 return _holding_reply(None)
             if note:
+                _mark_turn_outcome(turn_outcome, "order_action")
                 response_text = f"{response_text}\n\n{note}".strip()
         elif quote:
             self._record_quote(db, account.user_id, quote, "instagram_dm", instagram_account_id=account.id)
@@ -1704,6 +1716,7 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
         # call differ. Skipped when this turn already closed (handoff
         # early-returns above).
         if resend is not None and not agreement:
+            _mark_turn_outcome(turn_outcome, "markers_seen")
             live_order = (
                 db.query(Order)
                 .filter(
@@ -1788,6 +1801,7 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
                     "Ignoring IG RESEND_PAYMENT: no live PENDING order for this chat and no deal terms to close fresh."
                 )
             if resend_note:
+                _mark_turn_outcome(turn_outcome, "order_action")
                 response_text = f"{response_text}\n\n{resend_note}".strip()
 
         return response_text
@@ -1803,6 +1817,7 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
         db: Session = None,
         account: WhatsAppAccount = None,
         retry_on_outage: bool = False,
+        turn_outcome: Optional[dict] = None,
     ) -> str:
         if not self.client:
             return "AI service is currently unavailable."
@@ -2156,6 +2171,7 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
             # simultaneously being escalated to a human.
             response_text, agreement = _parse_and_strip_agreement(response_text)
             if agreement:
+                _mark_turn_outcome(turn_outcome, "markers_seen")
                 if context.state == ConversationState.HUMAN_HANDOFF:
                     logger.warning("AGREEMENT_REACHED marker seen on a handed-off turn; ignoring.")
                 else:
@@ -2175,6 +2191,7 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
                         )
                         note = None
                     if note:
+                        _mark_turn_outcome(turn_outcome, "order_action")
                         response_text = f"{response_text}\n\n{note}".strip()
 
             # 3b. Payment resend (RESEND_PAYMENT): the buyer says the
@@ -2188,6 +2205,7 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
             # its way" with nothing behind it.
             response_text, resend = _parse_and_strip_resend(response_text)
             if resend is not None and not agreement and context.state != ConversationState.HUMAN_HANDOFF:
+                _mark_turn_outcome(turn_outcome, "markers_seen")
                 live_order = (
                     db.query(Order)
                     .filter(
@@ -2278,6 +2296,7 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
                         "Ignoring RESEND_PAYMENT: no live PENDING order for this chat and no deal terms to close fresh."
                     )
                 if resend_note:
+                    _mark_turn_outcome(turn_outcome, "order_action")
                     response_text = f"{response_text}\n\n{resend_note}".strip()
 
             # 4. Price quoted but not yet agreed (QUOTE). Superseded by a
