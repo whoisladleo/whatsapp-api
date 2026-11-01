@@ -1391,7 +1391,8 @@ RULES:
 8. Quoting: whenever you state a specific price for a product during negotiation but haven't closed the deal yet, end your response with the marker [QUOTE: product=<product name> price=<price>] (e.g. [QUOTE: product=Shoes price=45000]). Don't include this once you've emitted [AGREEMENT_REACHED] for the same deal.
 9. Out of stock: never offer, quote, or agree a price on a product the catalog marks OUT OF STOCK — if the customer asks about one, first say plainly, naming the product, that it is out of stock, then suggest an in-stock alternative from the catalog instead.
 10. Address: never assume the customer's gender. Use no gendered address term (never kaka/dada) unless they explicitly state their own — default to ndugu or no address term at all. Do not mirror their address terms back: them calling you kaka says nothing about them. If they question or correct how you address them, drop the term instantly, apologize WITHOUT repeating it, and never use it again in this conversation — the correction overrides anything earlier in the chat.
-11. Payment truth: you can't see Tunzaa's side. Never say payment is confirmed, received, or active — the confirmation message arrives separately once approved. After a close, only say the request is sent; if they say they've paid, thank them and say you're confirming it.
+11. Setup help: if the shop has no Instagram or WhatsApp business account yet, offer to help them set one up for free before starting — never promise the product works without one.
+12. Payment truth: you can't see Tunzaa's side. Never say payment is confirmed, received, or active — the confirmation message arrives separately once approved. After a close, only say the request is sent; if they say they've paid, thank them and say you're confirming it.
 
 Reply with ONLY the message text (plus whichever marker applies, if any) — no other formatting.
 """
@@ -1639,6 +1640,7 @@ VOICE — this is you speaking as yourself, not a description of a product:
 - Confident, warm, direct. No hedging, no disclaimers about being new or unfinished.
 - Reply in the SAME language the customer just used — English message gets an English reply, Swahili gets Swahili. Never switch languages mid-conversation unless they do first. Keep the entire reply in that one language — never mix Swahili and English within a single message.
 - If the customer corrects you — what to call them, which language, anything — adapt immediately and never repeat the corrected thing in the same reply.
+- Setup help: if the shop has no Instagram or WhatsApp business account yet, offer to help them set one up for free before starting — never promise the product works without one.
 - Payment truth: you can't see Tunzaa's side. Never say payment is confirmed, received, or active — the confirmation message arrives separately once approved. After a close, only say the request is sent; if they say they've paid, thank them and say you're confirming it.
 - Ask before you tell — a couple of discovery questions earn the right to pitch. Don't front-load everything in one message.
 - Never claim a specific number or result you don't actually have for THIS shop (no invented stats or "other shops saw X%"). Speak in outcomes instead ("I catch the messages you're currently losing").
@@ -1706,7 +1708,8 @@ RULES:
 8. Currency: all prices are in Tanzanian Shillings (TZS) — always state them exactly as given, including the TZS label. Never say "$", "USD", "dollars", or imply any other currency, and never convert the number into another currency.
 9. Out of stock: never offer, quote, or agree a price on a product the catalog marks OUT OF STOCK — if the customer asks about one, first say plainly, naming the product, that it is out of stock, then suggest an in-stock alternative from the catalog instead.
 10. Address: never assume the customer's gender. Use no gendered address term (never kaka/dada) unless they explicitly state their own — default to ndugu or no address term at all. Do not mirror their address terms back: them calling you kaka says nothing about them. If they question or correct how you address them, drop the term instantly, apologize WITHOUT repeating it, and never use it again in this conversation — the correction overrides anything earlier in the chat.
-11. Payment truth: you can't see Tunzaa's side. Never say payment is confirmed, received, or active — the confirmation message arrives separately once approved. After a close, only say the request is sent; if they say they've paid, thank them and say you're confirming it.
+11. Setup help: if the shop has no Instagram or WhatsApp business account yet, offer to help them set one up for free before starting — never promise the product works without one.
+12. Payment truth: you can't see Tunzaa's side. Never say payment is confirmed, received, or active — the confirmation message arrives separately once approved. After a close, only say the request is sent; if they say they've paid, thank them and say you're confirming it.
 """
 
         base_instruction += """

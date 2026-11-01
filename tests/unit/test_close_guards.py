@@ -507,6 +507,7 @@ async def test_wa_shop_prompt_has_payment_truth_rule(db_session, shop_account, s
     )
 
     assert "Payment truth: you can't see Tunzaa's side" in calls[0]["system"]
+    assert "offer to help them set one up for free" in calls[0]["system"]
 
 
 async def test_ig_dm_prompt_has_payment_truth_rule(
@@ -524,6 +525,7 @@ async def test_ig_dm_prompt_has_payment_truth_rule(
     )
 
     assert "Payment truth: you can't see Tunzaa's side" in calls[0]["system"]
+    assert "offer to help them set one up for free" in calls[0]["system"]
 
 
 async def test_wa_platform_prompt_has_payment_truth_rule(db_session, merchant, sub_product):
@@ -552,6 +554,7 @@ async def test_wa_platform_prompt_has_payment_truth_rule(db_session, merchant, s
     )
 
     assert "Payment truth: you can't see Tunzaa's side" in calls[0]["system"]
+    assert "offer to help them set one up for free" in calls[0]["system"]
 
 
 _loop_phone_counter = [0]
