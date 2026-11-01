@@ -332,6 +332,24 @@ def test_cancel_pending_order_releases_stock_and_notifies_customer(
     assert outbound.status == "sent"
 
 
+@respx.mock
+def test_cancel_subscription_order_restores_no_stock(
+    client, merchant_headers, db_session, order, product
+):
+    # Subscriptions never claim stock at close — cancelling one must not
+    # mint a phantom unit (#118).
+    product.is_subscription = True
+    product.quantity = 0
+    db_session.commit()
+    _mock_send_text()
+
+    resp = client.post(f"{BASE}/{order.id}/cancel", headers=merchant_headers)
+
+    assert resp.status_code == 200
+    db_session.refresh(product)
+    assert product.quantity == 0
+
+
 def test_cancel_already_paid_order_is_rejected(client, merchant_headers, db_session, order):
     order.status = OrderStatus.PAID
     db_session.commit()
