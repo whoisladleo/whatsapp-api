@@ -7,6 +7,7 @@ import respx
 import app.tasks.claim_verification as claim_verification
 from app.core.config import settings
 from app.db.models import (
+    AmaraEventKind,
     ConversationContext,
     ConversationState,
     Customer,
@@ -22,6 +23,7 @@ from app.db.models import (
     User,
     WhatsAppAccount,
 )
+from app.services import usage as usage_service
 from app.services.llm import LLMService
 
 MESSAGES_URL_RE = r"https://graph\.facebook\.com/.+/messages$"
@@ -35,6 +37,19 @@ OCT31_PHANTOMS = [
     "It's on its way to your phone — just approve the mobile-money prompt and I'll get started. 🎉",
     "You're welcome! 🙂 And once you approve it, I'll be live on your shop and ready to start closing those chats for you.",
 ]
+
+
+def _verdict(**over):
+    base = {"claim": True, "product": None, "price": None, "consent": True, "phone": None}
+    base.update(over)
+    return base
+
+
+def _judge_returning(verdict):
+    async def _fake_judge(history, prior_paid):
+        return verdict
+
+    return _fake_judge
 
 
 @pytest.fixture(autouse=True)
@@ -237,9 +252,9 @@ def test_task_proceeds_past_an_expired_hold(db_session, account, customer, conte
     _pending_order(db_session, customer, product, account, expired=True)
     seen = {}
 
-    async def _fake_judge(outbound_body, prior_paid):
+    async def _fake_judge(history, prior_paid):
         seen["ran"] = True
-        return False
+        return _verdict(claim=False, consent=False)
 
     monkeypatch.setattr(claim_verification, "_judge_payment_claim", _fake_judge)
     assert (
@@ -268,10 +283,7 @@ def test_task_survives_internal_crash(monkeypatch):
 def test_task_flags_phantom_and_alerts_merchant_plus_ops(
     db_session, account, customer, context, owner, monkeypatch
 ):
-    async def _fake_judge(outbound_body, prior_paid):
-        return True
-
-    monkeypatch.setattr(claim_verification, "_judge_payment_claim", _fake_judge)
+    monkeypatch.setattr(claim_verification, "_judge_payment_claim", _judge_returning(_verdict()))
     monkeypatch.setattr(settings, "OPS_ALERT_PHONE", "255700000999")
     calls = []
 
@@ -283,16 +295,22 @@ def test_task_flags_phantom_and_alerts_merchant_plus_ops(
         "app.core.provider.WhatsAppProvider.send_template", _fake_send_template
     )
 
+    # Capture scalars before the call: the task commits and closes the
+    # session, detaching these fixtures.
+    phone = customer.phone_number
+    context_id = context.id
     result = claim_verification.verify_payment_claim(
-        "whatsapp", str(account.id), customer.phone_number, "I still haven't got it", OCT31_PHANTOMS[1],
+        "whatsapp", str(account.id), phone, "I still haven't got it", OCT31_PHANTOMS[1],
     )
 
-    assert result == "Flagged: merchant alerted (2 send(s))."
+    assert result == "Flagged: handed off without recovery (no_terms), merchant alerted (2 send(s))."
     assert sorted(c["to"] for c in calls) == ["255700000910", "255700000999"]
     assert {c["template"] for c in calls} == {settings.WHATSAPP_HANDOFF_ALERT_TEMPLATE_NAME}
     body_params = calls[0]["components"][1]["parameters"]
-    assert customer.phone_number in body_params[1]["text"]
-    assert "no order exists" in body_params[0]["text"]
+    assert phone in body_params[1]["text"]
+    assert "no order behind it" in body_params[0]["text"]
+    assert "Chat handed to you" in body_params[0]["text"]
+    assert db_session.get(ConversationContext, context_id).state == ConversationState.HUMAN_HANDOFF
 
 
 @respx.mock
@@ -304,11 +322,7 @@ def test_task_stays_silent_with_no_numbers_on_file(
     owner.handoff_phone_number = None
     db_session.commit()
     monkeypatch.setattr(settings, "OPS_ALERT_PHONE", None)
-
-    async def _fake_judge(outbound_body, prior_paid):
-        return True
-
-    monkeypatch.setattr(claim_verification, "_judge_payment_claim", _fake_judge)
+    monkeypatch.setattr(claim_verification, "_judge_payment_claim", _judge_returning(_verdict()))
 
     async def _boom(self, *a, **kw):
         raise AssertionError("no send without recipients")
@@ -319,17 +333,14 @@ def test_task_stays_silent_with_no_numbers_on_file(
         claim_verification.verify_payment_claim(
             "whatsapp", str(account.id), customer.phone_number, "where is it?", OCT31_PHANTOMS[1],
         )
-        == "Flagged: merchant alerted (0 send(s))."
+        == "Flagged: handed off without recovery (no_terms), merchant alerted (0 send(s))."
     )
 
 
 def test_task_throttles_repeat_alerts_for_one_conversation(
     db_session, account, customer, context, monkeypatch
 ):
-    async def _fake_judge(outbound_body, prior_paid):
-        return True
-
-    monkeypatch.setattr(claim_verification, "_judge_payment_claim", _fake_judge)
+    monkeypatch.setattr(claim_verification, "_judge_payment_claim", _judge_returning(_verdict()))
     monkeypatch.setattr(settings, "OPS_ALERT_PHONE", None)
     owner = account.owner
     owner.username = "social-login-user"
@@ -337,11 +348,17 @@ def test_task_throttles_repeat_alerts_for_one_conversation(
     owner.handoff_phone_number = None
     db_session.commit()
 
+    phone = customer.phone_number
+    context_id = context.id
     first = claim_verification.verify_payment_claim(
-        "whatsapp", str(account.id), customer.phone_number, "where is it?", OCT31_PHANTOMS[1],
+        "whatsapp", str(account.id), phone, "where is it?", OCT31_PHANTOMS[1],
     )
+    # The first flag hands the chat off; reopen it so the second call
+    # reaches the throttle instead of the handoff skip.
+    db_session.get(ConversationContext, context_id).state = ConversationState.NEGOTIATING
+    db_session.commit()
     second = claim_verification.verify_payment_claim(
-        "whatsapp", str(account.id), customer.phone_number, "where is it?", OCT31_PHANTOMS[2],
+        "whatsapp", str(account.id), phone, "where is it?", OCT31_PHANTOMS[2],
     )
     assert first.startswith("Flagged:")
     assert second == "Throttled: already alerted for this conversation."
@@ -351,10 +368,7 @@ def test_task_throttles_repeat_alerts_for_one_conversation(
 def test_task_flags_instagram_phantom_with_at_identifier(
     db_session, ig_account, ig_customer, ig_context, monkeypatch
 ):
-    async def _fake_judge(outbound_body, prior_paid):
-        return True
-
-    monkeypatch.setattr(claim_verification, "_judge_payment_claim", _fake_judge)
+    monkeypatch.setattr(claim_verification, "_judge_payment_claim", _judge_returning(_verdict()))
     monkeypatch.setattr(settings, "OPS_ALERT_PHONE", None)
     calls = []
 
@@ -366,20 +380,44 @@ def test_task_flags_instagram_phantom_with_at_identifier(
         "app.core.provider.WhatsAppProvider.send_template", _fake_send_template
     )
 
+    ig_customer_id = str(ig_customer.id)
+    ig_context_id = ig_context.id
     result = claim_verification.verify_payment_claim(
-        "instagram", str(ig_account.id), str(ig_customer.id), "where is it?", OCT31_PHANTOMS[1],
+        "instagram", str(ig_account.id), ig_customer_id, "where is it?", OCT31_PHANTOMS[1],
     )
 
-    assert result == "Flagged: merchant alerted (1 send(s))."
+    assert result == "Flagged: handed off without recovery (no_terms), merchant alerted (1 send(s))."
     assert calls[0]["components"][1]["parameters"][1]["text"] == "@claimer"
+    assert (
+        db_session.get(InstagramConversationContext, ig_context_id).state
+        == ConversationState.HUMAN_HANDOFF
+    )
 
 
 # --- Judge ---
 
 
+_FULL_YES = "CLAIM: YES\nPRODUCT: Claim Plan\nPRICE: 100000\nCONSENT: YES\nPHONE: NONE"
+_FULL_YES_DICT = {"claim": True, "product": "Claim Plan", "price": 100000, "consent": True, "phone": None}
+_FULL_NO_DICT = {"claim": False, "product": None, "price": None, "consent": False, "phone": None}
+
+
 @pytest.mark.parametrize(
     "verdict,expected",
-    [("YES", True), ("yes", True), ("NO", False), ("No.", False), ("MAYBE", False), ("", False)],
+    [
+        (_FULL_YES, _FULL_YES_DICT),
+        ("claim: no\nproduct: none\nprice: none\nconsent: no\nphone: none", _FULL_NO_DICT),
+        # Reasoning-model narration around the five lines is tolerated.
+        ("Here is my verdict:\n" + _FULL_YES + "\nDone.", _FULL_YES_DICT),
+        ("CLAIM: YES\nPRODUCT: X\nPRICE: 100\nCONSENT: YES", None),  # missing PHONE
+        ("CLAIM: MAYBE\nPRODUCT: NONE\nPRICE: NONE\nCONSENT: YES\nPHONE: NONE", None),
+        (
+            "CLAIM: YES\nPRODUCT: X\nPRICE: 100,000\nCONSENT: YES\nPHONE: NONE",
+            {"claim": True, "product": "X", "price": 100000, "consent": True, "phone": None},
+        ),
+        ("CLAIM: YES\nPRODUCT: X\nPRICE: lots\nCONSENT: YES\nPHONE: NONE", None),
+        ("", None),
+    ],
 )
 def test_judge_parses_verdict_strictly(monkeypatch, verdict, expected):
     async def _fake_complete(provider, **kwargs):
@@ -387,38 +425,48 @@ def test_judge_parses_verdict_strictly(monkeypatch, verdict, expected):
 
     monkeypatch.setattr("app.services.llm._complete_with_retry", _fake_complete)
     monkeypatch.setattr(
-        "app.services.llm.llm_service",
-        type("FakeService", (), {"client": object(), "provider": object()})(),
+        "app.services.llm._default_llm_service",
+        lambda: type("FakeService", (), {"client": object(), "provider": object()})(),
     )
     import asyncio
 
-    assert asyncio.run(claim_verification._judge_payment_claim("It's on its way.", False)) is expected
+    assert (
+        asyncio.run(claim_verification._judge_payment_claim([("outbound", "It's on its way.")], False))
+        == expected
+    )
 
 
-def test_judge_fails_silent_without_a_client(monkeypatch):
-    monkeypatch.setattr("app.services.llm.llm_service", None)
+def test_judge_fails_closed_without_a_client(monkeypatch):
+    monkeypatch.setattr("app.services.llm._default_llm_service", lambda: None)
     import asyncio
 
-    assert asyncio.run(claim_verification._judge_payment_claim("It's on its way.", False)) is False
+    assert asyncio.run(claim_verification._judge_payment_claim([("outbound", "It's on its way.")], False)) is None
 
 
-def test_judge_receives_ground_truth_facts(monkeypatch):
+def test_judge_receives_ground_truth_facts_and_transcript(monkeypatch):
     seen = {}
 
     async def _fake_complete(provider, **kwargs):
         seen.update(kwargs)
-        return "NO"
+        return "CLAIM: NO\nPRODUCT: NONE\nPRICE: NONE\nCONSENT: NO\nPHONE: NONE"
 
     monkeypatch.setattr("app.services.llm._complete_with_retry", _fake_complete)
     monkeypatch.setattr(
-        "app.services.llm.llm_service",
-        type("FakeService", (), {"client": object(), "provider": object()})(),
+        "app.services.llm._default_llm_service",
+        lambda: type("FakeService", (), {"client": object(), "provider": object()})(),
     )
     import asyncio
 
-    asyncio.run(claim_verification._judge_payment_claim("Your payment went through!", True))
-    assert "LIVE_PENDING=no PRIOR_PAID=yes" in seen["messages"][0]["content"]
-    assert "YES or NO" in seen["system"]
+    asyncio.run(
+        claim_verification._judge_payment_claim(
+            [("inbound", "where is it?"), ("outbound", "Your payment went through!")], True
+        )
+    )
+    content = seen["messages"][0]["content"]
+    assert "LIVE_PENDING=no PRIOR_PAID=yes" in content
+    assert "buyer: where is it?" in content
+    assert "amara: Your payment went through!" in content
+    assert "CLAIM:" in seen["system"]
 
 
 # --- Fail-open and defensive branches ---
@@ -437,26 +485,23 @@ def test_throttle_fails_open_on_redis_outage(monkeypatch):
     assert claim_verification._throttle_set("k") is True
 
 
-def test_judge_fails_silent_when_complete_crashes(monkeypatch):
+def test_judge_fails_closed_when_complete_crashes(monkeypatch):
     async def _fake_complete(provider, **kwargs):
         raise RuntimeError("provider down")
 
     monkeypatch.setattr("app.services.llm._complete_with_retry", _fake_complete)
     monkeypatch.setattr(
-        "app.services.llm.llm_service",
-        type("FakeService", (), {"client": object(), "provider": object()})(),
+        "app.services.llm._default_llm_service",
+        lambda: type("FakeService", (), {"client": object(), "provider": object()})(),
     )
     import asyncio
 
-    assert asyncio.run(claim_verification._judge_payment_claim("It's on its way.", False)) is False
+    assert asyncio.run(claim_verification._judge_payment_claim([("outbound", "It's on its way.")], False)) is None
 
 
 @respx.mock
 def test_task_survives_alert_send_failure(db_session, account, customer, context, monkeypatch):
-    async def _fake_judge(outbound_body, prior_paid):
-        return True
-
-    monkeypatch.setattr(claim_verification, "_judge_payment_claim", _fake_judge)
+    monkeypatch.setattr(claim_verification, "_judge_payment_claim", _judge_returning(_verdict()))
     monkeypatch.setattr(settings, "OPS_ALERT_PHONE", None)
 
     async def _boom(self, *a, **kw):
@@ -468,16 +513,13 @@ def test_task_survives_alert_send_failure(db_session, account, customer, context
         claim_verification.verify_payment_claim(
             "whatsapp", str(account.id), customer.phone_number, "where is it?", OCT31_PHANTOMS[1],
         )
-        == "Flagged: merchant alerted (0 send(s))."
+        == "Flagged: handed off without recovery (no_terms), merchant alerted (0 send(s))."
     )
 
 
 @respx.mock
 def test_task_survives_alert_rejection(db_session, account, customer, context, monkeypatch):
-    async def _fake_judge(outbound_body, prior_paid):
-        return True
-
-    monkeypatch.setattr(claim_verification, "_judge_payment_claim", _fake_judge)
+    monkeypatch.setattr(claim_verification, "_judge_payment_claim", _judge_returning(_verdict()))
     monkeypatch.setattr(settings, "OPS_ALERT_PHONE", None)
 
     async def _fake_send_template(self, *a, **kw):
@@ -491,7 +533,7 @@ def test_task_survives_alert_rejection(db_session, account, customer, context, m
         claim_verification.verify_payment_claim(
             "whatsapp", str(account.id), customer.phone_number, "where is it?", OCT31_PHANTOMS[1],
         )
-        == "Flagged: merchant alerted (0 send(s))."
+        == "Flagged: handed off without recovery (no_terms), merchant alerted (0 send(s))."
     )
 
 
@@ -521,10 +563,7 @@ def test_task_missing_customer(db_session, account):
 
 
 def test_task_throttled_on_lost_set_race(db_session, account, customer, context, monkeypatch):
-    async def _fake_judge(outbound_body, prior_paid):
-        return True
-
-    monkeypatch.setattr(claim_verification, "_judge_payment_claim", _fake_judge)
+    monkeypatch.setattr(claim_verification, "_judge_payment_claim", _judge_returning(_verdict()))
     monkeypatch.setattr(claim_verification, "_throttle_hit", lambda key: False)
     monkeypatch.setattr(claim_verification, "_throttle_set", lambda key: False)
 
@@ -537,11 +576,11 @@ def test_task_throttled_on_lost_set_race(db_session, account, customer, context,
 
 
 @respx.mock
-def test_task_truncates_long_preview_in_alert(db_session, account, customer, context, monkeypatch):
-    async def _fake_judge(outbound_body, prior_paid):
-        return True
-
-    monkeypatch.setattr(claim_verification, "_judge_payment_claim", _fake_judge)
+@pytest.mark.parametrize("long", [False, True])
+def test_task_truncates_alert_copy_at_350(db_session, account, customer, context, monkeypatch, long):
+    monkeypatch.setattr(
+        claim_verification, "_judge_payment_claim", _judge_returning(_verdict(consent=False))
+    )
     monkeypatch.setattr(settings, "OPS_ALERT_PHONE", None)
     calls = []
 
@@ -553,15 +592,24 @@ def test_task_truncates_long_preview_in_alert(db_session, account, customer, con
         "app.core.provider.WhatsAppProvider.send_template", _fake_send_template
     )
 
-    long_phantom = "It's on its way to your phone, please approve it now. " * 10
+    phantom = (
+        "It's on its way to your phone, please approve it now. " * 10
+        if long
+        else OCT31_PHANTOMS[1]
+    )
     result = claim_verification.verify_payment_claim(
-        "whatsapp", str(account.id), customer.phone_number, "where is it?", long_phantom,
+        "whatsapp", str(account.id), customer.phone_number, "where is it?", phantom,
     )
 
-    assert result == "Flagged: merchant alerted (1 send(s))."
+    assert result == "Flagged: handed off without recovery (no_consent), merchant alerted (1 send(s))."
     flagged_text = calls[0][1]["parameters"][0]["text"]
-    assert long_phantom not in flagged_text
-    assert '...". Check the chat.' in flagged_text
+    if long:
+        assert phantom not in flagged_text
+        assert len(flagged_text) <= 350
+        assert flagged_text.endswith("...")
+    else:
+        assert phantom in flagged_text
+        assert flagged_text.endswith('".')
 
 
 @respx.mock
@@ -793,10 +841,7 @@ def test_whatsapp_pipeline_enqueues_verify_and_alerts_on_phantom(
     class FakeLLMService:
         generate_response = staticmethod(fake_generate_response)
 
-    async def _fake_judge(outbound_body, prior_paid):
-        return True
-
-    monkeypatch.setattr(claim_verification, "_judge_payment_claim", _fake_judge)
+    monkeypatch.setattr(claim_verification, "_judge_payment_claim", _judge_returning(_verdict()))
     monkeypatch.setattr(webhook_processing, "SessionLocal", lambda: db_session)
     monkeypatch.setattr(settings, "OPS_ALERT_PHONE", None)
     calls = []
@@ -852,10 +897,7 @@ def test_instagram_pipeline_enqueues_verify_and_alerts_on_phantom(
         async def send_direct_message(self, ig_business_id, recipient_id, message):
             return {"message_id": "mid_out_claim1"}
 
-    async def _fake_judge(outbound_body, prior_paid):
-        return True
-
-    monkeypatch.setattr(claim_verification, "_judge_payment_claim", _fake_judge)
+    monkeypatch.setattr(claim_verification, "_judge_payment_claim", _judge_returning(_verdict()))
     monkeypatch.setattr(dm_processing, "SessionLocal", lambda: db_session)
     monkeypatch.setattr(dm_processing, "InstagramProvider", FakeProvider)
     monkeypatch.setattr(settings, "OPS_ALERT_PHONE", None)
@@ -880,3 +922,480 @@ def test_instagram_pipeline_enqueues_verify_and_alerts_on_phantom(
 
     assert result == "Processed."
     assert calls == ["255700000910"]
+
+
+# --- #120: actionable flags (handoff + recover-from-terms) ---
+
+
+@respx.mock
+def test_task_recovers_order_from_terms_and_alerts(
+    db_session, account, customer, context, product, owner, monkeypatch
+):
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "t"}))
+    respx.post(PAYMENT_URL).mock(
+        return_value=httpx.Response(200, json={"statusCode": 202, "success": True, "transactionID": "TXN9"})
+    )
+    monkeypatch.setattr("app.services.llm.llm_service", LLMService(api_key=None))
+    monkeypatch.setattr(
+        claim_verification,
+        "_judge_payment_claim",
+        _judge_returning(_verdict(product="Claim Plan", price=100000)),
+    )
+    monkeypatch.setattr(settings, "OPS_ALERT_PHONE", None)
+    calls = []
+
+    async def _fake_send_template(self, to, template, language_code=None, components=None):
+        calls.append(components)
+        return {"messages": [{"id": "wamid.alert.recovered"}]}
+
+    monkeypatch.setattr(
+        "app.core.provider.WhatsAppProvider.send_template", _fake_send_template
+    )
+
+    customer_id = customer.id
+    context_id = context.id
+    owner_id = owner.id
+    result = claim_verification.verify_payment_claim(
+        "whatsapp", str(account.id), customer.phone_number, "Lets do this", OCT31_PHANTOMS[0],
+    )
+
+    assert result == "Flagged: recovered Claim Plan order, merchant alerted (1 send(s))."
+    fresh = db_session.query(Order).filter_by(customer_id=customer_id).one()
+    assert fresh.status == OrderStatus.PENDING
+    assert fresh.agreed_price == 100000
+    assert db_session.get(ConversationContext, context_id).state == ConversationState.HUMAN_HANDOFF
+    copy = calls[0][1]["parameters"][0]["text"]
+    assert "recreated it" in copy
+    assert "TZS 100,000" in copy
+    now = datetime.utcnow()
+    assert (
+        usage_service.count_events(
+            db_session, owner_id, AmaraEventKind.HANDOFF,
+            now - timedelta(hours=1), now + timedelta(hours=1),
+        )
+        == 1
+    )
+
+
+@respx.mock
+def test_task_handoff_only_when_no_consent(db_session, account, customer, context, monkeypatch):
+    monkeypatch.setattr(
+        claim_verification, "_judge_payment_claim", _judge_returning(_verdict(consent=False))
+    )
+    monkeypatch.setattr(settings, "OPS_ALERT_PHONE", None)
+
+    async def _fake_send_template(self, *a, **kw):
+        return {"messages": [{"id": "wamid.alert.noconsent"}]}
+
+    monkeypatch.setattr(
+        "app.core.provider.WhatsAppProvider.send_template", _fake_send_template
+    )
+
+    customer_id = customer.id
+    context_id = context.id
+    assert (
+        claim_verification.verify_payment_claim(
+            "whatsapp", str(account.id), customer.phone_number, "stop", OCT31_PHANTOMS[1],
+        )
+        == "Flagged: handed off without recovery (no_consent), merchant alerted (1 send(s))."
+    )
+    assert db_session.query(Order).filter_by(customer_id=customer_id).count() == 0
+    assert db_session.get(ConversationContext, context_id).state == ConversationState.HUMAN_HANDOFF
+
+
+@respx.mock
+def test_task_handoff_only_when_product_unknown(
+    db_session, account, customer, context, product, monkeypatch
+):
+    monkeypatch.setattr(
+        claim_verification,
+        "_judge_payment_claim",
+        _judge_returning(_verdict(product="Ghost", price=50000)),
+    )
+    monkeypatch.setattr(settings, "OPS_ALERT_PHONE", None)
+    calls = []
+
+    async def _fake_send_template(self, to, template, language_code=None, components=None):
+        calls.append(components)
+        return {"messages": [{"id": "wamid.alert.unknown"}]}
+
+    monkeypatch.setattr(
+        "app.core.provider.WhatsAppProvider.send_template", _fake_send_template
+    )
+
+    customer_id = customer.id
+    result = claim_verification.verify_payment_claim(
+        "whatsapp", str(account.id), customer.phone_number, "Lets do this", OCT31_PHANTOMS[0],
+    )
+
+    assert result == "Flagged: handed off without recovery (no_terms), merchant alerted (1 send(s))."
+    assert "no product matching 'Ghost'" in calls[0][1]["parameters"][0]["text"]
+    assert db_session.query(Order).filter_by(customer_id=customer_id).count() == 0
+
+
+@respx.mock
+def test_task_handoff_only_when_price_outside_band(
+    db_session, account, customer, context, product, monkeypatch
+):
+    monkeypatch.setattr(
+        claim_verification,
+        "_judge_payment_claim",
+        _judge_returning(_verdict(product="Claim Plan", price=50000)),
+    )
+    monkeypatch.setattr(settings, "OPS_ALERT_PHONE", None)
+    calls = []
+
+    async def _fake_send_template(self, to, template, language_code=None, components=None):
+        calls.append(components)
+        return {"messages": [{"id": "wamid.alert.band"}]}
+
+    monkeypatch.setattr(
+        "app.core.provider.WhatsAppProvider.send_template", _fake_send_template
+    )
+
+    customer_id = customer.id
+    result = claim_verification.verify_payment_claim(
+        "whatsapp", str(account.id), customer.phone_number, "Lets do this", OCT31_PHANTOMS[0],
+    )
+
+    assert result == "Flagged: handed off without recovery (no_terms), merchant alerted (1 send(s))."
+    assert "outside 'Claim Plan' band" in calls[0][1]["parameters"][0]["text"]
+    assert db_session.query(Order).filter_by(customer_id=customer_id).count() == 0
+
+
+@respx.mock
+def test_task_handoff_only_when_intent_disagrees(
+    db_session, account, customer, context, product, monkeypatch
+):
+    context.current_product_intent = "Other Plan"
+    db_session.commit()
+    monkeypatch.setattr(
+        claim_verification,
+        "_judge_payment_claim",
+        _judge_returning(_verdict(product="Claim Plan", price=100000)),
+    )
+    monkeypatch.setattr(settings, "OPS_ALERT_PHONE", None)
+    calls = []
+
+    async def _fake_send_template(self, to, template, language_code=None, components=None):
+        calls.append(components)
+        return {"messages": [{"id": "wamid.alert.intent"}]}
+
+    monkeypatch.setattr(
+        "app.core.provider.WhatsAppProvider.send_template", _fake_send_template
+    )
+
+    customer_id = customer.id
+    result = claim_verification.verify_payment_claim(
+        "whatsapp", str(account.id), customer.phone_number, "Lets do this", OCT31_PHANTOMS[0],
+    )
+
+    assert result == "Flagged: handed off without recovery (no_terms), merchant alerted (1 send(s))."
+    assert "disagrees" in calls[0][1]["parameters"][0]["text"]
+    assert db_session.query(Order).filter_by(customer_id=customer_id).count() == 0
+
+
+@respx.mock
+def test_task_handoff_when_judge_unavailable(db_session, account, customer, context, monkeypatch):
+    monkeypatch.setattr(claim_verification, "_judge_payment_claim", _judge_returning(None))
+    monkeypatch.setattr(settings, "OPS_ALERT_PHONE", None)
+    calls = []
+
+    async def _fake_send_template(self, to, template, language_code=None, components=None):
+        calls.append(components)
+        return {"messages": [{"id": "wamid.alert.judgedown"}]}
+
+    monkeypatch.setattr(
+        "app.core.provider.WhatsAppProvider.send_template", _fake_send_template
+    )
+
+    context_id = context.id
+    result = claim_verification.verify_payment_claim(
+        "whatsapp", str(account.id), customer.phone_number, "where is it?", OCT31_PHANTOMS[1],
+    )
+
+    assert result == (
+        "Flagged: handed off without recovery (judge_unavailable), merchant alerted (1 send(s))."
+    )
+    assert "checker was down" in calls[0][1]["parameters"][0]["text"]
+    assert db_session.get(ConversationContext, context_id).state == ConversationState.HUMAN_HANDOFF
+
+
+@respx.mock
+def test_task_recovers_instagram_order_with_buyer_phone(
+    db_session, ig_account, ig_customer, ig_context, product, monkeypatch
+):
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "t"}))
+    respx.post(PAYMENT_URL).mock(
+        return_value=httpx.Response(200, json={"statusCode": 202, "success": True, "transactionID": "TXN10"})
+    )
+    monkeypatch.setattr("app.services.llm.llm_service", LLMService(api_key=None))
+    monkeypatch.setattr(
+        claim_verification,
+        "_judge_payment_claim",
+        _judge_returning(_verdict(product="Claim Plan", price=100000, phone="255722221111")),
+    )
+    monkeypatch.setattr(settings, "OPS_ALERT_PHONE", None)
+
+    async def _fake_send_template(self, *a, **kw):
+        return {"messages": [{"id": "wamid.alert.igrecovered"}]}
+
+    monkeypatch.setattr(
+        "app.core.provider.WhatsAppProvider.send_template", _fake_send_template
+    )
+
+    ig_customer_id = ig_customer.id
+    ig_context_id = ig_context.id
+    result = claim_verification.verify_payment_claim(
+        "instagram", str(ig_account.id), str(ig_customer_id), "tuma ombi", OCT31_PHANTOMS[0],
+    )
+
+    assert result == "Flagged: recovered Claim Plan order, merchant alerted (1 send(s))."
+    fresh = db_session.query(Order).filter_by(instagram_customer_id=ig_customer_id).one()
+    assert fresh.status == OrderStatus.PENDING
+    assert (
+        db_session.get(InstagramConversationContext, ig_context_id).state
+        == ConversationState.HUMAN_HANDOFF
+    )
+
+
+@respx.mock
+@pytest.mark.parametrize("phone", [None, "abc"])
+def test_task_instagram_handoff_only_without_phone(
+    db_session, ig_account, ig_customer, ig_context, product, monkeypatch, phone
+):
+    monkeypatch.setattr(
+        claim_verification,
+        "_judge_payment_claim",
+        _judge_returning(_verdict(product="Claim Plan", price=100000, phone=phone)),
+    )
+    monkeypatch.setattr(settings, "OPS_ALERT_PHONE", None)
+
+    async def _fake_send_template(self, *a, **kw):
+        return {"messages": [{"id": "wamid.alert.igonophone"}]}
+
+    monkeypatch.setattr(
+        "app.core.provider.WhatsAppProvider.send_template", _fake_send_template
+    )
+
+    ig_customer_id = ig_customer.id
+    assert (
+        claim_verification.verify_payment_claim(
+            "instagram", str(ig_account.id), str(ig_customer_id), "tuma ombi", OCT31_PHANTOMS[0],
+        )
+        == "Flagged: handed off without recovery (no_phone), merchant alerted (1 send(s))."
+    )
+    assert db_session.query(Order).filter_by(instagram_customer_id=ig_customer_id).count() == 0
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "reason,snippet",
+    [("out_of_stock", "out of stock"), ("weird", "Recovery failed")],
+)
+def test_task_recovery_failure_maps_reason(
+    db_session, account, customer, context, product, monkeypatch, reason, snippet
+):
+    async def _fake_close(db, parties, prod, price):
+        return None, reason
+
+    monkeypatch.setattr("app.services.payment_resend.close_deal_from_terms", _fake_close)
+    monkeypatch.setattr(
+        claim_verification,
+        "_judge_payment_claim",
+        _judge_returning(_verdict(product="Claim Plan", price=100000)),
+    )
+    monkeypatch.setattr(settings, "OPS_ALERT_PHONE", None)
+    calls = []
+
+    async def _fake_send_template(self, to, template, language_code=None, components=None):
+        calls.append(components)
+        return {"messages": [{"id": "wamid.alert.failmap"}]}
+
+    monkeypatch.setattr(
+        "app.core.provider.WhatsAppProvider.send_template", _fake_send_template
+    )
+
+    result = claim_verification.verify_payment_claim(
+        "whatsapp", str(account.id), customer.phone_number, "Lets do this", OCT31_PHANTOMS[0],
+    )
+
+    assert result == (
+        f"Flagged: handed off without recovery (recover_{reason}), merchant alerted (1 send(s))."
+    )
+    assert snippet in calls[0][1]["parameters"][0]["text"]
+
+
+@respx.mock
+def test_task_survives_handoff_reminder_schedule_failure(
+    db_session, account, customer, context, monkeypatch
+):
+    monkeypatch.setattr(
+        claim_verification, "_judge_payment_claim", _judge_returning(_verdict(consent=False))
+    )
+    monkeypatch.setattr(settings, "OPS_ALERT_PHONE", None)
+
+    def _boom(*a, **kw):
+        raise RuntimeError("broker down")
+
+    monkeypatch.setattr(
+        "app.tasks.handoff_reminders.send_handoff_reminder.apply_async", _boom
+    )
+
+    async def _fake_send_template(self, *a, **kw):
+        return {"messages": [{"id": "wamid.alert.remfail"}]}
+
+    monkeypatch.setattr(
+        "app.core.provider.WhatsAppProvider.send_template", _fake_send_template
+    )
+
+    assert (
+        claim_verification.verify_payment_claim(
+            "whatsapp", str(account.id), customer.phone_number, "stop", OCT31_PHANTOMS[1],
+        )
+        == "Flagged: handed off without recovery (no_consent), merchant alerted (1 send(s))."
+    )
+
+
+def test_recent_history_whatsapp_filters_orders_and_caps(db_session, account, customer):
+    base = datetime(2026, 1, 1, 12, 0, 0)
+    for i in range(8):
+        inbound = i % 2 == 0
+        db_session.add(
+            Message(
+                account_id=account.id,
+                direction="inbound" if inbound else "outbound",
+                from_phone=customer.phone_number if inbound else "255700000001",
+                to_phone="255700000001" if inbound else customer.phone_number,
+                type="text",
+                body=f"turn {i}",
+                timestamp=base + timedelta(minutes=i),
+            )
+        )
+    # Same buyer, trunk-prefix format — must still match.
+    db_session.add(
+        Message(
+            account_id=account.id,
+            direction="inbound",
+            from_phone="0722229999",
+            to_phone="255700000001",
+            type="text",
+            body="trunk format",
+            timestamp=base + timedelta(minutes=8),
+        )
+    )
+    # Noise: another buyer, and a non-text row.
+    db_session.add(
+        Message(
+            account_id=account.id,
+            direction="inbound",
+            from_phone="255700000002",
+            to_phone="255700000001",
+            type="text",
+            body="stranger",
+            timestamp=base + timedelta(minutes=9),
+        )
+    )
+    db_session.add(
+        Message(
+            account_id=account.id,
+            direction="inbound",
+            from_phone=customer.phone_number,
+            to_phone="255700000001",
+            type="image",
+            body="[image]",
+            timestamp=base + timedelta(minutes=10),
+        )
+    )
+    db_session.commit()
+
+    history = claim_verification._recent_history(db_session, "whatsapp", account.id, customer, None)
+
+    assert [body for _, body in history] == [f"turn {i}" for i in range(3, 8)] + ["trunk format"]
+    assert [direction for direction, _ in history] == [
+        "outbound", "inbound", "outbound", "inbound", "outbound", "inbound",
+    ]
+
+
+def test_recent_history_instagram_chronological(db_session, ig_account, ig_customer):
+    other = InstagramCustomer(ig_scoped_id="igsid_other", username="other", account_id=ig_account.id)
+    db_session.add(other)
+    db_session.commit()
+    base = datetime(2026, 1, 1, 12, 0, 0)
+    bodies = ["hello?", "still waiting", "tuma ombi"]
+    for i, body in enumerate(bodies):
+        db_session.add(
+            InstagramDirectMessage(
+                account_id=ig_account.id,
+                customer_id=ig_customer.id,
+                direction="inbound",
+                body=body,
+                created_at=base + timedelta(minutes=i),
+            )
+        )
+    db_session.add(
+        InstagramDirectMessage(
+            account_id=ig_account.id,
+            customer_id=ig_customer.id,
+            direction="inbound",
+            body=None,
+            created_at=base + timedelta(minutes=9),
+        )
+    )
+    db_session.add(
+        InstagramDirectMessage(
+            account_id=ig_account.id,
+            customer_id=other.id,
+            direction="inbound",
+            body="someone else",
+            created_at=base + timedelta(minutes=10),
+        )
+    )
+    db_session.commit()
+
+    history = claim_verification._recent_history(db_session, "instagram", ig_account.id, ig_customer, None)
+
+    assert history == [("inbound", body) for body in bodies]
+
+
+def test_recent_history_falls_back_to_outbound_body(db_session, account, customer):
+    assert claim_verification._recent_history(
+        db_session, "whatsapp", account.id, customer, "fallback reply"
+    ) == [("outbound", "fallback reply")]
+    assert claim_verification._recent_history(db_session, "whatsapp", account.id, customer, None) == []
+
+
+def test_resolve_terms_defaults_price_to_max(db_session, account, context, product):
+    resolved, price, why = claim_verification._resolve_terms(
+        db_session, account, context, _verdict(product="Claim Plan", price=None)
+    )
+    assert why is None
+    assert resolved.id == product.id
+    assert price == 100000
+
+
+def test_resolve_terms_rejects_duplicate_names(db_session, account, context, product, owner):
+    db_session.add(
+        Product(
+            slug="claim-plan-2", name="Claim Plan", max_price=90000, min_price=90000,
+            quantity=0, merchant_id=owner.id,
+        )
+    )
+    db_session.commit()
+
+    resolved, price, why = claim_verification._resolve_terms(
+        db_session, account, context, _verdict(product="Claim Plan", price=100000)
+    )
+    assert (resolved, price) == (None, None)
+    assert "multiple" in why
+
+
+def test_resolve_terms_ignores_drafts(db_session, account, context, product):
+    product.is_draft = True
+    db_session.commit()
+
+    resolved, price, why = claim_verification._resolve_terms(
+        db_session, account, context, _verdict(product="Claim Plan", price=100000)
+    )
+    assert (resolved, price) == (None, None)
+    assert "no product matching" in why

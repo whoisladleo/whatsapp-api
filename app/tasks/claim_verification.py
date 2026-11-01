@@ -1,19 +1,24 @@
 import logging
 import re
+from datetime import datetime
 
 from app.core.celery_app import celery_app
 from app.core.config import settings
 from app.core.ids import coerce_uuid
 from app.core.security import normalize_phone
 from app.db.models import (
+    AmaraEventKind,
     ConversationContext,
     ConversationState,
     Customer,
     InstagramAccount,
     InstagramConversationContext,
     InstagramCustomer,
+    InstagramDirectMessage,
+    Message,
     Order,
     OrderStatus,
+    Product,
     WhatsAppAccount,
 )
 from app.db.session import SessionLocal
@@ -38,24 +43,59 @@ PAYMENT_TOKEN_RE = re.compile(
 # overnight for the same missing order.
 CLAIM_THROTTLE_TTL_SECONDS = 6 * 3600
 
-_JUDGE_SYSTEM = """You are a payment-claim auditor for a sales chatbot. You get ground truth about the customer's orders plus one outbound message. Answer whether the message claims a payment is already underway.
+_JUDGE_SYSTEM = """You are a payment-claim auditor for a sales chatbot. You get ground truth about the customer's orders plus the last few messages of the conversation (oldest first, ending with Amara's latest reply). Answer five questions about that latest reply.
 
-Ground truth arrives as two facts: LIVE_PENDING (a payment request currently awaiting approval) and PRIOR_PAID (an older completed payment).
+Ground truth arrives as two facts: LIVE_PENDING (a payment request currently awaiting approval) and PRIOR_PAID (an older completed payment). Here LIVE_PENDING is always no.
 
-A claim is YES when the message says a payment request was already sent or is on its way, or presupposes one is in flight ("once you approve it", "after you approve"). It is NO when the message only talks about future or conditional payment ("once you agree, a request will be sent", "you can pay by mobile money"), explains prices, asks for a phone number, reports a payment failure, or confirms an already-completed payment while PRIOR_PAID is yes.
+Reply with exactly these five lines and nothing else:
+CLAIM: YES if Amara's latest reply says a payment request was already sent or is on its way, or presupposes one is in flight ("once you approve it", "after you approve"). NO if it only talks about future or conditional payment ("once you agree, a request will be sent", "you can pay by mobile money"), explains prices, asks for a phone number, reports a payment failure, or confirms an already-completed payment while PRIOR_PAID is yes.
+PRODUCT: the product or plan name this payment is for, exactly as Amara named it anywhere in these messages, or NONE if no product is named.
+PRICE: the total TZS amount the buyer would pay, digits only with no commas or decimals, or NONE if no amount is stated. For a monthly plan, give the monthly amount.
+CONSENT: YES if the buyer agreed to buy ("lets do this", "yes", "I want it") or asked for / chased the payment ("I'm waiting for the payment request", "I still did not get it"). NO if there is no agreement or request, or the buyer refused, cancelled, or asked to stop.
+PHONE: a phone number the buyer gave in their messages, digits only, or NONE.
 
-Examples (each shows ground truth, then the message, then the verdict):
-LIVE_PENDING=no PRIOR_PAID=no / "You'll get a mobile-money payment request on your phone shortly — just approve it." / YES
-LIVE_PENDING=no PRIOR_PAID=no / "It's on its way to your phone — just approve the mobile-money prompt." / YES
-LIVE_PENDING=no PRIOR_PAID=no / "Ombi la malipo limetumwa kwenye simu yako — tafadhali liidhinishe." / YES
-LIVE_PENDING=no PRIOR_PAID=no / "Once you approve it, I'll be live on your shop right away." / YES
-LIVE_PENDING=no PRIOR_PAID=no / "Once you agree, a payment request will be sent to your phone for approval." / NO
-LIVE_PENDING=no PRIOR_PAID=no / "The plan is TZS 100,000 per month, no commission on your sales." / NO
-LIVE_PENDING=no PRIOR_PAID=no / "Sorry, the payment could not be sent — someone from our team will help." / NO
-LIVE_PENDING=no PRIOR_PAID=no / "Tuma namba yako ya simu ili nikutumie ombi la malipo." / NO
-LIVE_PENDING=no PRIOR_PAID=yes / "Your payment went through — you're live!" / NO
+Examples (each shows the message slice, then the verdict):
+buyer: Lets do this
+amara: Perfect — you're in! Confirming: Taskflow Entry Plan at TZS 100,000/month, full payment, billed monthly. You'll get a mobile-money payment request on your phone shortly — just approve it.
+CLAIM: YES
+PRODUCT: Taskflow Entry Plan
+PRICE: 100000
+CONSENT: YES
+PHONE: NONE
 
-Reply with exactly one word: YES or NO."""
+buyer: Lets do this
+amara: Perfect — you're in! Confirming: Taskflow Entry Plan at TZS 100,000/month. You'll get a payment request shortly.
+buyer: Hello i still did not get it
+amara: You're welcome! Just shout if that payment request still hasn't shown up.
+CLAIM: YES
+PRODUCT: Taskflow Entry Plan
+PRICE: 100000
+CONSENT: YES
+PHONE: NONE
+
+buyer: Tuma kwa 0712345678
+amara: Sawa! Ombi la malipo la TZS 50,000 la Widget limetumwa kwenye simu yako — tafadhali liidhinishe.
+CLAIM: YES
+PRODUCT: Widget
+PRICE: 50000
+CONSENT: YES
+PHONE: 0712345678
+
+buyer: Actually stop, I changed my mind
+amara: It's on its way to your phone — just approve the mobile-money prompt.
+CLAIM: YES
+PRODUCT: NONE
+PRICE: NONE
+CONSENT: NO
+PHONE: NONE
+
+buyer: Bei gani?
+amara: The Taskflow Entry Plan is TZS 100,000 per month, no commission. Once you agree, a payment request will be sent to your phone.
+CLAIM: NO
+PRODUCT: Taskflow Entry Plan
+PRICE: 100000
+CONSENT: NO
+PHONE: NONE"""
 
 
 def _has_payment_tokens(text: str | None) -> bool:
@@ -112,41 +152,216 @@ def _throttle_set(key: str) -> bool:
         return True
 
 
-async def _judge_payment_claim(outbound_body: str, prior_paid: bool) -> bool:
+def _parse_verdict(text: str) -> dict | None:
     """
-    LLM verdict on the one question the exact filters can't answer: does
-    this outbound text claim a payment is already underway? Fail-silent
-    (False) on any failure — an unjudgeable message must never page a
-    merchant, and the judge running at all means no live order exists, so
-    "unknown" can only be a false negative, never a false accusation.
+    Parses the judge's five-line verdict into a dict, or None on garbage.
+    Lenient about extra lines (reasoning models narrate), strict about
+    the five values: CLAIM/CONSENT must be YES/NO, PRICE digits or NONE.
     """
-    from app.services.llm import _complete_with_retry, llm_service
+    fields: dict = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition(":")
+        if not sep:
+            continue
+        key = key.strip().upper()
+        if key in ("CLAIM", "PRODUCT", "PRICE", "CONSENT", "PHONE"):
+            fields[key] = value.strip()
+    if set(fields) != {"CLAIM", "PRODUCT", "PRICE", "CONSENT", "PHONE"}:
+        logger.warning(f"Claim judge verdict missing fields: {sorted(fields)}")
+        return None
+    claim = fields["CLAIM"].rstrip(".").upper()
+    consent = fields["CONSENT"].rstrip(".").upper()
+    if claim not in ("YES", "NO") or consent not in ("YES", "NO"):
+        logger.warning(f"Claim judge verdict has bad flags: {claim}/{consent}")
+        return None
+    price = None
+    if fields["PRICE"].upper() != "NONE":
+        digits = fields["PRICE"].replace(",", "").replace(" ", "")
+        if not digits.isdigit():
+            logger.warning(f"Claim judge verdict has bad price: {fields['PRICE']!r}")
+            return None
+        price = int(digits)
+    return {
+        "claim": claim == "YES",
+        "product": None if fields["PRODUCT"].upper() == "NONE" else fields["PRODUCT"],
+        "price": price,
+        "consent": consent == "YES",
+        "phone": None if fields["PHONE"].upper() == "NONE" else fields["PHONE"],
+    }
 
-    if llm_service is None or llm_service.client is None:
-        return False
+
+async def _judge_payment_claim(history: list, prior_paid: bool) -> dict | None:
+    """
+    LLM verdict over a conversation slice (oldest first, ending with
+    Amara's latest reply): is a payment claimed, and — for recovery —
+    what terms did the buyer agree to? Returns None on any failure
+    (judge down, unparseable): the caller hands off and alerts on None,
+    because the Oct 31 incident proved a silent checker costs more than
+    a cautious handoff — the merchant resolves it with one tap.
+    Uses the raw completion path, never delegation, so the judge can
+    never route, act, or spend.
+
+    Builds a fresh client per call instead of reusing the shared
+    llm_service: the shared SDK client holds a connection pool, and this
+    task runs each call inside its own asyncio.run, so every other call
+    reuses a pooled connection bound to an already-closed loop and dies
+    with "Event loop is closed" (measured 5/10 alternating failures on
+    the muse provider). A per-call client costs one connection setup and
+    is immune. The reply path has the same latent flaw on rapid
+    back-to-back turns — tracked separately, out of #120's scope.
+    """
+    from app.services.llm import _complete_with_retry, _default_llm_service
+
+    service = _default_llm_service()
+    if service is None or service.client is None:
+        return None
+    transcript = "\n".join(
+        f"{'buyer' if direction == 'inbound' else 'amara'}: {body}"
+        for direction, body in history
+    )
     content = (
-        f"LIVE_PENDING=no PRIOR_PAID={'yes' if prior_paid else 'no'}\n"
-        f'"{outbound_body}"'
+        f"LIVE_PENDING=no PRIOR_PAID={'yes' if prior_paid else 'no'}\n{transcript}"
     )
     try:
-        # Generous cap for a one-word verdict: reasoning tokens share the
-        # budget on both providers, and a length stop here degrades to a
-        # false negative (fail-silent), so starving the judge is the one
-        # thing this call must not do.
+        # Generous cap for a five-line verdict: reasoning tokens share the
+        # budget on both providers, and a length stop here degrades to
+        # handoff-without-recovery, so starving the judge is the one thing
+        # this call must not do.
         text = await _complete_with_retry(
-            llm_service.provider,
+            service.provider,
             system=_JUDGE_SYSTEM,
             messages=[{"role": "user", "content": content}],
             max_tokens=300,
         )
     except Exception as e:
-        logger.warning(f"Payment-claim judge unavailable; skipping: {e}")
-        return False
-    tokens = (text or "").strip().upper().split()
-    if not tokens or tokens[0] not in ("YES", "NO"):
-        logger.warning(f"Payment-claim judge returned unparseable verdict: {text!r}")
-        return False
-    return tokens[0] == "YES"
+        logger.warning(f"Payment-claim judge unavailable; handing off: {e}")
+        return None
+    if not (text or "").strip():
+        logger.warning("Payment-claim judge returned empty response")
+        return None
+    return _parse_verdict(text)
+
+
+def _recent_history(db, channel: str, account_uuid, customer, outbound_fallback: str | None) -> list:
+    """
+    Last few turns of this conversation, oldest first, for the judge.
+    A phantom reassurance ("it's on its way", chasing a payment the
+    buyer asked about two turns ago) is only recognizable — and only
+    recoverable — with the surrounding turns in view.
+    """
+    rows: list = []
+    if channel == "whatsapp":
+        # Both sides normalized: stored rows and the customer row disagree
+        # on trunk-prefix format often enough ("0712…" vs "255712…") that
+        # an exact SQL match would drop turns.
+        want = normalize_phone(customer.phone_number)
+        candidates = (
+            db.query(Message)
+            .filter(
+                Message.account_id == account_uuid,
+                Message.type == "text",
+                Message.body.isnot(None),
+            )
+            .order_by(Message.timestamp.desc())
+            .limit(60)
+            .all()
+        )
+        for row in candidates:
+            other = row.from_phone if row.direction == "inbound" else row.to_phone
+            if normalize_phone(other) == want:
+                rows.append(row)
+            if len(rows) == 6:
+                break
+        rows.reverse()
+    else:
+        rows = list(
+            reversed(
+                db.query(InstagramDirectMessage)
+                .filter(
+                    InstagramDirectMessage.customer_id == customer.id,
+                    InstagramDirectMessage.body.isnot(None),
+                )
+                .order_by(InstagramDirectMessage.created_at.desc())
+                .limit(6)
+                .all()
+            )
+        )
+    history = [(row.direction, (row.body or "")[:500]) for row in rows if (row.body or "").strip()]
+    if not history and (outbound_fallback or "").strip():
+        history = [("outbound", outbound_fallback.strip()[:500])]
+    return history
+
+
+def _handoff_conversation(db, channel: str, account, context) -> None:
+    """
+    Pauses Amara on a flagged chat: the same state flip + HANDOFF ledger
+    entry the model's own [HUMAN_HANDOFF] uses (see
+    LLMService._trigger_human_handoff), minus its merchant alert — the
+    caller sends one combined alert covering flag and handoff together.
+    """
+    from app.services import usage as usage_service
+
+    context.state = ConversationState.HUMAN_HANDOFF
+    context.handoff_at = datetime.utcnow()
+    db.commit()
+    if channel == "whatsapp":
+        usage_service.record_event(
+            db, account.user_id, AmaraEventKind.HANDOFF, channel="whatsapp", account_id=account.id
+        )
+        from app.tasks.handoff_reminders import (
+            HANDOFF_REMINDER_DELAY_SECONDS,
+            send_handoff_reminder,
+        )
+
+        try:
+            send_handoff_reminder.apply_async(
+                args=[str(context.id)], countdown=HANDOFF_REMINDER_DELAY_SECONDS
+            )
+        except Exception as sched_err:
+            logger.error(f"Failed to schedule handoff reminder: {sched_err}")
+    else:
+        usage_service.record_event(
+            db,
+            account.user_id,
+            AmaraEventKind.HANDOFF,
+            channel="instagram_dm",
+            instagram_account_id=account.id,
+        )
+
+
+def _resolve_terms(db, account, context, verdict: dict):
+    """
+    Turns the judge's extracted product + price into a real (product,
+    price) pair, or (None, None, why-not) for the merchant alert. Every
+    check biases toward refusing: an auto-recovery that charges for the
+    wrong thing is worse than a handoff the merchant resolves by hand.
+    """
+    name = verdict["product"]
+    if not name:
+        return None, None, "no product named in the chat"
+    matches = (
+        db.query(Product)
+        .filter(
+            Product.merchant_id == account.user_id,
+            Product.is_draft.is_(False),
+            Product.name.ilike(name),
+        )
+        .all()
+    )
+    if not matches:
+        return None, None, f"no product matching '{name}'"
+    if len(matches) > 1:
+        return None, None, f"multiple products matching '{name}'"
+    product = matches[0]
+    intent = getattr(context, "current_product_intent", None)
+    if intent and intent.lower() != product.name.lower():
+        return None, None, f"chat intent ({intent}) disagrees"
+    price = verdict["price"]
+    if price is None:
+        price = int(product.max_price)
+    elif not (product.min_price <= price <= product.max_price):
+        return None, None, f"TZS {price:,} outside '{product.name}' band"
+    return product, price, None
 
 
 def _alert_components(identifier: str, message: str) -> list:
@@ -178,13 +393,16 @@ async def _alert_merchant(identifier: str, message: str, owner, alert_target: di
     never has an open 24h session with the platform number, so this must
     be the approved template, not free text — see usage_alerts for the
     same pattern). Each send arms tap-to-reply onto the flagged
-    conversation. Alert-only: unlike a handoff, this flips no
-    conversation state and schedules no reminder nudge. Returns the
-    number of sends accepted by Meta.
+    conversation. This is the handoff alert, not a side note: the caller
+    already flipped the conversation to HUMAN_HANDOFF before calling.
+    Returns the number of sends accepted by Meta.
     """
     from app.core.provider import WhatsAppProvider
     from app.crud import user as crud_user
     from app.services.handoff_flow import remember_alert
+
+    if len(message) > 350:
+        message = message[:347] + "..."
 
     recipients = {
         normalize_phone(p)
@@ -233,10 +451,13 @@ def verify_payment_claim(
     """
     Async backstop for Amara promising a payment with no order behind it
     (#116 — the Oct 31 chat promised "it's on its way" for 13 hours while
-    no order existed). Enqueued after an AI reply sends; exact filters
-    first (this turn ran the order machinery / a human already owns the
-    chat / a live PENDING order backs the words), then the LLM judge for
-    the remainder, then a merchant + OPS template alert on a positive.
+    no order existed; #120 made the flag actionable). Enqueued after an
+    AI reply sends; exact filters first (this turn ran the order
+    machinery / a human already owns the chat / a live PENDING order
+    backs the words), then the LLM judge over the last few turns. On a
+    positive (or an unjudgeable turn) the chat is handed to the merchant,
+    the promised order is rebuilt from the agreed terms when they check
+    out, and one combined merchant + OPS template alert covers both.
 
     Best-effort by design: a monitor must never break the pipeline it
     watches, so every failure mode below degrades to a log line, never
@@ -351,21 +572,81 @@ def _verify(
         if _throttle_hit(throttle_key):
             return "Throttled: already alerted for this conversation."
 
-        flagged = _run_async(_judge_payment_claim(outbound_body or "", prior_paid is not None))
-        if not flagged:
+        history = _recent_history(db, channel, account_uuid, customer, outbound_body)
+        verdict = _run_async(_judge_payment_claim(history, prior_paid is not None))
+        if verdict is not None and not verdict["claim"]:
             return "Clear: no payment claim."
         if not _throttle_set(throttle_key):
             return "Throttled: alert already sent."
 
-        preview = (outbound_body or "").strip().replace("\n", " ")
-        if len(preview) > 200:
-            preview = preview[:197] + "..."
-        message = (
-            f"Phantom-payment flag: Amara told {identifier} a payment is on its way, "
-            f'but no order exists behind it. Flagged reply: "{preview}". Check the chat.'
-        )
+        # Flagged (or unjudgeable): pause Amara first, then try to rebuild
+        # the promised order from the agreed terms. The merchant gets one
+        # combined alert either way.
+        _handoff_conversation(db, channel, account, context)
+        recovered = None
+        if verdict is None:
+            short, detail = "judge_unavailable", "the payment checker was down, so I paused Amara to be safe"
+        elif not verdict["consent"]:
+            short, detail = "no_consent", "couldn't confirm the buyer agreed — no auto-recovery"
+        else:
+            product, price, terms_why = _resolve_terms(db, account, context, verdict)
+            if terms_why is not None:
+                short, detail = "no_terms", f"no safe terms to recover ({terms_why})"
+            else:
+                phone = (
+                    customer.phone_number
+                    if channel == "whatsapp"
+                    else verdict["phone"]
+                )
+                if not (phone and normalize_phone(phone)):
+                    short, detail = "no_phone", "no buyer phone number on file — no auto-recovery"
+                else:
+                    from app.services.payment_resend import close_deal_from_terms
+
+                    parties = (account, customer, context, phone, channel == "instagram")
+                    _, reason = _run_async(
+                        close_deal_from_terms(db, parties, product, price)
+                    )
+                    if reason is None:
+                        recovered = (product, price)
+                        short, detail = "recovered", ""
+                    else:
+                        short = f"recover_{reason}"
+                        detail = {
+                            "out_of_stock": f"'{product.name}' is out of stock — no order created",
+                            "deal_invalid": "the deal is no longer valid (product or price changed)",
+                            "tunzaa_error": "could not reach Tunzaa — no order created",
+                            "already_owned": "this plan is already paid for — no new prompt was sent",
+                            "unavailable": "closer unavailable — no order created",
+                        }.get(reason, "recovery failed — no order created")
+
+        if recovered is not None:
+            product, price = recovered
+            message = (
+                f"Phantom-payment flag on {identifier}: Amara promised a payment with no order, "
+                f"so I paused Amara and recreated it — {product.name} at TZS {price:,}, prompt "
+                f"re-sent. Chat handed to you; tap to reply."
+            )
+        else:
+            preview = (outbound_body or "").strip().replace("\n", " ")
+            if len(preview) > 200:
+                preview = preview[:197] + "..."
+            headline = (
+                "Amara promised a payment with no order behind it"
+                if verdict is not None
+                else "a payment-adjacent reply went out with no order behind it"
+            )
+            # First character only: str.capitalize would also lowercase
+            # product names quoted inside the detail.
+            detail = detail[:1].upper() + detail[1:]
+            message = (
+                f"Phantom-payment flag on {identifier}: {headline}. {detail}. "
+                f'Chat handed to you; tap to reply. Flagged reply: "{preview}".'
+            )
         owner = account.owner
         sent = _run_async(_alert_merchant(identifier, message, owner, alert_target))
-        return f"Flagged: merchant alerted ({sent} send(s))."
+        if recovered is not None:
+            return f"Flagged: recovered {recovered[0].name} order, merchant alerted ({sent} send(s))."
+        return f"Flagged: handed off without recovery ({short}), merchant alerted ({sent} send(s))."
     finally:
         db.close()

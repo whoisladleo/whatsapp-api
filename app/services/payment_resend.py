@@ -130,6 +130,75 @@ def _channel_parties(db: Session, order: Order):
     return (account, customer, context, customer.phone_number, False)
 
 
+async def close_deal_from_terms(db: Session, parties, product, price) -> tuple:
+    """
+    Shared close-from-known-terms tail for _fresh_clone (#117) and
+    phantom auto-recovery (#120): runs the real close path with a
+    synthetic FULL agreement, then proves a live PENDING row landed —
+    guards can return a note instead of ordering (PAID subscription
+    history blocks silently by design, #114), and races can lose.
+    parties is the _channel_parties tuple
+    (account, customer, context, phone, is_instagram).
+
+    Returns (new_order, None) on success, (None, reason) otherwise.
+    Reasons: "unavailable" (no closer) | "out_of_stock" |
+    "deal_invalid" | "tunzaa_error" | "already_owned" (blocked with no
+    live row behind it). Never touches any pre-existing row — callers
+    own cancel/restore around it.
+    """
+    from app.services.llm import DealRejected, _hold_expired, llm_service
+
+    if llm_service is None:
+        return None, "unavailable"
+
+    account, customer, context, phone, is_instagram = parties
+    agreement = {
+        "product_name": product.name,
+        "price": price,
+        "payment_type": "full",
+        "phone": phone if is_instagram else None,
+    }
+    try:
+        if is_instagram:
+            await llm_service._close_instagram_deal(db, account, customer, agreement)
+        else:
+            await llm_service._close_deal(db, account, customer, phone, agreement, context)
+    except DealRejected as e:
+        logger.warning(f"Close-from-terms rejected for {product.name}: {e}")
+        if "out of stock" in str(e):
+            return None, "out_of_stock"
+        return None, "deal_invalid"
+    except Exception as e:
+        logger.error(f"Close-from-terms crashed for {product.name}: {e}")
+        return None, "tunzaa_error"
+
+    channel_filter = (
+        Order.instagram_account_id == account.id
+        if is_instagram
+        else Order.account_id == account.id
+    )
+    customer_filter = (
+        Order.instagram_customer_id == customer.id
+        if is_instagram
+        else Order.customer_id == customer.id
+    )
+    fresh = (
+        db.query(Order)
+        .filter(
+            customer_filter,
+            Order.product_id == product.id,
+            channel_filter,
+            Order.status == OrderStatus.PENDING,
+            Order.payment_type == PaymentType.FULL,
+        )
+        .order_by(Order.created_at.desc())
+        .first()
+    )
+    if fresh is None or _hold_expired(fresh):
+        return None, "already_owned"
+    return fresh, None
+
+
 async def _fresh_clone(db: Session, order: Order, parties) -> ResendResult:
     """
     Expired hold, merchant-approved retry: cancel the lapsed row, then
@@ -141,11 +210,6 @@ async def _fresh_clone(db: Session, order: Order, parties) -> ResendResult:
     exactly (status PENDING, hold untouched) plus its stock adjustment
     reversed, so a failed retry leaves history truthful.
     """
-    from app.services.llm import DealRejected, _hold_expired, llm_service
-
-    if llm_service is None:
-        return ResendResult(ResendOutcome.TUNZAA_ERROR, order=order, detail="Closer unavailable.")
-
     account, customer, context, phone, is_instagram = parties
     if not phone:
         return ResendResult(ResendOutcome.NO_PHONE, order=order)
@@ -179,81 +243,34 @@ async def _fresh_clone(db: Session, order: Order, parties) -> ResendResult:
         stock_restored = True
     db.commit()
 
-    def _restore(detail: str) -> ResendResult:
+    def _restore(result: ResendResult) -> ResendResult:
         order.status = saved_status
         order.reserved_until = saved_hold
         if stock_restored:
             product.quantity = (product.quantity or 0) - (order.quantity or 1)
         db.commit()
-        return ResendResult(ResendOutcome.TUNZAA_ERROR, order=order, detail=detail)
+        return result
 
-    agreement = {
-        "product_name": product.name,
-        "price": order.agreed_price,
-        "payment_type": "full",
-        "phone": phone if is_instagram else None,
-    }
-    try:
-        if is_instagram:
-            await llm_service._close_instagram_deal(db, account, customer, agreement)
-        else:
-            await llm_service._close_deal(db, account, customer, phone, agreement, context)
-    except DealRejected as e:
-        logger.warning(f"Merchant resend fresh-clone rejected for order {order.id}: {e}")
-        text = str(e)
-        outcome = ResendOutcome.OUT_OF_STOCK if "out of stock" in text else ResendOutcome.DEAL_INVALID
-        order.status = saved_status
-        order.reserved_until = saved_hold
-        if stock_restored:
-            product.quantity = (product.quantity or 0) - (order.quantity or 1)
-        db.commit()
-        if outcome is ResendOutcome.OUT_OF_STOCK:
-            return ResendResult(outcome, order=order, detail=f"'{product.name}' is out of stock.")
-        return ResendResult(
-            outcome, order=order,
+    fresh, reason = await close_deal_from_terms(db, parties, product, order.agreed_price)
+    if fresh is not None:
+        return ResendResult(ResendOutcome.FRESH_ORDERED, order=fresh)
+    if reason == "out_of_stock":
+        return _restore(ResendResult(
+            ResendOutcome.OUT_OF_STOCK, order=order, detail=f"'{product.name}' is out of stock."
+        ))
+    if reason == "deal_invalid":
+        return _restore(ResendResult(
+            ResendOutcome.DEAL_INVALID, order=order,
             detail="The deal is no longer valid (product or price changed).",
-        )
-    except Exception as e:
-        logger.error(f"Merchant resend fresh-clone crashed for order {order.id}: {e}")
-        return _restore("Could not reach Tunzaa right now.")
-
-    # The close may have returned a guard note instead of ordering (PAID
-    # subscription history blocks silently by design, #114) — only a
-    # newer live PENDING row proves the retry landed.
-    channel_filter = (
-        Order.instagram_account_id == account.id
-        if is_instagram
-        else Order.account_id == account.id
-    )
-    customer_filter = (
-        Order.instagram_customer_id == customer.id
-        if is_instagram
-        else Order.customer_id == customer.id
-    )
-    fresh = (
-        db.query(Order)
-        .filter(
-            customer_filter,
-            Order.product_id == product.id,
-            channel_filter,
-            Order.status == OrderStatus.PENDING,
-            Order.payment_type == PaymentType.FULL,
-            Order.id != order.id,
-        )
-        .order_by(Order.created_at.desc())
-        .first()
-    )
-    if fresh is None or _hold_expired(fresh):
-        order.status = saved_status
-        order.reserved_until = saved_hold
-        if stock_restored:
-            product.quantity = (product.quantity or 0) - (order.quantity or 1)
-        db.commit()
-        return ResendResult(
+        ))
+    if reason == "already_owned":
+        return _restore(ResendResult(
             ResendOutcome.ALREADY_OWNED, order=order,
             detail="This plan is already paid for — no new prompt was sent.",
-        )
-    return ResendResult(ResendOutcome.FRESH_ORDERED, order=fresh)
+        ))
+    if reason == "unavailable":
+        return _restore(ResendResult(ResendOutcome.TUNZAA_ERROR, order=order, detail="Closer unavailable."))
+    return _restore(ResendResult(ResendOutcome.TUNZAA_ERROR, order=order, detail="Could not reach Tunzaa right now."))
 
 
 async def merchant_resend_order(db: Session, order: Order) -> ResendResult:
