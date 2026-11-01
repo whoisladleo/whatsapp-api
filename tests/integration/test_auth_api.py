@@ -843,3 +843,136 @@ def test_pay_now_with_product_id_charges_that_plan(client, auth_user, db_session
     order = db_session.query(Order).filter(Order.id == uuid.UUID(resp.json()["order_id"])).one()
     assert order.product_id == pro.id
     assert order.agreed_price == 200000
+
+
+@respx.mock
+def test_pay_now_refuses_active_subscription(client, auth_user, db_session):
+    # Paying for an ACTIVE plan is always a duplicate charge — 409 with no
+    # new order and no Tunzaa call (#115). Tunzaa routes are deliberately
+    # unmocked: any dispatch attempt fails this test.
+    from app.db.models import (
+        Customer,
+        Order,
+        OrderStatus,
+        PaymentType,
+        ProductSubscription,
+        ProductSubscriptionStatus,
+    )
+
+    product = _seed_platform_product(db_session)
+    user, headers = auth_user
+
+    customer = Customer(phone_number=user.username)
+    db_session.add(customer)
+    db_session.commit()
+    db_session.refresh(customer)
+    order = Order(
+        customer_id=customer.id, product_id=product.id, quantity=1,
+        agreed_price=100000, payment_type=PaymentType.FULL, status=OrderStatus.PAID,
+    )
+    db_session.add(order)
+    db_session.commit()
+    db_session.refresh(order)
+    db_session.add(
+        ProductSubscription(
+            order_id=order.id, customer_id=customer.id, product_id=product.id,
+            status=ProductSubscriptionStatus.ACTIVE, monthly_amount=100000,
+        )
+    )
+    db_session.commit()
+
+    resp = client.post("/api/v1/auth/me/subscription/pay", json={}, headers=headers)
+
+    assert resp.status_code == 409
+    assert "already active" in resp.json()["detail"]
+    assert db_session.query(Order).count() == 1
+
+
+@respx.mock
+def test_pay_now_allows_past_due_catch_up(client, auth_user, db_session):
+    # PAST_DUE is a legitimate catch-up, not a duplicate (#115).
+    from app.db.models import (
+        Customer,
+        Order,
+        OrderStatus,
+        PaymentType,
+        ProductSubscription,
+        ProductSubscriptionStatus,
+    )
+
+    product = _seed_platform_product(db_session)
+    user, headers = auth_user
+
+    customer = Customer(phone_number=user.username)
+    db_session.add(customer)
+    db_session.commit()
+    db_session.refresh(customer)
+    order = Order(
+        customer_id=customer.id, product_id=product.id, quantity=1,
+        agreed_price=100000, payment_type=PaymentType.FULL, status=OrderStatus.PAID,
+    )
+    db_session.add(order)
+    db_session.commit()
+    db_session.refresh(order)
+    db_session.add(
+        ProductSubscription(
+            order_id=order.id, customer_id=customer.id, product_id=product.id,
+            status=ProductSubscriptionStatus.PAST_DUE, monthly_amount=100000,
+        )
+    )
+    db_session.commit()
+
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "tok-1"}))
+    respx.post(PAYMENT_URL).mock(
+        return_value=httpx.Response(200, json={"statusCode": 202, "success": True, "transactionID": "MOCK_TXN_PASTDUE"})
+    )
+
+    resp = client.post("/api/v1/auth/me/subscription/pay", json={}, headers=headers)
+
+    assert resp.status_code == 200
+    assert db_session.query(Order).count() == 2
+
+
+@respx.mock
+def test_pay_now_allows_resubscribe_after_cancelled(client, auth_user, db_session):
+    # Resubscribing after CANCELLED is legitimate (#115).
+    from app.db.models import (
+        Customer,
+        Order,
+        OrderStatus,
+        PaymentType,
+        ProductSubscription,
+        ProductSubscriptionStatus,
+    )
+
+    product = _seed_platform_product(db_session)
+    user, headers = auth_user
+
+    customer = Customer(phone_number=user.username)
+    db_session.add(customer)
+    db_session.commit()
+    db_session.refresh(customer)
+    order = Order(
+        customer_id=customer.id, product_id=product.id, quantity=1,
+        agreed_price=100000, payment_type=PaymentType.FULL, status=OrderStatus.PAID,
+    )
+    db_session.add(order)
+    db_session.commit()
+    db_session.refresh(order)
+    db_session.add(
+        ProductSubscription(
+            order_id=order.id, customer_id=customer.id, product_id=product.id,
+            status=ProductSubscriptionStatus.CANCELLED, monthly_amount=100000,
+        )
+    )
+    db_session.commit()
+
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "tok-1"}))
+    respx.post(PAYMENT_URL).mock(
+        return_value=httpx.Response(200, json={"statusCode": 202, "success": True, "transactionID": "MOCK_TXN_RESUB"})
+    )
+
+    resp = client.post("/api/v1/auth/me/subscription/pay", json={}, headers=headers)
+
+    assert resp.status_code == 200
+    assert db_session.query(Order).count() == 2

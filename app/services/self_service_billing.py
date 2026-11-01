@@ -7,7 +7,16 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.security import normalize_phone
-from app.db.models import Customer, Order, OrderStatus, PaymentType, Product, ProductSubscription, User
+from app.db.models import (
+    Customer,
+    Order,
+    OrderStatus,
+    PaymentType,
+    Product,
+    ProductSubscription,
+    ProductSubscriptionStatus,
+    User,
+)
 from app.services import product_subscription
 
 logger = logging.getLogger(__name__)
@@ -36,6 +45,10 @@ class PhoneNumberRequiredError(Exception):
 
 class PhoneNumberInUseError(Exception):
     """The supplied phone number is already on a different User's account."""
+
+
+class AlreadySubscribedError(Exception):
+    """An ACTIVE subscription already exists for this customer+product (#115)."""
 
 
 def get_my_subscription(db: Session, user: User) -> Optional[ProductSubscription]:
@@ -95,6 +108,30 @@ async def pay_now(
         db.add(customer)
         db.commit()
         db.refresh(customer)
+
+    # Paying for a plan that's already ACTIVE is always a duplicate charge
+    # (#115) — the dashboard hides the button, but the API must refuse too.
+    # Deliberately ACTIVE-only: PAST_DUE is a legitimate catch-up,
+    # CANCELLED/PAYMENT_FAILED a legitimate resubscribe, and a
+    # PENDING_PAYMENT row with no live order means a dead prompt worth
+    # retrying (the reuse query above handles the live one).
+    active = (
+        db.query(ProductSubscription)
+        .filter(
+            ProductSubscription.customer_id == customer.id,
+            ProductSubscription.product_id == product.id,
+            ProductSubscription.status == ProductSubscriptionStatus.ACTIVE,
+        )
+        .first()
+    )
+    if active:
+        logger.warning(
+            "Pay Now refused: subscription %s already ACTIVE for customer %s / product %s.",
+            active.id,
+            customer.id,
+            product.id,
+        )
+        raise AlreadySubscribedError()
 
     price = product.max_price
     # Idempotency (#110): a repeat click while the first prompt is still
