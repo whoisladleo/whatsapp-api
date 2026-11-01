@@ -34,6 +34,7 @@ import asyncio
 import copy
 import datetime
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -1214,7 +1215,22 @@ def main(argv=None):
         "celery_calls": [],
         "stub_skipped": [],
         "llm_records": [],
+        # v2 follow-up: app-level WARNING+ records (DealRejected reasons,
+        # length-cutoff retries, guard blocks) land in summary.json so a
+        # rejection is diagnosable without the run's stderr.
+        "app_warnings": [],
     }
+
+    class _SimLogHandler(logging.Handler):
+        def emit(self, record):
+            try:
+                msg = record.getMessage()
+            except Exception:
+                return
+            if len(ctx["app_warnings"]) < 200:
+                ctx["app_warnings"].append(f"{record.levelname}:{record.name}:{msg[-300:]}")
+
+    logging.getLogger("app").addHandler(_SimLogHandler(level=logging.WARNING))
 
     transcript_fh = open(transcript_path, "w", encoding="utf-8")
 
@@ -1273,6 +1289,7 @@ def main(argv=None):
             "table": calibration["table"],
         },
         "pay_now_probe": probe,
+        "app_warnings": ctx["app_warnings"],
         "mock_stats": {
             "ig_sends": len(ctx["ig_calls"]),
             "tunzaa_calls": len(ctx["tunzaa"].calls),
