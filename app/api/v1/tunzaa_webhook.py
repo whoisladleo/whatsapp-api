@@ -743,6 +743,28 @@ _PAYMENT_COMPLETE_SUBSCRIPTION = {
     "en": "Your subscription is now active — welcome!",
 }
 
+# Platform-plan buyers are merchants who just bought Taskflow itself — the
+# generic "subscription active" tail leaves them with no next step (they ask
+# "can i get a link for it?", confirmed live). This replaces the tail for
+# is_platform_plan orders only; every other subscription keeps the exact
+# text above. Sent as conversation free text, so no Meta template needed.
+_PAYMENT_COMPLETE_ONBOARDING = {
+    "sw": (
+        "Karibu sana! 🎉 Hatua zinazofuata (dakika 5): "
+        "1) Fungua dashibodi yako: {dashboard_url} "
+        "2) Ingia na namba hii hii ya WhatsApp "
+        "3) Unganisha namba yako ya WhatsApp au Instagram, "
+        "kisha ongeza bidhaa zako. Ukikwama, nijulishe hapa."
+    ),
+    "en": (
+        "Welcome aboard! 🎉 Next steps (5 min): "
+        "1) Open your dashboard: {dashboard_url} "
+        "2) Log in with this same WhatsApp number "
+        "3) Connect your WhatsApp number or Instagram, "
+        "then add your products. Reply here any time if you get stuck."
+    ),
+}
+
 _PAYMENT_FAILED_LINES = {
     "sw": (
         "Malipo yako hayakukamilika, kwa hivyo oda hii imefutwa. "
@@ -778,7 +800,12 @@ def _payment_notification_body(kind: str, order: Order) -> str:
         # is the one place that may truthfully say the subscription is
         # active, since Tunzaa just confirmed it (#104).
         if order.product is not None and order.product.is_subscription:
-            tail = _lang_text(_PAYMENT_COMPLETE_SUBSCRIPTION, language)
+            if order.product.is_platform_plan:
+                tail = _lang_text(_PAYMENT_COMPLETE_ONBOARDING, language).format(
+                    dashboard_url=settings.DASHBOARD_URL.rstrip("/")
+                )
+            else:
+                tail = _lang_text(_PAYMENT_COMPLETE_SUBSCRIPTION, language)
         else:
             tail = _lang_text(_PAYMENT_COMPLETE_DELIVERY, language)
         if language in ("sw", "en"):

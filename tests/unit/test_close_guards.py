@@ -560,7 +560,7 @@ async def test_wa_platform_prompt_has_payment_truth_rule(db_session, merchant, s
 _loop_phone_counter = [0]
 
 
-def _loop_order(db_session, merchant, language, is_subscription):
+def _loop_order(db_session, merchant, language, is_subscription, platform=False):
     from app.db.models import Order
 
     _loop_phone_counter[0] += 1
@@ -568,10 +568,11 @@ def _loop_order(db_session, merchant, language, is_subscription):
         phone_number=f"25571119{_loop_phone_counter[0]:04d}", language=language
     )
     product = Product(
-        slug=f"loop-{'sub' if is_subscription else 'goods'}-{language or 'none'}",
+        slug=f"loop-{'sub' if is_subscription else 'goods'}-{'plat' if platform else 'std'}-{language or 'none'}",
         name="Loop Plan" if is_subscription else "Loop Goods",
         max_price=100000, min_price=100000, quantity=0,
         merchant_id=merchant.id, is_subscription=is_subscription,
+        is_platform_plan=platform,
     )
     db_session.add_all([customer, product])
     db_session.commit()
@@ -627,6 +628,60 @@ def test_payment_notification_bilingual_when_language_unknown(db_session, mercha
 
     assert "Malipo yamethibitishwa" in body
     assert "Payment confirmed" in body
+
+
+def test_payment_notification_platform_plan_en(db_session, merchant):
+    from app.api.v1.tunzaa_webhook import _payment_notification_body
+    from app.core.config import settings
+
+    body = _payment_notification_body(
+        "payment_complete", _loop_order(db_session, merchant, "en", True, platform=True)
+    )
+
+    assert "Welcome aboard!" in body
+    assert "Next steps" in body
+    assert "Connect your WhatsApp number or Instagram" in body
+    assert settings.DASHBOARD_URL.rstrip("/") in body
+    # Platform buyers get onboarding instead of the generic tail.
+    assert "subscription is now active" not in body
+
+
+def test_payment_notification_platform_plan_sw(db_session, merchant):
+    from app.api.v1.tunzaa_webhook import _payment_notification_body
+    from app.core.config import settings
+
+    body = _payment_notification_body(
+        "payment_complete", _loop_order(db_session, merchant, "sw", True, platform=True)
+    )
+
+    assert "Karibu sana!" in body
+    assert "Hatua zinazofuata" in body
+    assert settings.DASHBOARD_URL.rstrip("/") in body
+    assert "Usajili wako umeanza" not in body
+
+
+def test_payment_notification_platform_plan_bilingual(db_session, merchant):
+    from app.api.v1.tunzaa_webhook import _payment_notification_body
+
+    body = _payment_notification_body(
+        "payment_complete", _loop_order(db_session, merchant, None, True, platform=True)
+    )
+
+    assert "Welcome aboard!" in body
+    assert "Karibu sana!" in body
+
+
+def test_payment_notification_non_platform_subscription_byte_identical(db_session, merchant):
+    from app.api.v1.tunzaa_webhook import _payment_notification_body
+
+    body = _payment_notification_body(
+        "payment_complete", _loop_order(db_session, merchant, "en", True)
+    )
+
+    assert body == (
+        "🎉 Payment confirmed! Thank you for your order. "
+        "Your subscription is now active — welcome!"
+    )
 
 
 def test_payment_notification_failed_sw(db_session, merchant):
