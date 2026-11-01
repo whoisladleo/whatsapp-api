@@ -244,6 +244,13 @@ class DealRejected(Exception):
     """An AGREEMENT_REACHED marker failed server-side validation; no order was created."""
 
 
+class LLMLengthCutoff(Exception):
+    """The model stopped for length (finish_reason=length / stop_reason=max_tokens).
+
+    Partial text is withheld, never returned — a reply cut mid-sentence must
+    never reach the buyer as if complete (#103)."""
+
+
 _HOLDING_REPLIES = {
     "sw": "Asante! Naomba nithibitishe hili na duka kwanza — mtu wa timu yetu atakujibu hapa hivi punde.",
     "en": "Thanks! Let me confirm this with the shop first — someone from our team will reply here shortly.",
@@ -313,14 +320,22 @@ _ALREADY_ACTIVE_LINES = {
 }
 
 
-async def _complete_with_empty_retry(provider, **kwargs) -> str:
+async def _complete_with_retry(provider, **kwargs) -> str:
     """
     One inline retry when the model returns empty content — a blank
-    reply would otherwise end the conversation in silence (#101).
-    Exceptions from either attempt propagate to the caller's outage
+    reply would otherwise end the conversation in silence (#101) — and
+    one retry with a doubled cap when it stops for length, since the
+    reasoning tokens share the same budget (#103). A length stop that
+    survives the bigger cap raises LLMLengthCutoff for the caller to
+    hand off; other exceptions propagate to the caller's outage
     handling unchanged.
     """
-    text = await provider.complete(**kwargs)
+    try:
+        text = await provider.complete(**kwargs)
+    except LLMLengthCutoff:
+        bigger = {**kwargs, "max_tokens": kwargs.get("max_tokens", 500) * 2}
+        logger.warning("LLM reply cut off by max_tokens; retrying once with a doubled cap.")
+        text = await provider.complete(**bigger)
     if not (text or "").strip():
         logger.warning("LLM returned empty content; retrying once.")
         text = await provider.complete(**kwargs)
@@ -446,6 +461,11 @@ class ClaudeProvider(LLMProvider):
             system=system,
             messages=messages,
         )
+        # Reasoning shares the max_tokens budget, so a length stop can
+        # leave only a fragment of visible text — fail rather than send
+        # it as if complete (#103).
+        if getattr(response, "stop_reason", None) == "max_tokens":
+            raise LLMLengthCutoff(f"Claude stop_reason=max_tokens at cap {max_tokens}")
         # This model returns extended-thinking content blocks before the
         # text block non-deterministically (confirmed live — the same
         # prompt sometimes returns [ThinkingBlock, TextBlock] and
@@ -481,6 +501,11 @@ class MuseProvider(LLMProvider):
             messages=[{"role": "system", "content": system}, *messages],
         )
         choice = response.choices[0]
+        # Even at minimal reasoning effort the reasoning tokens share the
+        # max_tokens budget, so a length stop can leave a mid-sentence
+        # fragment — fail rather than send it as if complete (#103).
+        if choice.finish_reason == "length":
+            raise LLMLengthCutoff(f"Muse finish_reason=length at cap {max_tokens}")
         content = choice.message.content or ""
         if not content:
             logger.warning(
@@ -1149,14 +1174,17 @@ Match the customer's language (Swahili or English). Keep both lines to one sente
 """
 
         try:
-            response_text = await self.provider.complete(
+            response_text = await _complete_with_retry(
+                self.provider,
                 system=instruction,
                 messages=[{"role": "user", "content": "Respond as Amara:"}],
                 # 300 truncated Muse on off-topic comments (reasoning
                 # exhausted the budget, finish_reason=length, content=None
                 # -> unparseable -> sends nothing). 500 matches the DM
                 # budget; Claude replies are short so the higher cap
-                # doesn't change its output.
+                # doesn't change its output. A length stop now retries
+                # at a doubled cap inside the helper; a double cut
+                # lands here and stays silent (#103).
                 max_tokens=500,
             )
         except Exception as e:
@@ -1367,7 +1395,7 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
 """
 
         try:
-            response_text = await _complete_with_empty_retry(
+            response_text = await _complete_with_retry(
                 self.provider,
                 system=instruction,
                 messages=[
@@ -1378,6 +1406,12 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
                 ],
                 max_tokens=500,
             )
+        except LLMLengthCutoff:
+            # Cut off even at the doubled cap — hand off with the holding
+            # reply rather than send a mid-sentence fragment (#103).
+            logger.warning("DM-response LLM cut off after retry; handing off.")
+            await self._hand_off_instagram(db, account, customer, context, message_body)
+            return _holding_reply(None)
         except Exception as e:
             if retry_on_outage and _is_transient_llm_error(e):
                 raise LLMUnavailable(str(e)) from e
@@ -1711,7 +1745,7 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
             # live against the real API — not documented ahead of time) —
             # omitted rather than guessing at a replacement parameter.
             try:
-                response_text = await _complete_with_empty_retry(
+                response_text = await _complete_with_retry(
                     self.provider,
                     system=base_instruction,
                     messages=[
@@ -1722,6 +1756,14 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
                     ],
                     max_tokens=1024,
                 )
+            except LLMLengthCutoff:
+                # Cut off even at the doubled cap — hand off with the
+                # holding reply rather than send a mid-sentence fragment (#103).
+                logger.warning("LLM cut off after retry; handing off.")
+                await self._trigger_human_handoff(
+                    db, account, context, from_phone, message_body, is_platform_account
+                )
+                return _holding_reply(customer.language)
             except Exception as e:
                 if retry_on_outage and _is_transient_llm_error(e):
                     raise LLMUnavailable(str(e)) from e
