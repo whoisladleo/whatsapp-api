@@ -7,6 +7,7 @@ from app.core.config import settings
 from app.core.security import verify_tunzaa_signature
 from app.core.provider import WhatsAppProvider
 from app.crud import message as crud_message
+from app.crud.order import try_release_pending_order
 from app.services import usage
 from app.db.session import get_db
 from app.db.models import (
@@ -137,8 +138,17 @@ async def handle_tunzaa_webhook(
             # A second COMPLETED with a new transaction_id (genuine double
             # payment, not a retry — retries share the id and are caught
             # above). The cash is real, so record it, but the order is
-            # already paid: don't rewrite state or re-notify. (#77)
+            # already paid: don't rewrite state. Flag the refund owed
+            # (MANUAL convention, cf. the no-stock branch below) and alert
+            # the merchant — previously nobody was told about the 2x
+            # charge. The customer already got their confirmation on the
+            # first payment, so they are not re-notified. (#77, P7)
+            order.refund_status = "MANUAL"
+            db.commit()
             _record_payment_event(db, order, _parse_float(data.get("amount")))
+            await _notify_merchant_of_payment(
+                db, order, duplicate_payment=True, transaction_id=transaction_id
+            )
             return {"status": "success", "message": "Order already PAID; payment recorded"}
 
         if order.status in (OrderStatus.FAILED, OrderStatus.CANCELLED):
@@ -148,13 +158,22 @@ async def handle_tunzaa_webhook(
             # Re-claim before marking paid, or the sale completes without
             # decrementing. (#77, #110)
             if not _try_reclaim_stock(db, order):
+                # Real money arrived for an item that can't be fulfilled.
+                # Leaving the order FAILED/CANCELLED with only a log meant
+                # neither side was told and nothing discoverable recorded
+                # the debt — flag the refund, count the cash (as the
+                # paid-twice branch does), and notify both sides. (P6)
                 if transaction_id:
                     order.tunzaa_transaction_id = transaction_id
+                order.refund_status = "MANUAL"
                 db.commit()
                 logger.error(
                     f"COMPLETED for order {order.id} but no stock to reclaim; "
                     f"leaving {order.status.value} for merchant review."
                 )
+                _record_payment_event(db, order, _parse_float(data.get("amount")))
+                await _notify_customer(db, order, "payment_no_stock")
+                await _notify_merchant_of_payment(db, order, stock_shortage=True)
                 return {"status": "success", "message": "Payment arrived but stock unavailable"}
             order.status = OrderStatus.PENDING
 
@@ -218,10 +237,63 @@ async def handle_tunzaa_webhook(
             # duplicate attempt after the real one paid) must never regress
             # it — or restore stock twice. (#77)
             return {"status": "ignored", "reason": "Order already resolved"}
-        order.status = OrderStatus.FAILED
+        installment_id = data.get("installment_id")
+        if installment_id and order.tunzaa_plan_id:
+            # Leg-level failure on a tracked multi-installment plan —
+            # mirrors the COMPLETED side's installment_id + tunzaa_plan_id
+            # gating above. When earlier legs are already PAID, only this
+            # leg failed: fail just the leg and keep the order alive (stock
+            # stays held, linked subscription untouched, no cancellation
+            # notice — the order was NOT cancelled). With no legs paid the
+            # order is effectively dead, so fall through to the whole-order
+            # failure below. (P8)
+            # NOTE: whether Tunzaa actually sends leg-level FAILED/CANCELLED
+            # callbacks carrying installment_id is UNVERIFIED — order-level
+            # callbacks (no installment_id, or no captured plan id) behave
+            # exactly as before.
+            any_leg_paid = (
+                db.query(Installment)
+                .filter(
+                    Installment.order_id == order.id,
+                    Installment.status == InstallmentStatus.PAID,
+                )
+                .first()
+                is not None
+            )
+            if any_leg_paid:
+                leg = (
+                    db.query(Installment)
+                    .filter(
+                        Installment.order_id == order.id,
+                        Installment.tunzaa_installment_id == installment_id,
+                    )
+                    .first()
+                )
+                if leg is not None and leg.status != InstallmentStatus.PAID:
+                    # No InstallmentStatus.FAILED exists — OVERDUE is the
+                    # established "leg still owed" state (cf.
+                    # apply_installment_plan_state), cleared back to PAID by
+                    # reconcile when the leg is actually paid.
+                    leg.status = InstallmentStatus.OVERDUE
+                if transaction_id:
+                    order.tunzaa_transaction_id = transaction_id
+                db.commit()
+                logger.warning(
+                    "Installment %s of order %s failed; earlier legs paid, "
+                    "keeping order PENDING.",
+                    installment_id,
+                    order.id,
+                )
+                return {"status": "success", "message": "Installment payment failed; order remains PENDING"}
+        # Atomic release (P10): only the transition winner restores. A
+        # lost race means auto-cancel, a dashboard cancel, or the reclose
+        # guard resolved the order (and restored the unit) concurrently —
+        # same outcome as the already-resolved guard above.
+        won, restored_product_id = try_release_pending_order(db, order, OrderStatus.FAILED)
+        if not won:
+            return {"status": "ignored", "reason": "Order already resolved"}
         if transaction_id:
             order.tunzaa_transaction_id = transaction_id
-        restored_product_id = _release_reservation(db, order)
         db.commit()
         if restored_product_id:
             # The release may flip the catalog's availability back to in stock.
@@ -368,20 +440,57 @@ def _merchant_for_order(order: Order):
     return None
 
 
-def _payment_alert_summary_and_reference(order: Order) -> tuple[str, str]:
+def _payment_alert_summary_and_reference(
+    order: Order,
+    *,
+    stock_shortage: bool = False,
+    duplicate_payment: bool = False,
+    reconcile_giveup: bool = False,
+    reconcile_attempts: int = 0,
+    transaction_id: Optional[str] = None,
+) -> tuple[str, str]:
     """
     Builds the {{summary}} and {{reference}} values for the payment_received
     template — one variable per template line, each wrapped by that line's
     own static text, since a newline embedded inside a single variable's
     value doesn't render as a line break (found live while designing this).
+    With stock_shortage, the same template instead reports a payment that
+    arrived for an item that can't be fulfilled, with the refund owed —
+    never "Paid in full". With duplicate_payment, it reports a second
+    charge on an already-PAID order, again with the refund owed. With
+    reconcile_giveup, it reports an installment plan whose authoritative
+    state stayed unreachable, with the order and the amounts on record so
+    the merchant can review before auto-cancel releases it (P9).
+    transaction_id, when given, overrides the txn shown in the reference
+    (the duplicate charge's own id — order.tunzaa_transaction_id keeps the
+    first one).
     """
     amount = f"{order.agreed_price:,.0f} TZS" if order.agreed_price is not None else "an unknown amount"
 
-    # Keyed off tunzaa_plan_id (same signal the main handler above uses to
-    # decide whether to reconcile against the plan) rather than
-    # payment_type — this is what actually determines whether this
-    # callback is one leg of a tracked multi-installment plan.
-    is_installment_plan = bool(order.tunzaa_plan_id)
+    if stock_shortage:
+        payment_desc = "payment received — item out of stock"
+        status_text = "Item out of stock — customer refund owed"
+        is_installment_plan = False
+    elif duplicate_payment:
+        payment_desc = "duplicate payment"
+        status_text = "Duplicate charge — customer refund owed"
+        is_installment_plan = False
+    elif reconcile_giveup:
+        paid = f"{order.paid_amount:,.0f}" if order.paid_amount is not None else "unknown"
+        total = f"{order.agreed_price:,.0f}" if order.agreed_price is not None else "unknown"
+        payment_desc = "installment reconcile failed — action needed"
+        status_text = (
+            f"Plan {order.tunzaa_plan_id} unreachable after {reconcile_attempts} tries — "
+            f"paid {paid} of {total} TZS on record; order {order.id} still "
+            "PENDING, review before auto-cancel"
+        )
+        is_installment_plan = False
+    else:
+        # Keyed off tunzaa_plan_id (same signal the main handler above uses to
+        # decide whether to reconcile against the plan) rather than
+        # payment_type — this is what actually determines whether this
+        # callback is one leg of a tracked multi-installment plan.
+        is_installment_plan = bool(order.tunzaa_plan_id)
     if is_installment_plan:
         if order.status == OrderStatus.PAID:
             payment_desc = "final installment — fully paid"
@@ -394,9 +503,10 @@ def _payment_alert_summary_and_reference(order: Order) -> tuple[str, str]:
             )
         else:
             status_text = "Paid in full." if order.status == OrderStatus.PAID else "Partial payment received."
-    else:
+    elif not (stock_shortage or duplicate_payment or reconcile_giveup):
         payment_desc = "installment payment" if order.payment_type == PaymentType.INSTALLMENT else "full payment"
         status_text = "Paid in full."
+    # else: stock_shortage / duplicate_payment / reconcile_giveup keep their preset copy above.
 
     summary = f"{amount} ({payment_desc})"
 
@@ -410,13 +520,35 @@ def _payment_alert_summary_and_reference(order: Order) -> tuple[str, str]:
     else:
         customer_ref, channel = "an unknown customer", "an unknown channel"
 
-    txn = order.tunzaa_transaction_id or "unknown"
+    txn = transaction_id or order.tunzaa_transaction_id or "unknown"
     reference = f"From {customer_ref} via {channel} · {status_text} · Txn {txn}"
 
     return summary, reference
 
 
-async def _notify_merchant_of_payment(db: Session, order: Order) -> None:
+async def notify_merchant_of_reconcile_giveup(db: Session, order: Order, attempts: int) -> None:
+    """
+    Final give-up alert for an installment plan whose authoritative state
+    stayed unreachable across every reconcile retry (P9) — the order sits
+    PENDING with paid legs on record and auto-cancel will release it, so
+    the merchant must review it by hand. Called from the retry task's
+    give-up branch; best-effort like every other merchant alert.
+    """
+    await _notify_merchant_of_payment(
+        db, order, reconcile_giveup=True, reconcile_attempts=attempts
+    )
+
+
+async def _notify_merchant_of_payment(
+    db: Session,
+    order: Order,
+    *,
+    stock_shortage: bool = False,
+    duplicate_payment: bool = False,
+    reconcile_giveup: bool = False,
+    reconcile_attempts: int = 0,
+    transaction_id: Optional[str] = None,
+) -> None:
     """
     Alerts the merchant of any successful payment — full, an installment
     leg (including a mid-plan one), or whatever activates/completes a
@@ -425,7 +557,12 @@ async def _notify_merchant_of_payment(db: Session, order: Order) -> None:
     connected account: a merchant essentially never has an open 24h session
     with either number, so this needs the approved payment_received
     template regardless of which number sends it. Best-effort/silent if the
-    merchant has no phone on file. See #35.
+    merchant has no phone on file. See #35. With stock_shortage, the same
+    template instead reports a payment that arrived for an unavailable
+    item, with the refund owed. With duplicate_payment, it reports a second
+    charge on an already-PAID order, again with the refund owed. With
+    reconcile_giveup, it reports an unreachable installment plan, with the
+    order and the amounts on record.
     """
     merchant = _merchant_for_order(order)
     merchant_phone = (merchant.username or merchant.phone_number) if merchant else None
@@ -434,7 +571,14 @@ async def _notify_merchant_of_payment(db: Session, order: Order) -> None:
         return
 
     product_name = order.product.name if order.product else "your order"
-    summary, reference = _payment_alert_summary_and_reference(order)
+    summary, reference = _payment_alert_summary_and_reference(
+        order,
+        stock_shortage=stock_shortage,
+        duplicate_payment=duplicate_payment,
+        reconcile_giveup=reconcile_giveup,
+        reconcile_attempts=reconcile_attempts,
+        transaction_id=transaction_id,
+    )
 
     components = [
         {
@@ -558,28 +702,14 @@ def _parse_float(value) -> Optional[float]:
         return None
 
 
-def _release_reservation(db: Session, order: Order) -> Optional[uuid.UUID]:
-    """Restores stock reserved at order-creation time for a failed/cancelled order.
-
-    Returns the restored product's id, or None when nothing was restored.
-    """
-    if not order.product_id:
-        return None
-    product = db.query(Product).filter(Product.id == order.product_id).first()
-    # Same subscription guard as cancel_order (#118): plans never reserve
-    # units, so a failed first payment restores nothing.
-    if product and not product.is_subscription:
-        product.quantity += order.quantity or 1
-        return product.id
-    return None
-
-
 def _try_reclaim_stock(db: Session, order: Order) -> bool:
     """
     Re-decrements stock for a COMPLETED that arrives after FAILED restored
     the reservation (#77). Conditional UPDATE like _try_claim_stock: the
     rowcount decides, so two racing callbacks can't both claim the last
     unit. True when stock was (re)taken or there's nothing to track.
+    Mutates without committing — the caller commits once, so a crash (or
+    a concurrent COMPLETED) between two commits can't lose a unit (P11).
     """
     if not order.product_id:
         return True
@@ -595,7 +725,6 @@ def _try_reclaim_stock(db: Session, order: Order) -> bool:
             synchronize_session=False,
         )
     )
-    db.commit()
     return claimed > 0
 
 
@@ -627,6 +756,20 @@ _PAYMENT_FAILED_LINES = {
 }
 
 
+_PAYMENT_NO_STOCK_LINES = {
+    "sw": (
+        "Malipo yako yamepokelewa, lakini kwa bahati mbaya bidhaa "
+        "haipatikani tena. Oda yako imewekewa alama ya kurejeshewa "
+        "pesa — muuzaji atawasiliana nawe hivi punde."
+    ),
+    "en": (
+        "Your payment has been received, but unfortunately the item is "
+        "no longer available. Your order has been flagged for a refund "
+        "— the merchant will be in touch shortly."
+    ),
+}
+
+
 def _payment_notification_body(kind: str, order: Order) -> str:
     language = order.customer.language if order.customer else None
     if kind == "payment_complete":
@@ -645,6 +788,8 @@ def _payment_notification_body(kind: str, order: Order) -> str:
         sw_body, en_body = body.split("\n\n")
         sw_tail, en_tail = tail.split("\n\n")
         return f"{sw_body} {sw_tail}\n\n{en_body} {en_tail}"
+    if kind == "payment_no_stock":
+        return _lang_text(_PAYMENT_NO_STOCK_LINES, language)
     return _lang_text(_PAYMENT_FAILED_LINES, language)
 
 

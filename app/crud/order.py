@@ -1,7 +1,7 @@
 import uuid
 from typing import List, Optional
 
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.db.models import InstagramAccount, Order, OrderStatus, Product, WhatsAppAccount
@@ -37,6 +37,7 @@ def _to_order_read(order: Order) -> OrderRead:
         subscription_status=order.subscription.status if order.subscription else None,
         subscription_next_billing_at=order.subscription.next_billing_at if order.subscription else None,
         subscription_retry_count=order.subscription.retry_count if order.subscription else None,
+        refund_status=order.refund_status,
     )
 
 
@@ -115,6 +116,46 @@ def get_order_detail_for_merchant(db: Session, order_id: uuid.UUID, user_id: uui
     return _to_order_detail(order) if order else None
 
 
+def try_release_pending_order(
+    db: Session, order: Order, to_status: OrderStatus
+) -> tuple[bool, Optional[uuid.UUID]]:
+    """
+    Atomically moves a PENDING order to to_status (FAILED/CANCELLED) and
+    restores its stock reservation — the release-side mirror of
+    _try_claim_stock: a conditional UPDATE decides the PENDING->?
+    transition, so a FAILED callback racing auto-cancel (or a dashboard
+    cancel, or the reclose guard's lazy retire of an expired hold) can't
+    both restore the same unit (+2 phantom stock, P10). Only the
+    transition winner restores, and the restore itself is a SQL expression
+    (quantity = quantity + N), not a read-modify-write. Returns
+    (won, restored_product_id): won=False means the order already left
+    PENDING — a concurrent path won and restored — so the caller must
+    treat the order as already resolved and restore nothing. Mutates
+    without committing — the caller commits once.
+    """
+    moved = (
+        db.query(Order)
+        .filter(Order.id == order.id, Order.status == OrderStatus.PENDING)
+        .update({Order.status: to_status}, synchronize_session=False)
+    )
+    if moved == 0:
+        return False, None
+    order.status = to_status
+    if not order.product_id:
+        return True, None
+    product = db.query(Product).filter(Product.id == order.product_id).first()
+    # Subscriptions never claim stock at close, so there is nothing
+    # to give back — restoring would mint phantom units (#118).
+    if product is None or product.is_subscription:
+        return True, None
+    units = order.quantity or 1
+    db.query(Product).filter(Product.id == order.product_id).update(
+        {Product.quantity: func.coalesce(Product.quantity, 0) + units},
+        synchronize_session=False,
+    )
+    return True, product.id
+
+
 def cancel_order(db: Session, order: Order) -> None:
     """
     Cancels a PENDING order and releases its stock reservation. Raises
@@ -123,18 +164,9 @@ def cancel_order(db: Session, order: Order) -> None:
     Does not notify the customer; the caller (app/api/v1/orders.py) does
     that, matching the pattern already established in tunzaa_webhook.py.
     """
-    if order.status != OrderStatus.PENDING:
+    won, restored_product_id = try_release_pending_order(db, order, OrderStatus.CANCELLED)
+    if not won:
         raise OrderNotCancellableError()
-
-    order.status = OrderStatus.CANCELLED
-    restored_product_id = None
-    if order.product_id:
-        product = db.query(Product).filter(Product.id == order.product_id).first()
-        # Subscriptions never claim stock at close, so there is nothing
-        # to give back — restoring would mint phantom units (#118).
-        if product and not product.is_subscription:
-            product.quantity += order.quantity or 1
-            restored_product_id = product.id
     db.commit()
     if restored_product_id:
         # The release may flip the catalog's availability back to in stock.

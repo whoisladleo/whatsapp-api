@@ -8,12 +8,12 @@ from app.db.session import SessionLocal
 from app.db.models import (
     Order,
     OrderStatus,
-    Product,
     ProductSubscription,
     ProductSubscriptionStatus,
     WhatsAppAccount,
 )
 from app.crud import message as crud_message
+from app.crud.order import try_release_pending_order
 from app.services import usage
 
 logger = logging.getLogger(__name__)
@@ -199,16 +199,13 @@ def auto_cancel_order(order_id: str):
             # stale; the newer firing will cancel at the new deadline.
             return "Reservation still active."
 
-        order.status = OrderStatus.CANCELLED
-
-        restored_product_id = None
-        if order.product_id:
-            product = db.query(Product).filter(Product.id == order.product_id).first()
-            # Same subscription guard as cancel_order (#118): no claim at
-            # close means no restore here.
-            if product and not product.is_subscription:
-                product.quantity += order.quantity or 1
-                restored_product_id = product.id
+        # Atomic release (P10): only the transition winner restores. A
+        # lost race means a FAILED callback, a dashboard cancel, or the
+        # reclose guard resolved the order (and restored the unit)
+        # concurrently — same outcome as the not-pending guard above.
+        won, restored_product_id = try_release_pending_order(db, order, OrderStatus.CANCELLED)
+        if not won:
+            return "Order not found or not pending."
 
         db.commit()
 
