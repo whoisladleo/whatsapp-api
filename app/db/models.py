@@ -63,6 +63,8 @@ class SupportAccessKind(enum.Enum):
     START = "START"  # operator minted an impersonation token
     END = "END"  # operator exited (or the token expired server-side)
     WRITE = "WRITE"  # one impersonated mutating API call (method+path only)
+    TRIAL_GRANTED = "TRIAL_GRANTED"  # operator set/changed a trial window (detail: until)
+    TRIAL_REVOKED = "TRIAL_REVOKED"  # operator cleared a trial early
 
 class PhoneNumberStatus(enum.Enum):
     AVAILABLE = "AVAILABLE"
@@ -112,6 +114,11 @@ class User(Base):
     # see crud_user.resolve_handoff_number. No uniqueness: two merchants may
     # share an ops phone, and this is an alert target, not identity.
     handoff_phone_number = Column(String, nullable=True)
+    # Operator-granted free trial (demo/trial access): while this is in the
+    # future, is_merchant_allowed_ai passes without a paid subscription.
+    # NULL = no trial. Expiry is enforced by the daily sweep re-syncing
+    # lapsed trials — access reads this live, but ai_enabled flips on sync.
+    trial_ends_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     accounts = relationship("WhatsAppAccount", back_populates="owner")

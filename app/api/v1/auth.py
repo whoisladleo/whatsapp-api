@@ -31,6 +31,8 @@ from app.schemas.auth import (
     MySubscriptionRead,
     PayNowRequest,
     PayNowResponse,
+    TrialGrantRequest,
+    TrialRead,
 )
 from app.crud import instagram as crud_instagram
 from app.crud import refresh_token as crud_refresh
@@ -488,6 +490,115 @@ def exit_impersonation(
         target_label=support_access.target_label(current_user),
     )
     return {"success": True}
+
+
+@router.post("/trial", response_model=TrialRead)
+def grant_trial(
+    payload: TrialGrantRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    _own_session: None = Depends(forbid_impersonated),
+):
+    """
+    Operator-only free trial (demo access): sets the merchant's
+    trial_ends_at, which is_merchant_allowed_ai honors like a paid
+    subscription until it passes. Same grant call re-grants (change the
+    window anytime); sync runs immediately so Amara flips on in this
+    request instead of at the next trigger.
+    """
+    from app.services import subscription_access
+
+    operator_label = support_access.operator_match(db, current_user)
+    if operator_label is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Support access only.",
+        )
+    if not check_and_increment(
+        f"trial:{current_user.id}", limit=30, window_seconds=3600
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many trial changes. Try again later.",
+        )
+    target = crud_user.get_user(db, payload.user_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="Merchant not found")
+
+    now = datetime.utcnow()
+    if payload.days is not None:
+        trial_ends_at = now + timedelta(days=payload.days)
+    else:
+        trial_ends_at = payload.ends_at
+        if trial_ends_at.tzinfo is not None:
+            trial_ends_at = trial_ends_at.replace(tzinfo=None)
+        if trial_ends_at <= now:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="ends_at must be in the future (revoke instead to end a trial now).",
+            )
+    target.trial_ends_at = trial_ends_at
+    db.commit()
+    subscription_access.sync_ai_access_for_merchant(db, target)
+    support_access.record_support_event(
+        db, current_user.id, target.id, SupportAccessKind.TRIAL_GRANTED,
+        operator_label=operator_label,
+        target_label=support_access.target_label(target),
+        detail=f"trial until {trial_ends_at.isoformat(timespec='minutes')}Z",
+    )
+    return TrialRead(
+        user_id=target.id,
+        trial_ends_at=trial_ends_at,
+        amara_active=subscription_access.is_merchant_allowed_ai(db, target),
+    )
+
+
+@router.delete("/trial/{user_id}", response_model=TrialRead)
+def revoke_trial(
+    user_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    _own_session: None = Depends(forbid_impersonated),
+):
+    """
+    Operator-only trial revoke: clears the window immediately (Amara flips
+    off in this request unless a paid subscription holds it on).
+    Idempotent — revoking a merchant with no trial still 200s.
+    """
+    from app.services import subscription_access
+
+    operator_label = support_access.operator_match(db, current_user)
+    if operator_label is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Support access only.",
+        )
+    if not check_and_increment(
+        f"trial:{current_user.id}", limit=30, window_seconds=3600
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many trial changes. Try again later.",
+        )
+    target = crud_user.get_user(db, user_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="Merchant not found")
+
+    had_trial = target.trial_ends_at is not None
+    target.trial_ends_at = None
+    db.commit()
+    subscription_access.sync_ai_access_for_merchant(db, target)
+    support_access.record_support_event(
+        db, current_user.id, target.id, SupportAccessKind.TRIAL_REVOKED,
+        operator_label=operator_label,
+        target_label=support_access.target_label(target),
+        detail="trial revoked" if had_trial else "revoke with no trial set (no-op)",
+    )
+    return TrialRead(
+        user_id=target.id,
+        trial_ends_at=None,
+        amara_active=subscription_access.is_merchant_allowed_ai(db, target),
+    )
 
 
 @router.get("/session", response_model=SessionRead)

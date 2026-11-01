@@ -437,3 +437,12 @@ Production-tier decisions only — what was chosen, what was considered and reje
 - *Pre-seeding a pending order at registration/first nudge.* Rejected: pay_now's reuse makes the seed redundant — identical end state with one less writer and no dead rows.
 - *Quick-reply button instead of a keyword.* Reversed during review: the owner submitted the template with a "Yes" quick-reply button, so taps now confirm payment too (platform-chat only — a shop's own buttons can never trigger one). The typed keyword stays as the fallback path.
 - *Firing a push per nudge without confirmation.* Rejected: unsolicited STK pushes, 30x over months, is spam — consent (the YES) precedes every prompt.
+
+## Operator trials (2026-11-02)
+
+**Chose:** free trials live on the user row (`trial_ends_at`, nullable; migration `a3d5f7b9c1e2`), honored by `is_merchant_allowed_ai` like a paid subscription while in the future — so the banner, the nudge sweep's targeting, and the access sync all treat a trial merchant as paid with zero special-casing. Operators set (days or absolute date), change, and revoke per merchant from a new Trial column on the admin page, backed by `POST /auth/trial` and `DELETE /auth/trial/{user_id}`: operator allow-list + no-impersonation + rate limit, mirroring the impersonate guards, with immediate sync (Amara flips in the same request) and `TRIAL_GRANTED`/`TRIAL_REVOKED` audit rows (own `ALTER TYPE` values in the same migration). Expiry is enforced by the daily sweep re-syncing lapsed trials that still have Amara on anywhere (~24h precision); merchants already fully off are skipped so the check stays free.
+
+**Considered and rejected:**
+- *A plain ai_enabled toggle the admin flips.* Rejected: the access sync would revert it for unpaid merchants on the next account update — the exact behavior that stops merchants re-enabling themselves stops operators too. The trial has to live inside the access decision, not beside it.
+- *Trial as a $0 ACTIVE subscription row.* Rejected: it would flow into billing/renewal machinery built for real money (past-due transitions, Tunzaa reconciliation); a timestamp the access check reads is total and touch-free.
+- *Per-request expiry (checking trial_ends_at on every AI reply).* Rejected: the AI path reads the stored ai_enabled flag, not the access check; re-sync-on-sweep matches how every other access transition already propagates.
