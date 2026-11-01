@@ -5,6 +5,7 @@ from app.core.config import settings
 from app.core.ids import coerce_uuid
 from app.core.provider import WhatsAppProvider
 from app.core.security import normalize_phone
+from app.crud import user as crud_user
 from app.db.models import User
 from app.db.session import SessionLocal
 from app.tasks.webhook_processing import _run_async
@@ -51,7 +52,7 @@ def send_usage_warning(merchant_id: str, percent: int):
         ]
         recipients = {
             normalize_phone(p)
-            for p in (merchant.username or merchant.phone_number, settings.OPS_ALERT_PHONE)
+            for p in (crud_user.resolve_handoff_number(merchant), settings.OPS_ALERT_PHONE)
             if p
         }
         provider = WhatsAppProvider(settings.WHATSAPP_TOKEN, settings.PHONE_NUMBER_ID)

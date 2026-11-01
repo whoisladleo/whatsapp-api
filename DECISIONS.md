@@ -213,3 +213,7 @@ Production-tier decisions only — what was chosen, what was considered and reje
 ## Dedicated handoff number (2026-11-01, #105)
 
 **Chose:** `User.handoff_phone_number` (nullable, no index/unique — read off the loaded row, and two merchants may share an ops phone). Alert resolution is handoff-number, then OTP `username`, then profile `phone_number`, skipping non-dialable values (also fixes social-login usernames silently breaking the old `username or phone_number` pick). PATCH /auth/me sets it (400 on non-dialable, empty clears); dashboard settings card beside Billing Phone. Usage alerts and catalog sync keep the old resolution — handoffs only, per scope.
+
+## Alert-number DRY (2026-11-01, #106)
+
+**Chose:** usage warnings use `resolve_handoff_number` too — one recipient resolution for all merchant alerts. Deliberately excluded: catalog sync's `merchant_phone` (public shop contact in catalog items, not an internal alert — the ops override must not leak there) and subscription/OTP identity matching (identity, not alerting).

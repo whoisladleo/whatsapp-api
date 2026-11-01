@@ -169,6 +169,23 @@ def test_usage_warning_goes_to_merchant_and_ops(db_session, merchant, monkeypatc
 
 
 @respx.mock
+def test_usage_warning_respects_handoff_number_override(db_session, merchant, monkeypatch):
+    merchant.handoff_phone_number = "255700000999"
+    db_session.commit()
+    monkeypatch.setattr(usage_alerts, "SessionLocal", lambda: db_session)
+    monkeypatch.setattr(settings, "OPS_ALERT_PHONE", "255726000000")
+    monkeypatch.setattr(settings, "PLAN_REPLY_LIMIT", 2000)
+    route = respx.post(url__regex=MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "wamid.usage"}]})
+    )
+
+    usage_alerts.send_usage_warning(str(merchant.id), 80)
+
+    sent = [json.loads(c.request.content) for c in route.calls]
+    assert sorted(s["to"] for s in sent) == ["255700000999", "255726000000"]
+
+
+@respx.mock
 def test_usage_warning_without_ops_phone_only_alerts_merchant(db_session, merchant, monkeypatch):
     monkeypatch.setattr(usage_alerts, "SessionLocal", lambda: db_session)
     monkeypatch.setattr(settings, "OPS_ALERT_PHONE", None)
