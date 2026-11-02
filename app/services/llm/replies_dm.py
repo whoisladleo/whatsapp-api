@@ -49,6 +49,7 @@ class DMReplyMixin:
         knowledge_content: Optional[str] = None,
         retry_on_outage: bool = False,
         turn_outcome: Optional[dict] = None,
+        proactive: bool = False,
     ) -> Optional[str]:
         """
         Generates Amara's reply to an ongoing Instagram DM conversation:
@@ -141,6 +142,17 @@ RULES:
 Reply with ONLY the message text (plus whichever marker applies, if any) — no other formatting.
 """
 
+        user_content = f'Recent conversation:\n{history_str}\nCustomer just sent: "{message_body}"\n\nRespond as Amara:'
+        if proactive:
+            # Operator-triggered (/direct): no new DM exists, so the
+            # "just sent" framing would be a lie — say so instead.
+            user_content = (
+                f"Recent conversation:\n{history_str}\n"
+                "The customer has not sent a new message — the shop owner "
+                "asked you to proactively send the steered message now. "
+                "Write it directly, in the conversation's language."
+                "\n\nRespond as Amara:"
+            )
         try:
             response_text = await _complete_with_retry(
                 self.provider,
@@ -148,7 +160,7 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
                 messages=[
                     {
                         "role": "user",
-                        "content": f'Recent conversation:\n{history_str}\nCustomer just sent: "{message_body}"\n\nRespond as Amara:',
+                        "content": user_content,
                     }
                 ],
                 max_tokens=500,
@@ -157,12 +169,19 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
             # Cut off even at the doubled cap — hand off with the holding
             # reply rather than send a mid-sentence fragment (#103).
             logger.warning("DM-response LLM cut off after retry; handing off.")
+            if proactive:
+                # Operator-triggered: report failure to the operator
+                # (who re-arms the directive) instead of flipping a
+                # conversation they didn't ask to hand off.
+                return None
             await self._hand_off_instagram(db, account, customer, context, message_body)
             return _holding_reply(None)
         except Exception as e:
             if retry_on_outage and _is_transient_llm_error(e):
                 raise LLMUnavailable(str(e)) from e
             logger.error(f"DM-response LLM error; handing off: {e}")
+            if proactive:
+                return None
             await self._hand_off_instagram(db, account, customer, context, message_body)
             return _outage_reply(None)
 
@@ -171,6 +190,8 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
             # hand off (the holding line promises a human follows up) and
             # send the same holding reply a failed close uses (#101).
             logger.warning("DM-response LLM empty after retry; handing off.")
+            if proactive:
+                return None
             await self._hand_off_instagram(db, account, customer, context, message_body)
             return _holding_reply(None)
 
@@ -183,12 +204,20 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
             response_text = response_text.replace("[HUMAN_HANDOFF]", "").strip()
             if not response_text:
                 response_text = "I am transferring you to a member of our team who can help you further. Please hold."
-            await self._hand_off_instagram(db, account, customer, context, message_body)
+            # Proactive (/direct) turns strip the marker but never
+            # trigger — the operator is already here.
+            if not proactive:
+                await self._hand_off_instagram(db, account, customer, context, message_body)
             return response_text
 
         response_text, agreement = _parse_and_strip_agreement(response_text)
         if agreement:
             _mark_turn_outcome(turn_outcome, "markers_seen")
+            if proactive:
+                # A proactive turn carries no customer consent — Amara's
+                # words go out, but no order is ever closed from them.
+                logger.warning("AGREEMENT_REACHED in a proactive turn; sending words only, no close.")
+                return response_text
             try:
                 note = await self._close_instagram_deal(db, account, customer, agreement)
             except Exception as deal_err:
@@ -202,14 +231,16 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
             if note:
                 _mark_turn_outcome(turn_outcome, "order_action")
                 response_text = f"{response_text}\n\n{note}".strip()
-        elif quote:
+        elif quote and not proactive:
             self._record_quote(db, account.user_id, quote, "instagram_dm", instagram_account_id=account.id)
 
         # Same payment-resend path as WhatsApp (see generate_response
         # step 3b) — only the order lookup keys, phone source, and close
         # call differ. Skipped when this turn already closed (handoff
         # early-returns above).
-        if resend is not None and not agreement:
+        if resend is not None and proactive:
+            logger.warning("RESEND_PAYMENT in a proactive turn; sending words only, no re-fire.")
+        elif resend is not None and not agreement:
             _mark_turn_outcome(turn_outcome, "markers_seen")
             live_order = (
                 db.query(Order)

@@ -56,6 +56,7 @@ class WAReplyMixin:
         account: WhatsAppAccount = None,
         retry_on_outage: bool = False,
         turn_outcome: Optional[dict] = None,
+        proactive: bool = False,
     ) -> str:
         if not self.client:
             return "AI service is currently unavailable."
@@ -85,8 +86,10 @@ class WAReplyMixin:
         # regardless of what (if anything) this turn's reply ends up being.
         # This is the main defense against a stale nudge firing later; the
         # nudge task itself also re-checks validity at fire time as a
-        # second layer (see app/tasks/quote_nudges.py).
-        if context.pending_quote_at is not None:
+        # second layer (see app/tasks/quote_nudges.py). Skipped for
+        # proactive (/direct) turns — no new inbound arrived, so there is
+        # no "no longer quiet" signal to act on.
+        if context.pending_quote_at is not None and not proactive:
             context.pending_quote_price = None
             context.pending_quote_at = None
             context.quote_nudge_count = 0
@@ -349,6 +352,18 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
             # temperature is deprecated/rejected for this model (confirmed
             # live against the real API — not documented ahead of time) —
             # omitted rather than guessing at a replacement parameter.
+            user_content = f"Recent Conversation:\n{chat_history_str}\n\nRespond as Amara:"
+            if proactive:
+                # Operator-triggered (/direct): no new customer message
+                # exists, so say so — otherwise Amara answers a question
+                # nobody asked.
+                user_content = (
+                    f"Recent Conversation:\n{chat_history_str}\n\n"
+                    "The customer has not sent a new message — the shop owner "
+                    "asked you to proactively send the steered message now. "
+                    "Write it directly, in the conversation's language."
+                    "\n\nRespond as Amara:"
+                )
             try:
                 response_text = await _complete_with_retry(
                     self.provider,
@@ -356,7 +371,7 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
                     messages=[
                         {
                             "role": "user",
-                            "content": f"Recent Conversation:\n{chat_history_str}\n\nRespond as Amara:",
+                            "content": user_content,
                         }
                     ],
                     max_tokens=1024,
@@ -365,6 +380,11 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
                 # Cut off even at the doubled cap — hand off with the
                 # holding reply rather than send a mid-sentence fragment (#103).
                 logger.warning("LLM cut off after retry; handing off.")
+                if proactive:
+                    # Operator-triggered: report failure to the operator
+                    # (who re-arms the directive) instead of flipping a
+                    # conversation they didn't ask to hand off.
+                    return None
                 await self._trigger_human_handoff(
                     db, account, context, from_phone, message_body, is_platform_account
                 )
@@ -373,6 +393,8 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
                 if retry_on_outage and _is_transient_llm_error(e):
                     raise LLMUnavailable(str(e)) from e
                 logger.error(f"LLM error; handing off: {e}")
+                if proactive:
+                    return None
                 await self._trigger_human_handoff(
                     db, account, context, from_phone, message_body, is_platform_account
                 )
@@ -382,6 +404,8 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
                 # Empty even after the inline retry — don't end in
                 # silence: hand off and send the holding reply (#101).
                 logger.warning("LLM empty after retry; handing off.")
+                if proactive:
+                    return None
                 await self._trigger_human_handoff(
                     db, account, context, from_phone, message_body, is_platform_account
                 )
@@ -397,12 +421,14 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
                 customer.language = detected_language
                 db.commit()
 
-            # 2. Human Handoff
+            # 2. Human Handoff. Proactive (/direct) turns strip the
+            # marker but never trigger — the operator is already here.
             if "[HUMAN_HANDOFF]" in response_text:
                 response_text = response_text.replace("[HUMAN_HANDOFF]", "").strip()
-                await self._trigger_human_handoff(
-                    db, account, context, from_phone, message_body, is_platform_account
-                )
+                if not proactive:
+                    await self._trigger_human_handoff(
+                        db, account, context, from_phone, message_body, is_platform_account
+                    )
 
                 if not response_text:
                     response_text = "I am transferring you to a human agent who can help you further. Please hold."
@@ -418,7 +444,11 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
             response_text, agreement = _parse_and_strip_agreement(response_text)
             if agreement:
                 _mark_turn_outcome(turn_outcome, "markers_seen")
-                if context.state == ConversationState.HUMAN_HANDOFF:
+                if proactive:
+                    # A proactive turn carries no customer consent — Amara's
+                    # words go out, but no order is ever closed from them.
+                    logger.warning("AGREEMENT_REACHED in a proactive turn; sending words only, no close.")
+                elif context.state == ConversationState.HUMAN_HANDOFF:
                     logger.warning("AGREEMENT_REACHED marker seen on a handed-off turn; ignoring.")
                 else:
                     try:
@@ -450,7 +480,9 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
             # terms, so Amara is never left telling the buyer "it's on
             # its way" with nothing behind it.
             response_text, resend = _parse_and_strip_resend(response_text)
-            if resend is not None and not agreement and context.state != ConversationState.HUMAN_HANDOFF:
+            if resend is not None and proactive:
+                logger.warning("RESEND_PAYMENT in a proactive turn; sending words only, no re-fire.")
+            elif resend is not None and not agreement and context.state != ConversationState.HUMAN_HANDOFF:
                 _mark_turn_outcome(turn_outcome, "markers_seen")
                 live_order = (
                     db.query(Order)
@@ -549,7 +581,7 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
             # handoff or an agreement reached in this same turn — either
             # means there's nothing to nudge about.
             response_text, quote = _parse_and_strip_quote(response_text)
-            if quote and not agreement and not is_platform_account and context.state != ConversationState.HUMAN_HANDOFF:
+            if quote and not agreement and not is_platform_account and context.state != ConversationState.HUMAN_HANDOFF and not proactive:
                 await self._track_quote(
                     db, account, context, quote, from_phone, message_body, is_platform_account
                 )

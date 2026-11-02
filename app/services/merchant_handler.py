@@ -1,10 +1,17 @@
+import logging
 import re
 import uuid
 
 from sqlalchemy.orm import Session
+from app.core.attachments import describe_attachments
+from app.core.instagram_provider import InstagramProvider
+from app.core.provider import WhatsAppProvider
 from app.core.security import normalize_phone
 from app.db.models import (
+    ConversationState,
     Customer,
+    InstagramAccount,
+    InstagramCustomer,
     WhatsAppAccount,
     Product,
     Message,
@@ -14,6 +21,7 @@ from app.db.models import (
 )
 from app.crud import message as crud_message
 from app.crud import instagram as crud_instagram
+from app.services import usage
 from app.services.handoff_flow import (
     list_pending_handoffs,
     relay_to_instagram_customer,
@@ -23,6 +31,8 @@ from app.services.handoff_flow import (
     set_directive_wa,
 )
 from app.services.payment_resend import ResendOutcome, merchant_resend_order
+
+logger = logging.getLogger(__name__)
 
 async def handle_merchant_message(db: Session, account: WhatsAppAccount, message_body: str, from_phone: str) -> str:
     """
@@ -61,7 +71,7 @@ async def handle_merchant_message(db: Session, account: WhatsAppAccount, message
             "`/reply @their_instagram_username Your message`\n"
             "- To re-fire a dead payment prompt: `/resend 2557XXXXXXXX` or "
             "`/resend @their_instagram_username`\n"
-            "- To steer Amara's next reply: `/direct 2557XXXXXXXX Your instruction` or "
+            "- To make Amara message a customer right now: `/direct 2557XXXXXXXX Your instruction` or "
             "`/direct @their_instagram_username Your instruction`"
         )
 
@@ -271,7 +281,24 @@ async def _direct_pending_pick(
     if pick["channel"] == "instagram":
         if not set_directive_ig(uuid.UUID(pick["customer_id"]), instruction):
             return "Couldn't save that instruction — please try again."
-        return f"Amara's next reply to {pick['name']} will follow this instruction: {instruction}"
+        ig_customer = (
+            db.query(InstagramCustomer)
+            .filter(InstagramCustomer.id == uuid.UUID(pick["customer_id"]))
+            .first()
+        )
+        # Instagram picks carry account_id=None — the account comes from
+        # the customer row instead.
+        ig_account = (
+            db.query(InstagramAccount)
+            .filter(InstagramAccount.id == ig_customer.account_id)
+            .first()
+            if ig_customer
+            else None
+        )
+        if not ig_account or not ig_customer:
+            return "That Instagram conversation is no longer connected."
+        who = f"@{ig_customer.username or ig_customer.ig_scoped_id}"
+        return await _send_direct_now_ig(db, ig_account, ig_customer, who, instruction)
     pick_account = (
         db.query(WhatsAppAccount).filter(WhatsAppAccount.id == uuid.UUID(pick["account_id"])).first()
     )
@@ -285,9 +312,9 @@ async def _direct_whatsapp_customer(
 ) -> str:
     """
     `/direct 2557XXXXXXXX <instruction>`: arms a one-shot hidden steering
-    instruction for Amara's next generated reply in this conversation.
-    Requires prior message history with this account, like /reply's relay
-    — a typo'd number must not arm a phantom directive.
+    instruction and has Amara send it right now. Requires prior message
+    history with this account, like /reply's relay — a typo'd number must
+    not arm a phantom directive.
     """
     normalized = normalize_phone(phone)
     customer = _find_customer_by_phone(db, normalized, phone)
@@ -302,7 +329,95 @@ async def _direct_whatsapp_customer(
         return f"No conversation with {normalized} found for this account."
     if not set_directive_wa(account.id, customer.id, instruction):
         return "Couldn't save that instruction — please try again."
-    return f"Amara's next reply to {normalized} will follow this instruction: {instruction}"
+    return await _send_direct_now_wa(db, account, customer, normalized, instruction)
+
+
+async def _send_direct_now_wa(
+    db: Session,
+    account: WhatsAppAccount,
+    customer: Customer,
+    phone_display: str,
+    instruction: str,
+) -> str:
+    """
+    Instant half of /direct (WhatsApp): generates Amara's steered reply
+    now and sends it, instead of waiting for the customer's next message.
+    Anything that prevents a send (handoff, quota, outage, Meta rejection)
+    keeps the already-armed directive queued for her next generated reply
+    and says so — never silently dropped.
+    """
+    from app.services.llm import llm_service
+
+    if llm_service is None or llm_service.client is None:
+        return (
+            f"Amara is unavailable right now — kept queued; her next reply to "
+            f"{phone_display} will follow this instruction: {instruction}"
+        )
+    holding = usage.check_reply_quota(db, account.owner) if account.owner else None
+    if holding is not None:
+        return (
+            f"Reply allowance exhausted — kept queued for {phone_display}; it will "
+            f"apply once replies renew: {instruction}"
+        )
+    context = crud_message.get_or_create_context(db, customer.id, account.id)
+    if context.state == ConversationState.HUMAN_HANDOFF:
+        # generate_response would return None without consuming — the
+        # directive is still armed.
+        return (
+            f"That conversation is handed off to you — /resume it first; kept "
+            f"queued for {phone_display}: {instruction}"
+        )
+    try:
+        response_text = await llm_service.generate_response(
+            message_body="",
+            product_slug=account.product_slug,
+            system_prompt=account.system_prompt,
+            from_phone=customer.phone_number,
+            db=db,
+            account=account,
+            proactive=True,
+        )
+    except Exception as e:
+        logger.error(f"Instant /direct generation failed for {phone_display}: {e}")
+        set_directive_wa(account.id, customer.id, instruction)
+        return (
+            f"Couldn't generate Amara's message just now — kept queued for "
+            f"{phone_display}: {instruction}"
+        )
+    if not response_text:
+        # Proactive generation failed (outage/empty/cutoff returns None
+        # without handing off) after consuming the directive — re-arm it.
+        set_directive_wa(account.id, customer.id, instruction)
+        return (
+            f"Amara's having trouble right now — kept queued for {phone_display}, "
+            f"try again in a bit: {instruction}"
+        )
+    provider = WhatsAppProvider(account.access_token, account.phone_number_id)
+    try:
+        resp = await provider.send_text(customer.phone_number, response_text)
+    except Exception as e:
+        logger.error(f"Instant /direct send failed for {phone_display}: {e}")
+        resp = None
+    crud_message.create_message(
+        db,
+        {
+            "to_phone": customer.phone_number,
+            "type": "text",
+            "body": response_text,
+            "direction": "outbound",
+            "status": "sent" if resp and "messages" in resp else "failed",
+            "raw": resp or {},
+        },
+        account.id,
+    )
+    if resp and "messages" in resp:
+        usage.record_reply(db, account.user_id, "whatsapp", account_id=account.id)
+        return f"Sent to {phone_display}: {response_text}"
+    set_directive_wa(account.id, customer.id, instruction)
+    return (
+        f"Couldn't deliver to {phone_display} just now (Meta rejected it — likely "
+        f"outside the 24h window). Kept queued for Amara's next reply."
+    )
 
 
 def _find_customer_by_phone(db: Session, normalized: str, raw: str):
@@ -329,7 +444,94 @@ async def _direct_instagram_customer(
     if not set_directive_ig(ig_customer.id, instruction):
         return "Couldn't save that instruction — please try again."
     who = f"@{ig_customer.username or ig_customer.ig_scoped_id}"
-    return f"Amara's next reply to {who} will follow this instruction: {instruction}"
+    return await _send_direct_now_ig(db, ig_account, ig_customer, who, instruction)
+
+
+async def _send_direct_now_ig(
+    db: Session,
+    ig_account: InstagramAccount,
+    ig_customer: InstagramCustomer,
+    who: str,
+    instruction: str,
+) -> str:
+    """
+    Instant half of /direct (Instagram): the counterpart to
+    _send_direct_now_wa — same arm-then-send contract, same keep-queued
+    fallbacks. The handoff check lives here because the IG generator (unlike
+    the WhatsApp one) has no handoff early-return of its own.
+    """
+    from app.services.llm import llm_service
+
+    if llm_service is None or llm_service.client is None:
+        return (
+            f"Amara is unavailable right now — kept queued; her next reply to "
+            f"{who} will follow this instruction: {instruction}"
+        )
+    context = crud_instagram.get_or_create_conversation(db, ig_customer.id)
+    if context.state == ConversationState.HUMAN_HANDOFF:
+        return (
+            f"That conversation is handed off to you — /resume it first; kept "
+            f"queued for {who}: {instruction}"
+        )
+    holding = usage.check_reply_quota(db, ig_account.owner) if ig_account.owner else None
+    if holding is not None:
+        return (
+            f"Reply allowance exhausted — kept queued for {who}; it will "
+            f"apply once replies renew: {instruction}"
+        )
+    history = [
+        {"direction": m.direction, "body": m.body or describe_attachments(m.attachments)}
+        for m in crud_instagram.get_dm_history(db, ig_customer.id, limit=20)
+    ]
+    try:
+        response_text = await llm_service.generate_dm_response(
+            message_body="",
+            db=db,
+            account=ig_account,
+            customer=ig_customer,
+            context=context,
+            conversation_history=history,
+            account_name=ig_account.username or "the shop",
+            proactive=True,
+        )
+    except Exception as e:
+        logger.error(f"Instant /direct generation failed for {who}: {e}")
+        set_directive_ig(ig_customer.id, instruction)
+        return f"Couldn't generate Amara's message just now — kept queued for {who}: {instruction}"
+    if not response_text:
+        # Proactive generation failed (outage/empty/cutoff returns None
+        # without handing off) after consuming the directive — re-arm it.
+        # (No-client None can't reach here — the pre-check above returns
+        # first — but the re-arm is harmless either way.)
+        set_directive_ig(ig_customer.id, instruction)
+        return (
+            f"Amara's having trouble right now — kept queued for {who}, "
+            f"try again in a bit: {instruction}"
+        )
+    provider = InstagramProvider(ig_account.access_token)
+    try:
+        resp = await provider.send_direct_message(
+            ig_account.ig_business_id, ig_customer.ig_scoped_id, response_text
+        )
+    except Exception as e:
+        logger.error(f"Instant /direct send failed for {who}: {e}")
+        resp = {"error": str(e)}
+    crud_instagram.create_direct_message(
+        db,
+        account_id=ig_account.id,
+        customer_id=ig_customer.id,
+        direction="outbound",
+        body=response_text,
+        ig_message_id=(resp or {}).get("message_id"),
+    )
+    if resp and "error" not in resp:
+        usage.record_reply(db, ig_account.user_id, "instagram_dm", instagram_account_id=ig_account.id)
+        return f"Sent to {who}: {response_text}"
+    set_directive_ig(ig_customer.id, instruction)
+    return (
+        f"Couldn't deliver to {who} just now (Meta rejected it — likely "
+        f"outside the 24h window). Kept queued for Amara's next reply."
+    )
 
 
 def _render_resend_result(who: str, order: Order, result) -> str:
