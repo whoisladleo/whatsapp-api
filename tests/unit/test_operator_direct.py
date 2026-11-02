@@ -1,3 +1,4 @@
+import uuid
 from datetime import datetime
 
 import fakeredis
@@ -11,13 +12,15 @@ from app.db.models import (
     InstagramAccount,
     InstagramConversationContext,
     InstagramCustomer,
+    InstagramDirectMessage,
     Message,
+    Order,
     User,
     WhatsAppAccount,
 )
 from app.services.handoff_flow import consume_directive_ig, consume_directive_wa
-from app.services.llm import LLMService
-from app.services.merchant_handler import handle_merchant_message
+from app.services.llm import LLMLengthCutoff, LLMService
+from app.services.merchant_handler import _direct_pending_pick, handle_merchant_message
 
 
 class _FakeMessages:
@@ -64,6 +67,14 @@ def _pin_claude_provider(monkeypatch):
 @pytest.fixture(autouse=True)
 def _fake_redis(monkeypatch):
     monkeypatch.setattr(flow_module, "redis_client", fakeredis.FakeRedis())
+
+
+@pytest.fixture(autouse=True)
+def _no_default_llm_service(monkeypatch):
+    # Instant-send needs a configured LLM; without one /direct stays
+    # queued. Pin that so these tests never depend on ambient API keys —
+    # instant-path tests below override with a fake service.
+    monkeypatch.setattr("app.services.llm.llm_service", None)
 
 
 @pytest.fixture
@@ -371,3 +382,496 @@ async def test_directive_survives_handed_off_turn(db_session, shop_account):
 
     assert reply is None  # still handed off — nothing generated
     assert consume_directive_wa(shop_account.id, customer.id) == "STEER_PAUSED wait for resume"
+
+
+# --- instant send ----------------------------------------------------------
+
+
+class _FakeWAProvider:
+    def __init__(self, resp):
+        self._resp = resp
+        self.calls = []
+
+    async def send_text(self, to, body, **kwargs):
+        self.calls.append({"to": to, "body": body})
+        if isinstance(self._resp, Exception):
+            raise self._resp
+        return self._resp
+
+
+class _FakeIGProvider:
+    def __init__(self, resp):
+        self._resp = resp
+        self.calls = []
+
+    async def send_direct_message(self, biz_id, scoped_id, body):
+        self.calls.append({"biz": biz_id, "scoped": scoped_id, "body": body})
+        if isinstance(self._resp, Exception):
+            raise self._resp
+        return self._resp
+
+
+class _RaisingService:
+    client = object()
+
+    async def generate_response(self, **kwargs):
+        raise RuntimeError("boom")
+
+    async def generate_dm_response(self, **kwargs):
+        raise RuntimeError("boom")
+
+
+def _raising_llm_service(exc):
+    async def handler(**kwargs):
+        raise exc
+
+    return _service_with_fake_client(handler=handler)
+
+
+def _arm_instant(monkeypatch, provider):
+    monkeypatch.setattr(
+        "app.services.merchant_handler.WhatsAppProvider", lambda *a: provider
+    )
+    monkeypatch.setattr(
+        "app.services.merchant_handler.InstagramProvider", lambda *a: provider
+    )
+
+
+async def test_direct_whatsapp_sends_instantly(db_session, shop_account, monkeypatch):
+    phone = "255722223339"
+    customer = _customer_with_history(db_session, shop_account, phone)
+    monkeypatch.setattr(
+        "app.services.llm.llm_service",
+        _service_with_fake_client(reply_text="Here are your onboarding steps: open the dashboard."),
+    )
+    provider = _FakeWAProvider({"messages": [{"id": "wamid.direct1"}]})
+    _arm_instant(monkeypatch, provider)
+
+    reply = await handle_merchant_message(
+        db_session, shop_account, f"/direct {phone} send onboarding instructions",
+        "255700000111",
+    )
+
+    assert f"Sent to {phone}" in reply
+    assert "Here are your onboarding steps" in reply
+    assert provider.calls == [{"to": phone, "body": "Here are your onboarding steps: open the dashboard."}]
+    sent = (
+        db_session.query(Message)
+        .filter(Message.to_phone == phone, Message.direction == "outbound")
+        .all()
+    )
+    assert len(sent) == 1 and sent[0].status == "sent"
+    assert consume_directive_wa(shop_account.id, customer.id) is None
+
+
+async def test_direct_whatsapp_send_failure_rearms(db_session, shop_account, monkeypatch):
+    phone = "255722223340"
+    customer = _customer_with_history(db_session, shop_account, phone)
+    monkeypatch.setattr(
+        "app.services.llm.llm_service",
+        _service_with_fake_client(reply_text="Hello!"),
+    )
+    _arm_instant(monkeypatch, _FakeWAProvider({"error": {"code": 131047}}))
+
+    reply = await handle_merchant_message(
+        db_session, shop_account, f"/direct {phone} Say hello", "255700000111"
+    )
+
+    assert "Couldn't deliver" in reply and "Kept queued" in reply
+    failed = (
+        db_session.query(Message)
+        .filter(Message.to_phone == phone, Message.direction == "outbound")
+        .all()
+    )
+    assert len(failed) == 1 and failed[0].status == "failed"
+    assert consume_directive_wa(shop_account.id, customer.id) == "Say hello"
+
+
+async def test_direct_whatsapp_handoff_keeps_queued(db_session, shop_account, monkeypatch):
+    phone = "255722223341"
+    customer = _customer_with_history(db_session, shop_account, phone)
+    _hand_off_wa(db_session, customer)
+    monkeypatch.setattr(
+        "app.services.llm.llm_service", _service_with_fake_client(reply_text="Hello!")
+    )
+    provider = _FakeWAProvider({"messages": [{"id": "wamid.direct2"}]})
+    _arm_instant(monkeypatch, provider)
+
+    reply = await handle_merchant_message(
+        db_session, shop_account, f"/direct {phone} Say hello", "255700000111"
+    )
+
+    assert "/resume" in reply and "kept queued" in reply.lower()
+    assert provider.calls == []
+    assert consume_directive_wa(shop_account.id, customer.id) == "Say hello"
+
+
+async def test_direct_whatsapp_quota_exhausted_keeps_queued(
+    db_session, shop_account, monkeypatch
+):
+    phone = "255722223342"
+    customer = _customer_with_history(db_session, shop_account, phone)
+    captured = {}
+    monkeypatch.setattr(
+        "app.services.llm.llm_service",
+        _service_with_fake_client(captured=captured, reply_text="Hello!"),
+    )
+    monkeypatch.setattr(
+        "app.services.usage.check_reply_quota", lambda db, merchant: "holding!"
+    )
+
+    reply = await handle_merchant_message(
+        db_session, shop_account, f"/direct {phone} Say hello", "255700000111"
+    )
+
+    assert "exhausted" in reply and "kept queued" in reply.lower()
+    assert captured == {}  # never generated
+    assert consume_directive_wa(shop_account.id, customer.id) == "Say hello"
+
+
+async def test_direct_instagram_sends_instantly(db_session, shop_account, ig_setup, monkeypatch):
+    ig_account, ig_customer, _ = ig_setup
+    monkeypatch.setattr(
+        "app.services.llm.llm_service",
+        _service_with_fake_client(reply_text="Thanks for reaching out!"),
+    )
+    provider = _FakeIGProvider({"message_id": "mid.direct1"})
+    _arm_instant(monkeypatch, provider)
+
+    reply = await handle_merchant_message(
+        db_session, shop_account, "/direct @buyer1 Thank them warmly", "255700000111"
+    )
+
+    assert "Sent to @buyer1" in reply
+    assert "Thanks for reaching out!" in reply
+    assert provider.calls[0]["scoped"] == "igsid_direct"
+    dms = (
+        db_session.query(InstagramDirectMessage)
+        .filter(
+            InstagramDirectMessage.customer_id == ig_customer.id,
+            InstagramDirectMessage.direction == "outbound",
+        )
+        .all()
+    )
+    assert len(dms) == 1 and dms[0].ig_message_id == "mid.direct1"
+    assert consume_directive_ig(ig_customer.id) is None
+    assert ig_account.id is not None
+
+
+async def test_direct_instagram_send_failure_rearms(
+    db_session, shop_account, ig_setup, monkeypatch
+):
+    _, ig_customer, _ = ig_setup
+    monkeypatch.setattr(
+        "app.services.llm.llm_service",
+        _service_with_fake_client(reply_text="Hello!"),
+    )
+    _arm_instant(monkeypatch, _FakeIGProvider({"error": {"code": 10}}))
+
+    reply = await handle_merchant_message(
+        db_session, shop_account, "/direct @buyer1 Say hello", "255700000111"
+    )
+
+    assert "Couldn't deliver" in reply and "Kept queued" in reply
+    assert consume_directive_ig(ig_customer.id) == "Say hello"
+
+
+async def test_direct_instagram_handoff_keeps_queued(
+    db_session, shop_account, ig_setup, monkeypatch
+):
+    _, ig_customer, ig_context = ig_setup
+    ig_context.state = ConversationState.HUMAN_HANDOFF
+    ig_context.handoff_at = datetime.utcnow()
+    db_session.commit()
+    monkeypatch.setattr(
+        "app.services.llm.llm_service", _service_with_fake_client(reply_text="Hello!")
+    )
+    provider = _FakeIGProvider({"message_id": "mid.direct2"})
+    _arm_instant(monkeypatch, provider)
+
+    reply = await handle_merchant_message(
+        db_session, shop_account, "/direct @buyer1 Say hello", "255700000111"
+    )
+
+    assert "/resume" in reply and "kept queued" in reply.lower()
+    assert provider.calls == []
+    assert consume_directive_ig(ig_customer.id) == "Say hello"
+
+
+# --- proactive mode: words go out, side effects never fire -----------------
+
+
+async def test_proactive_skips_close_side_effects_wa(db_session, shop_account):
+    phone = "255722223343"
+    _customer_with_history(db_session, shop_account, phone)
+
+    reply = await _service_with_fake_client(
+        reply_text="Great, deal! [AGREEMENT_REACHED: product=Shoes price=45000 payment=full]"
+    ).generate_response(
+        message_body="", from_phone=phone, db=db_session, account=shop_account,
+        proactive=True,
+    )
+
+    assert "[AGREEMENT_REACHED" not in reply
+    assert "Great, deal!" in reply
+    assert db_session.query(Order).count() == 0
+
+
+async def test_proactive_skips_handoff_quote_resend_wa(db_session, shop_account):
+    phone = "255722223344"
+    customer = _customer_with_history(db_session, shop_account, phone)
+
+    reply = await _service_with_fake_client(
+        reply_text="[HUMAN_HANDOFF] hold on [QUOTE: product=Shoes price=45000] "
+        "[RESEND_PAYMENT: product=Shoes price=45000 payment=full]"
+    ).generate_response(
+        message_body="", from_phone=phone, db=db_session, account=shop_account,
+        proactive=True,
+    )
+
+    assert "[HUMAN_HANDOFF]" not in reply
+    assert "[QUOTE" not in reply and "[RESEND_PAYMENT" not in reply
+    context = (
+        db_session.query(ConversationContext)
+        .filter(ConversationContext.customer_id == customer.id)
+        .first()
+    )
+    assert context.state != ConversationState.HUMAN_HANDOFF
+    assert context.pending_quote_at is None
+    assert db_session.query(Order).count() == 0
+
+
+async def test_proactive_skips_close_side_effects_ig(db_session, ig_setup):
+    ig_account, ig_customer, ig_context = ig_setup
+
+    reply = await _service_with_fake_client(
+        reply_text="Deal! [AGREEMENT_REACHED: product=Shoes price=45000 payment=full phone=255700000000]"
+    ).generate_dm_response(
+        "", db=db_session, account=ig_account, customer=ig_customer,
+        context=ig_context, conversation_history=[], proactive=True,
+    )
+
+    assert "[AGREEMENT_REACHED" not in reply
+    assert "Deal!" in reply
+    assert db_session.query(Order).count() == 0
+
+
+async def test_proactive_user_content_notes_no_new_message(db_session, shop_account):
+    phone = "255722223345"
+    _customer_with_history(db_session, shop_account, phone)
+
+    proactive_captured, normal_captured = {}, {}
+    await _service_with_fake_client(captured=proactive_captured).generate_response(
+        message_body="", from_phone=phone, db=db_session, account=shop_account,
+        proactive=True,
+    )
+    await _service_with_fake_client(captured=normal_captured).generate_response(
+        message_body="hi", from_phone=phone, db=db_session, account=shop_account,
+    )
+
+    proactive_content = proactive_captured["messages"][0]["content"]
+    normal_content = normal_captured["messages"][0]["content"]
+    assert "has not sent a new message" in proactive_content
+    assert "has not sent a new message" not in normal_content
+
+
+# --- failure hardening: re-arm, never silently drop ------------------------
+
+
+async def test_direct_whatsapp_outage_rearms_without_handoff(
+    db_session, shop_account, monkeypatch
+):
+    phone = "255722223346"
+    customer = _customer_with_history(db_session, shop_account, phone)
+    monkeypatch.setattr(
+        "app.services.llm.llm_service", _raising_llm_service(RuntimeError("down"))
+    )
+    provider = _FakeWAProvider({"messages": [{"id": "wamid.direct3"}]})
+    _arm_instant(monkeypatch, provider)
+
+    reply = await handle_merchant_message(
+        db_session, shop_account, f"/direct {phone} Say hello", "255700000111"
+    )
+
+    assert "having trouble" in reply and "kept queued" in reply.lower()
+    assert provider.calls == []
+    context = (
+        db_session.query(ConversationContext)
+        .filter(ConversationContext.customer_id == customer.id)
+        .first()
+    )
+    assert context.state != ConversationState.HUMAN_HANDOFF
+    assert consume_directive_wa(shop_account.id, customer.id) == "Say hello"
+
+
+async def test_direct_instagram_outage_rearms_without_handoff(
+    db_session, shop_account, ig_setup, monkeypatch
+):
+    _, ig_customer, ig_context = ig_setup
+    monkeypatch.setattr(
+        "app.services.llm.llm_service", _raising_llm_service(RuntimeError("down"))
+    )
+    provider = _FakeIGProvider({"message_id": "mid.direct3"})
+    _arm_instant(monkeypatch, provider)
+
+    reply = await handle_merchant_message(
+        db_session, shop_account, "/direct @buyer1 Say hello", "255700000111"
+    )
+
+    assert "having trouble" in reply and "kept queued" in reply.lower()
+    assert provider.calls == []
+    db_session.refresh(ig_context)
+    assert ig_context.state != ConversationState.HUMAN_HANDOFF
+    assert consume_directive_ig(ig_customer.id) == "Say hello"
+
+
+async def test_proactive_cutoff_and_empty_return_none(db_session, shop_account):
+    phone = "255722223347"
+    _customer_with_history(db_session, shop_account, phone)
+
+    cutoff = await _raising_llm_service(LLMLengthCutoff("cut")).generate_response(
+        message_body="", from_phone=phone, db=db_session, account=shop_account,
+        proactive=True,
+    )
+    empty = await _service_with_fake_client(reply_text="   ").generate_response(
+        message_body="", from_phone=phone, db=db_session, account=shop_account,
+        proactive=True,
+    )
+
+    assert cutoff is None
+    assert empty is None
+
+
+async def test_proactive_cutoff_and_empty_return_none_ig(db_session, ig_setup):
+    ig_account, ig_customer, ig_context = ig_setup
+
+    cutoff = await _raising_llm_service(LLMLengthCutoff("cut")).generate_dm_response(
+        "", db=db_session, account=ig_account, customer=ig_customer,
+        context=ig_context, conversation_history=[], proactive=True,
+    )
+    empty = await _service_with_fake_client(reply_text="  ").generate_dm_response(
+        "", db=db_session, account=ig_account, customer=ig_customer,
+        context=ig_context, conversation_history=[], proactive=True,
+    )
+
+    assert cutoff is None
+    assert empty is None
+
+
+async def test_direct_whatsapp_generation_error_rearms(
+    db_session, shop_account, monkeypatch
+):
+    phone = "255722223348"
+    customer = _customer_with_history(db_session, shop_account, phone)
+    monkeypatch.setattr("app.services.llm.llm_service", _RaisingService())
+
+    reply = await handle_merchant_message(
+        db_session, shop_account, f"/direct {phone} Say hello", "255700000111"
+    )
+
+    assert "Couldn't generate" in reply and "kept queued" in reply.lower()
+    assert consume_directive_wa(shop_account.id, customer.id) == "Say hello"
+
+
+async def test_direct_instagram_generation_error_rearms(
+    db_session, shop_account, ig_setup, monkeypatch
+):
+    _, ig_customer, _ = ig_setup
+    monkeypatch.setattr("app.services.llm.llm_service", _RaisingService())
+
+    reply = await handle_merchant_message(
+        db_session, shop_account, "/direct @buyer1 Say hello", "255700000111"
+    )
+
+    assert "Couldn't generate" in reply and "kept queued" in reply.lower()
+    assert consume_directive_ig(ig_customer.id) == "Say hello"
+
+
+async def test_direct_whatsapp_provider_error_rearms(db_session, shop_account, monkeypatch):
+    phone = "255722223349"
+    customer = _customer_with_history(db_session, shop_account, phone)
+    monkeypatch.setattr(
+        "app.services.llm.llm_service",
+        _service_with_fake_client(reply_text="Hello!"),
+    )
+    _arm_instant(monkeypatch, _FakeWAProvider(ConnectionError("net down")))
+
+    reply = await handle_merchant_message(
+        db_session, shop_account, f"/direct {phone} Say hello", "255700000111"
+    )
+
+    assert "Couldn't deliver" in reply and "Kept queued" in reply
+    failed = (
+        db_session.query(Message)
+        .filter(Message.to_phone == phone, Message.direction == "outbound")
+        .all()
+    )
+    assert len(failed) == 1 and failed[0].status == "failed"
+    assert consume_directive_wa(shop_account.id, customer.id) == "Say hello"
+
+
+async def test_direct_instagram_provider_error_rearms(
+    db_session, shop_account, ig_setup, monkeypatch
+):
+    _, ig_customer, _ = ig_setup
+    monkeypatch.setattr(
+        "app.services.llm.llm_service",
+        _service_with_fake_client(reply_text="Hello!"),
+    )
+    _arm_instant(monkeypatch, _FakeIGProvider(ConnectionError("net down")))
+
+    reply = await handle_merchant_message(
+        db_session, shop_account, "/direct @buyer1 Say hello", "255700000111"
+    )
+
+    assert "Couldn't deliver" in reply and "Kept queued" in reply
+    assert consume_directive_ig(ig_customer.id) == "Say hello"
+
+
+async def test_direct_instagram_quota_exhausted_keeps_queued(
+    db_session, shop_account, ig_setup, monkeypatch
+):
+    _, ig_customer, _ = ig_setup
+    captured = {}
+    monkeypatch.setattr(
+        "app.services.llm.llm_service",
+        _service_with_fake_client(captured=captured, reply_text="Hello!"),
+    )
+    monkeypatch.setattr(
+        "app.services.usage.check_reply_quota", lambda db, merchant: "holding!"
+    )
+
+    reply = await handle_merchant_message(
+        db_session, shop_account, "/direct @buyer1 Say hello", "255700000111"
+    )
+
+    assert "exhausted" in reply and "kept queued" in reply.lower()
+    assert captured == {}  # never generated
+    assert consume_directive_ig(ig_customer.id) == "Say hello"
+
+
+async def test_proactive_resend_skipped_ig(db_session, ig_setup):
+    ig_account, ig_customer, ig_context = ig_setup
+
+    reply = await _service_with_fake_client(
+        reply_text="On it! [RESEND_PAYMENT: product=Shoes price=45000 payment=full phone=255700000000]"
+    ).generate_dm_response(
+        "", db=db_session, account=ig_account, customer=ig_customer,
+        context=ig_context, conversation_history=[], proactive=True,
+    )
+
+    assert "[RESEND_PAYMENT" not in reply
+    assert "On it!" in reply
+    assert db_session.query(Order).count() == 0
+
+
+async def test_direct_pending_index_instagram_gone(db_session, shop_account):
+    pick = {
+        "channel": "instagram",
+        "customer_id": str(uuid.uuid4()),
+        "name": "@ghost",
+    }
+
+    reply = await _direct_pending_pick(db_session, shop_account, pick, "Say hello")
+
+    assert "no longer connected" in reply
