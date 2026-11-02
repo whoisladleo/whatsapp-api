@@ -12,6 +12,7 @@ from app.db.models import (
     PaymentType,
     Product,
 )
+from app.services.handoff_flow import consume_directive_ig, format_directive_block
 from app.services.llm.helpers import (
     DealRejected,
     _hold_expired,
@@ -67,6 +68,13 @@ class DMReplyMixin:
         if not self.client:
             return None
 
+        # One-shot operator steering (/direct), consumed on this generated
+        # reply — the handoff/quota callers return before reaching here,
+        # so a paused conversation keeps its directive until Amara
+        # actually generates. Appended to the system prompt below, never
+        # to anything customer-facing.
+        directive = consume_directive_ig(customer.id)
+
         # Drafts excluded — see the comment-reply builder above.
         products = (
             db.query(Product)
@@ -108,6 +116,9 @@ class DMReplyMixin:
 """
         if knowledge_content:
             instruction += f"\nHere is additional knowledge:\n{knowledge_content}"
+
+        if directive:
+            instruction += format_directive_block(directive)
 
         instruction += """
 RULES:
