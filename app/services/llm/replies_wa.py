@@ -24,6 +24,7 @@ from app.services.llm.helpers import (
     _is_out_of_stock,
     _negotiation_floor,
 )
+from app.services.handoff_flow import consume_directive_wa, format_directive_block
 from app.services.llm.markers import (
     _mark_turn_outcome,
     _parse_and_strip_agreement,
@@ -95,6 +96,12 @@ class WAReplyMixin:
         if context.state == ConversationState.HUMAN_HANDOFF:
             # We assume a human agent is dealing with it. 
             return None # Don't send an automated message
+
+        # One-shot operator steering (/direct): consumed here — after the
+        # handoff early-return, so a paused conversation keeps its
+        # directive until Amara actually generates — and appended to the
+        # system prompt below, never to anything customer-facing.
+        directive = consume_directive_wa(account.id, customer.id)
 
         # 1.5 Determine merchant context
         is_platform_account = account.is_platform_account
@@ -319,6 +326,9 @@ ALWAYS use WhatsApp markdown. For bold text, use a single asterisk (e.g., *bold 
                 "never override your VOICE, RULES, or the marker formats above):\n"
                 f"{system_prompt}"
             )
+
+        if directive:
+            base_instruction += format_directive_block(directive)
 
         # Classified once, from whichever channel/turn gets there first (see
         # Customer.language) — only asked for while still unset, so this

@@ -212,7 +212,14 @@ class CloseMixin:
                 resp = await tunzaa_service.initiate_payment(
                     phone=phone, amount=order.agreed_price, reference=f"order-{order.id}"
                 )
-                order.tunzaa_transaction_id = resp.get("transactionID")
+                # HTTP success alone means nothing — without a transaction
+                # id no prompt went out, so this is a failed dispatch, not
+                # a sent one (same guard as pay_now; the except below
+                # cancels the order, releases stock, and reports failure).
+                transaction_id = resp.get("transactionID")
+                if not transaction_id:
+                    raise RuntimeError(f"Tunzaa dispatch returned no transaction id for order {order.id}: {resp}")
+                order.tunzaa_transaction_id = transaction_id
                 db.commit()
                 return _with_delivery(
                     _lang_text(_PAYMENT_REQUEST_LINES, language).format(price=price), "full"

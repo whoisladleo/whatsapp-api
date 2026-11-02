@@ -19,6 +19,8 @@ from app.services.handoff_flow import (
     relay_to_instagram_customer,
     relay_to_whatsapp_customer,
     resolve_instagram_customer,
+    set_directive_ig,
+    set_directive_wa,
 )
 from app.services.payment_resend import ResendOutcome, merchant_resend_order
 
@@ -32,6 +34,7 @@ async def handle_merchant_message(db: Session, account: WhatsAppAccount, message
     /resume [Phone|@instagram_username]
     /reply [Phone|@instagram_username] [Message]
     /resend [Phone|@instagram_username]
+    /direct [Phone|@instagram_username|pending-#] [Instruction]
     /cancel (leave an armed handoff reply-mode without sending)
     """
     body = message_body.strip()
@@ -57,7 +60,9 @@ async def handle_merchant_message(db: Session, account: WhatsAppAccount, message
             "- To reply to a customer yourself: `/reply 2557XXXXXXXX Your message` or "
             "`/reply @their_instagram_username Your message`\n"
             "- To re-fire a dead payment prompt: `/resend 2557XXXXXXXX` or "
-            "`/resend @their_instagram_username`"
+            "`/resend @their_instagram_username`\n"
+            "- To steer Amara's next reply: `/direct 2557XXXXXXXX Your instruction` or "
+            "`/direct @their_instagram_username Your instruction`"
         )
 
     if body.lower() == "/resume" or body.lower().startswith("/resume "):
@@ -96,6 +101,25 @@ async def handle_merchant_message(db: Session, account: WhatsAppAccount, message
         if identifier.startswith("@"):
             return await relay_to_instagram_customer(db, account.owner, identifier[1:], reply_text)
         return await relay_to_whatsapp_customer(db, account, identifier, reply_text)
+
+    if body.lower() == "/direct" or body.lower().startswith("/direct "):
+        rest = body[len("/direct"):].strip()
+        match = re.match(r"(\S+)\s+(.+)", rest, re.DOTALL)
+        if not match or not match.group(2).strip():
+            return (
+                "Usage: `/direct 2557XXXXXXXX Your instruction` (WhatsApp customer), "
+                "`/direct @their_instagram_username Your instruction` (Instagram customer), "
+                "or `/direct <number from the waiting list> Your instruction`"
+            )
+        identifier, instruction = match.group(1), match.group(2).strip()
+
+        pick = _pending_pick(db, account, identifier)
+        if pick is not None:
+            return await _direct_pending_pick(db, account, pick, instruction)
+
+        if identifier.startswith("@"):
+            return await _direct_instagram_customer(db, account, identifier[1:], instruction)
+        return await _direct_whatsapp_customer(db, account, identifier, instruction)
 
     if body.lower() == "/resend" or body.lower().startswith("/resend "):
         identifier = body[len("/resend"):].strip()
@@ -236,6 +260,76 @@ async def _resend_pending_pick(db: Session, account: WhatsAppAccount, pick: dict
     if not pick_account:
         return "That business number is no longer connected."
     return await _resend_whatsapp_customer(db, pick_account, pick["ref"])
+
+
+async def _direct_pending_pick(
+    db: Session, account: WhatsAppAccount, pick: dict, instruction: str
+) -> str:
+    # Same pick shape as _resume/_resend above — the entry carries its own
+    # account context, and the directive is keyed to it, not to whichever
+    # number the command arrived on.
+    if pick["channel"] == "instagram":
+        if not set_directive_ig(uuid.UUID(pick["customer_id"]), instruction):
+            return "Couldn't save that instruction — please try again."
+        return f"Amara's next reply to {pick['name']} will follow this instruction: {instruction}"
+    pick_account = (
+        db.query(WhatsAppAccount).filter(WhatsAppAccount.id == uuid.UUID(pick["account_id"])).first()
+    )
+    if not pick_account:
+        return "That business number is no longer connected."
+    return await _direct_whatsapp_customer(db, pick_account, pick["ref"], instruction)
+
+
+async def _direct_whatsapp_customer(
+    db: Session, account: WhatsAppAccount, phone: str, instruction: str
+) -> str:
+    """
+    `/direct 2557XXXXXXXX <instruction>`: arms a one-shot hidden steering
+    instruction for Amara's next generated reply in this conversation.
+    Requires prior message history with this account, like /reply's relay
+    — a typo'd number must not arm a phantom directive.
+    """
+    normalized = normalize_phone(phone)
+    customer = _find_customer_by_phone(db, normalized, phone)
+    has_history = (
+        db.query(Message)
+        .filter(Message.account_id == account.id, Message.from_phone.in_([phone, normalized]))
+        .first()
+        if customer
+        else None
+    )
+    if not customer or not has_history:
+        return f"No conversation with {normalized} found for this account."
+    if not set_directive_wa(account.id, customer.id, instruction):
+        return "Couldn't save that instruction — please try again."
+    return f"Amara's next reply to {normalized} will follow this instruction: {instruction}"
+
+
+def _find_customer_by_phone(db: Session, normalized: str, raw: str):
+    """Customer lookup tolerant of legacy non-normalized phone rows."""
+    customer = db.query(Customer).filter(Customer.phone_number == normalized).first()
+    if customer is None and raw != normalized:
+        customer = db.query(Customer).filter(Customer.phone_number == raw).first()
+    return customer
+
+
+async def _direct_instagram_customer(
+    db: Session, account: WhatsAppAccount, ig_username: str, instruction: str
+) -> str:
+    """
+    `/direct @username <instruction>` — the Instagram counterpart, scoped
+    the same way /reply's own @ handling is (this merchant's connected
+    InstagramAccount, username or ig_scoped_id).
+    """
+    ig_account, ig_customer = resolve_instagram_customer(db, account.user_id, ig_username)
+    if not ig_account:
+        return "No Instagram account connected."
+    if not ig_customer:
+        return f"No Instagram conversation with @{ig_username} found."
+    if not set_directive_ig(ig_customer.id, instruction):
+        return "Couldn't save that instruction — please try again."
+    who = f"@{ig_customer.username or ig_customer.ig_scoped_id}"
+    return f"Amara's next reply to {who} will follow this instruction: {instruction}"
 
 
 def _render_resend_result(who: str, order: Order, result) -> str:

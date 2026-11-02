@@ -559,3 +559,40 @@ async def test_agreement_still_suppressed_while_handed_off(db_session, platform_
 
     assert result is None
     assert db_session.query(Order).count() == 0
+
+
+@respx.mock
+async def test_dispatch_without_transaction_id_cancels_order_and_reports_failure(db_session, shop_account, shoes):
+    """
+    Regression: Tunzaa answered HTTP 200 but with no transactionID — no
+    prompt actually went out, so the order must be CANCELLED (stock
+    released) and the buyer told setup failed, never "sent".
+    """
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "tok-1"}))
+    respx.post(PAYMENT_URL).mock(
+        return_value=httpx.Response(200, json={"statusCode": 202, "success": True})
+    )
+
+    async def handler(**kwargs):
+        return _FakeResponse(
+            "Deal! [AGREEMENT_REACHED: product=Shoes price=45000 payment=full]"
+        )
+
+    service = _service_with_fake_client(handler=handler)
+
+    result = await service.generate_response(
+        message_body="I'll take the shoes for 45000, full payment",
+        from_phone="255711130070",
+        db=db_session,
+        account=shop_account,
+    )
+
+    assert "has been sent" not in result
+    assert "Something went wrong setting up your payment" in result
+
+    order = db_session.query(Order).filter(Order.agreed_price == 45000).one()
+    assert order.status == OrderStatus.CANCELLED
+    assert order.tunzaa_transaction_id is None
+
+    db_session.refresh(shoes)
+    assert shoes.quantity == 3  # the claimed unit was released, not left reserved
