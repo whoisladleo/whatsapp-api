@@ -214,6 +214,56 @@ async def test_human_handoff_alert_send_failure_is_logged_as_failed(db_session, 
 
 
 @respx.mock
+async def test_human_handoff_alert_meta_rejection_is_loud_and_failed(
+    db_session, shop_account, merchant, monkeypatch, caplog
+):
+    """
+    Meta error bodies are not exceptions: send_template returns {"error": ...}
+    as a normal value, so a rejected handoff_notification used to be recorded
+    as "sent" with nothing in the logs (#148). It must error-log the Meta body
+    and record the alert as failed instead.
+    """
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "PHONE_NUMBER_ID", "PLATFORM_PHONE_TEST")
+    db_session.add(WhatsAppAccount(
+        name="Taskflow", phone_number_id="PLATFORM_PHONE_TEST", access_token="platform-tok",
+        user_id=merchant.id, is_platform_account=True,
+    ))
+    db_session.commit()
+
+    respx.post(url__regex=MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(
+            400, json={"error": {"message": "Template params mismatch", "code": 132001}}
+        )
+    )
+
+    async def handoff_handler(**kwargs):
+        return _FakeResponse("Let me get a human. [HUMAN_HANDOFF]")
+
+    service = _service_with_fake_client(handler=handoff_handler)
+
+    with caplog.at_level(logging.ERROR, logger="app.services.llm"):
+        result = await service.generate_response(
+            message_body="I need a human",
+            from_phone="255711116667",
+            db=db_session,
+            account=shop_account,
+        )
+
+    assert result == "Let me get a human."
+    assert "rejected by Meta" in caplog.text
+    assert "132001" in caplog.text
+    alert_message = (
+        db_session.query(Message)
+        .filter(Message.to_phone == merchant.username, Message.direction == "outbound")
+        .first()
+    )
+    assert alert_message is not None
+    assert alert_message.status == "failed"
+
+
+@respx.mock
 async def test_human_handoff_with_empty_remaining_text_uses_default_message(db_session, shop_account):
     respx.post(url__regex=MESSAGES_URL_RE).mock(
         return_value=httpx.Response(200, json={"messages": [{"id": "wamid.alert"}]})

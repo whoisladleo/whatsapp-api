@@ -231,6 +231,13 @@ class NotifyMixin:
             logger.error(f"Failed to send platform alert to merchant: {alert_err}")
             alert_resp = None
 
+        # Meta error bodies are NOT exceptions — send_template returns
+        # {"error": ...} as a normal value. Without this check a rejected
+        # send was recorded as "sent" with nothing in the logs (#148).
+        if alert_resp is not None and not usage.whatsapp_send_succeeded(alert_resp):
+            logger.error("Handoff alert to merchant %s rejected by Meta: %s", merchant.id, alert_resp)
+            alert_resp = None
+
         # Maps the sent alert to its customer so a button tap's context id
         # resolves to the exact conversation (template button payloads are
         # static — see app/services/handoff_flow.py).
