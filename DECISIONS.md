@@ -1,5 +1,13 @@
 # Decisions
 
+## Meta-rejected handoff alerts are loud and failed, not "sent" (2026-11-04, #148)
+
+**Chose:** `_send_platform_alert_to_merchant` now treats a template response without `"messages"` as a failed send: error-logs the Meta body and records the alert as failed. Root cause of a live mystery: `send_template` never raises on Meta errors (returns `{"error": ...}` as a normal value), and the handoff path only guarded exceptions — so a rejected `handoff_notification` was stored as `"sent"` (an error dict is truthy) with zero log noise. Every other template caller already checked for `"messages"`; the handoff path was the one that didn't. Uses the existing `usage.whatsapp_send_succeeded` helper rather than a new inline check. Regression test posts a 400 + error body and asserts the log line plus strict `"failed"` status (the older 500-body test asserts weak `in ("sent", "failed")` and was left untouched).
+
+**Considered and rejected:**
+- *`raise_for_status` inside `send_template`.* Rejected: every other caller already handles error bodies by inspecting the response (OTP, /reply, reminders); making the provider raise would flip all of their contracts at once. The fix belongs at the one call site that never checked.
+- *Retrying the rejected alert.* Rejected: Meta rejections (bad params, template/language state) are deterministic, not transient — a retry would fail identically. Loud logging is the fix; the retry decision belongs to whoever reads the log.
+
 ## Upsell banner for the WhatsApp-only handoff policy (2026-11-04, #145)
 
 **Chose:** the #144 policy is communicated with a persistent layout banner (amber, `UnpaidBanner` pattern) shown only when the merchant has no dialable handoff number, linking to Settings, plus a one-word settings-card fix ("WhatsApp alerts"). The flag (`has_handoff_number`) is computed backend-side by `resolve_handoff_number` and rides the existing `/auth/me/subscription` read the layout already makes — no new request per page load — which also kills the client-side resolver mirror in the settings page as the source of truth (it never checked dialability). Both schema and dashboard default to flag-true (no banner): a missing value must never nag merchants who have a number, same fail-hidden rule as `amara_active`. Either repo can merge first: the dashboard guards `!== false` against an older backend, and the new field is backward-compatible.
