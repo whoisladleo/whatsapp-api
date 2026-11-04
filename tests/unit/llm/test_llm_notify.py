@@ -1,4 +1,5 @@
 import json
+import logging
 
 import httpx
 import respx
@@ -8,6 +9,7 @@ from app.db.models import (
     ConversationState,
     Customer,
     Message,
+    User,
     WhatsAppAccount,
 )
 from app.services.llm import (
@@ -281,3 +283,49 @@ async def test_human_handoff_schedule_failure_does_not_break_reply(
     )
 
     assert result == "Let me get a human."
+
+
+@respx.mock
+async def test_platform_handoff_alerts_owner_and_schedules_reminder(
+    db_session, platform_account, merchant, monkeypatch
+):
+    # #140: prospects handing off on Taskflow's own number alert the
+    # owner like any other handoff — the #136 platform silence was wrong.
+    alert_route = respx.post(url__regex=MESSAGES_URL_RE).mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "wamid.alert"}]})
+    )
+    scheduled = []
+    from app.tasks.handoff_reminders import send_handoff_reminder
+    monkeypatch.setattr(
+        send_handoff_reminder, "apply_async", lambda *a, **kw: scheduled.append((a, kw))
+    )
+
+    async def handoff_handler(**kwargs):
+        return _FakeResponse("Let me get a human. [HUMAN_HANDOFF]")
+
+    service = _service_with_fake_client(handler=handoff_handler)
+    result = await service.generate_response(
+        message_body="I need a human",
+        from_phone="255711117777",
+        db=db_session,
+        account=platform_account,
+    )
+    assert result == "Let me get a human."
+    assert alert_route.called
+    assert len(scheduled) == 1
+
+
+@respx.mock
+async def test_handoff_alert_without_number_skips_loudly(db_session, caplog):
+    # No routes registered: any HTTP attempt fails the test. The skip
+    # itself must warn (#140) — mute skips hid a total notification
+    # outage behind green logs.
+    merchant = User(username="notaphone")
+    db_session.add(merchant)
+    db_session.commit()
+    service = _service_with_fake_client()
+    with caplog.at_level(logging.WARNING, logger="app.services.llm"):
+        await service._send_platform_alert_to_merchant(
+            db_session, merchant, "255711116666", "help", alert_target=None
+        )
+    assert "no dialable number" in caplog.text

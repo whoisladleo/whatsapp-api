@@ -871,9 +871,12 @@ async def test_platform_ig_close_creates_merchant_and_subscription(
     assert sub.instagram_customer_id == customer.id
 
 
-async def test_platform_ig_handoff_is_silent(
+async def test_platform_ig_handoff_alerts_owner(
     db_session, ig_platform_account, entry_plan, monkeypatch,
 ):
+    # #140 reversed the #136 mirroring (platform handoffs were silent):
+    # a prospect needing a human on Taskflow's own account is the
+    # highest-value notification in the system.
     customer, context = _platform_prospect(db_session, ig_platform_account, "h")
     alerts = []
 
@@ -890,6 +893,6 @@ async def test_platform_ig_handoff_is_silent(
     )
     db_session.refresh(context)
     assert context.state == ConversationState.HUMAN_HANDOFF
-    assert alerts == []
+    assert alerts == [1]
     event = db_session.query(AmaraEvent).filter(AmaraEvent.kind == AmaraEventKind.HANDOFF).one()
     assert event.channel == "instagram_dm"

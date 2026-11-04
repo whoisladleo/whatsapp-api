@@ -48,7 +48,14 @@ class NotifyMixin:
         db.commit()
         usage.record_event(db, account.user_id, AmaraEventKind.HANDOFF, channel="whatsapp", account_id=account.id)
 
-        if is_platform_account or not account.owner:
+        # Platform handoffs alert the owner too (#140): a prospect needing
+        # a human on Taskflow's own sales number is the highest-value
+        # notification in the system, not noise to suppress. The reminder
+        # nudge below re-notifies the same owner, so it stays correct here.
+        if not account.owner:
+            logger.warning(
+                "Skipping handoff alert: WhatsAppAccount %s has no owner.", account.id
+            )
             return
 
         await self._send_platform_alert_to_merchant(
@@ -86,11 +93,8 @@ class NotifyMixin:
         usage.record_event(
             db, account.user_id, AmaraEventKind.HANDOFF, channel="instagram_dm", instagram_account_id=account.id
         )
-        if account.is_platform_account:
-            # Prospect conversations on Taskflow's own account flip state
-            # and ledger like any handoff, but alert nobody — mirroring the
-            # WhatsApp platform branch.
-            return
+        # No platform carve-out: prospect handoffs on Taskflow's own
+        # account alert the owner like any other (#140).
         await self._notify_merchant_of_instagram_handoff(db, account, customer, customer_message)
 
     async def _notify_merchant_of_instagram_handoff(
@@ -117,6 +121,9 @@ class NotifyMixin:
         """
         merchant = ig_account.owner
         if not merchant:
+            logger.warning(
+                "Skipping IG handoff alert: InstagramAccount %s has no owner.", ig_account.id
+            )
             return
 
         # /reply's Instagram path matches on username OR ig_scoped_id (see
@@ -176,14 +183,21 @@ class NotifyMixin:
         HANDOFF_ALERT_MESSAGE_MAX_CHARS for the template's {{message}}
         variable.
 
-        Best-effort/silent if the merchant has no phone on file at all
+        Best-effort if the merchant has no phone on file at all
         (explicit handoff number, then OTP username, then the
-        self-reported phone_number — see crud_user.resolve_handoff_number).
+        self-reported phone_number — see crud_user.resolve_handoff_number):
+        the send is skipped, but loudly — a mute skip here once cost an
+        owner every handoff notification with nothing in the logs (#140).
         """
         from app.crud import user as crud_user
 
         merchant_phone = crud_user.resolve_handoff_number(merchant)
         if not merchant_phone:
+            logger.warning(
+                "Skipping handoff alert: merchant %s has no dialable number "
+                "(handoff_phone_number/username/phone_number all unset or undialable).",
+                merchant.id,
+            )
             return
 
         from app.core.config import settings
