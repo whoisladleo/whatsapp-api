@@ -50,6 +50,10 @@ router = APIRouter()
 # Login, which solved the same problem (unreliable WhatsApp OTP) before.
 INSTAGRAM_LOGIN_CODE_EXPIRE_MINUTES = 2
 INSTAGRAM_LOGIN_STATE_EXPIRE_MINUTES = 10
+# Purpose claim binding login codes to /instagram/exchange: without it any
+# valid JWT (a session token, an impersonation token) could be traded for a
+# fresh session here.
+INSTAGRAM_LOGIN_CODE_PURPOSE = "instagram_login"
 
 # Kept in sync with WHATSAPP_OTP_TEMPLATE_LANGUAGE so the plain-text
 # fallback (sent when the template send fails, or is unconfigured) is in
@@ -269,7 +273,15 @@ def refresh_session(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    crud_refresh.revoke_refresh_token(db, record)
+    # Atomic single-use claim (#154): two concurrent refreshes with the same
+    # Bearer [REDACTED] pass the read checks above, so the guarded UPDATE admits
+    # exactly one — the loser takes the same 401, no oracle.
+    if not crud_refresh.try_revoke_refresh_token(db, record.id):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired refresh token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     return _mint_session_tokens(db, user)
 
 
@@ -375,7 +387,9 @@ async def instagram_login_callback(
         print(f"Failed to subscribe {ig_user_id} to Instagram webhooks on login: {e}")
 
     login_code = security.create_access_token(
-        user.id, expires_delta=timedelta(minutes=INSTAGRAM_LOGIN_CODE_EXPIRE_MINUTES)
+        user.id,
+        expires_delta=timedelta(minutes=INSTAGRAM_LOGIN_CODE_EXPIRE_MINUTES),
+        extra_claims={"purpose": INSTAGRAM_LOGIN_CODE_PURPOSE},
     )
     return RedirectResponse(f"{login_url}?ig_code={login_code}")
 
@@ -398,6 +412,8 @@ def exchange_instagram_login_code(payload: InstagramExchangeRequest, db: Session
         decoded = jwt.decode(payload.code, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
         user_id = uuid.UUID(decoded["sub"])
     except (jwt.InvalidTokenError, KeyError, TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="Invalid or expired login code")
+    if decoded.get("purpose") != INSTAGRAM_LOGIN_CODE_PURPOSE:
         raise HTTPException(status_code=401, detail="Invalid or expired login code")
 
     user = crud_user.get_user(db, user_id)

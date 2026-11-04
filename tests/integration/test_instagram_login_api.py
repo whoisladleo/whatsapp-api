@@ -7,6 +7,7 @@ import jwt
 import pytest
 import respx
 
+from app.api.v1.auth import INSTAGRAM_LOGIN_CODE_PURPOSE
 from app.core.config import settings
 from app.core.security import create_access_token
 from app.db.models import InstagramAccount, User
@@ -55,6 +56,13 @@ def _start_state(client) -> str:
 
 def _login_code_from(location: str) -> str:
     return parse_qs(urlparse(location).query)["ig_code"][0]
+
+
+def _mint_login_code(user_id) -> str:
+    """Mirrors the /instagram/callback mint site (purpose-bound code)."""
+    return create_access_token(
+        user_id, extra_claims={"purpose": INSTAGRAM_LOGIN_CODE_PURPOSE}
+    )
 
 
 def test_start_requires_no_auth_and_returns_login_authorize_url(client):
@@ -285,16 +293,45 @@ def test_exchange_expired_code_is_unauthorized(client, auth_user):
 
 
 def test_exchange_unknown_user_is_not_found(client):
-    code = create_access_token(uuid.uuid4())
+    code = _mint_login_code(uuid.uuid4())
 
     resp = client.post("/api/v1/auth/instagram/exchange", json={"code": code})
 
     assert resp.status_code == 404
 
 
+def test_exchange_rejects_plain_session_token(client, auth_user):
+    """A valid session/access JWT is not a login code — no purpose claim,
+    no exchange (otherwise any live token mints a fresh session)."""
+    user, _ = auth_user
+
+    resp = client.post(
+        "/api/v1/auth/instagram/exchange",
+        json={"code": create_access_token(user.id)},
+    )
+
+    assert resp.status_code == 401
+
+
+def test_exchange_rejects_impersonation_token(client, auth_user):
+    """An impersonation token must not upgrade into a full session here."""
+    from app.services.support_access import IMPERSONATOR_CLAIM
+
+    user, _ = auth_user
+    impersonated = create_access_token(
+        user.id, extra_claims={IMPERSONATOR_CLAIM: str(uuid.uuid4())}
+    )
+
+    resp = client.post(
+        "/api/v1/auth/instagram/exchange", json={"code": impersonated}
+    )
+
+    assert resp.status_code == 401
+
+
 def test_exchange_success_returns_short_lived_access_and_refresh(client, auth_user):
     user, _ = auth_user
-    code = create_access_token(user.id)
+    code = _mint_login_code(user.id)
 
     resp = client.post("/api/v1/auth/instagram/exchange", json={"code": code})
 

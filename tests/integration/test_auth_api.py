@@ -446,6 +446,39 @@ def test_refresh_rotates_tokens_single_use(client, db_session, fixed_otp):
     assert again.status_code == 200
 
 
+@respx.mock
+def test_refresh_rotation_claim_single_winner(client, db_session, fixed_otp):
+    # Auth fix #9 (#154): two concurrent refreshes with the same Bearer [REDACTED]
+    # both pass the read checks, so the guarded UPDATE must admit exactly one.
+    # Simulated deterministically: both "requests" hold the same unrevoked
+    # row, then claim in turn — the second claim loses.
+    import hashlib
+
+    from app.crud import refresh_token as crud_refresh
+
+    _mock_send_text()
+    body = _login_via_otp(client)
+    record = (
+        db_session.query(RefreshToken)
+        .filter(
+            RefreshToken.token_hash
+            == hashlib.sha256(body["refresh_token"].encode()).hexdigest()
+        )
+        .one()
+    )
+    assert record.revoked_at is None
+
+    assert crud_refresh.try_revoke_refresh_token(db_session, record.id) is True
+    assert crud_refresh.try_revoke_refresh_token(db_session, record.id) is False
+
+    # The loser's Bearer [REDACTED] now spent — refresh rejects it like any rotated token.
+    replay = client.post(
+        "/api/v1/auth/refresh", json={"refresh_token": body["refresh_token"]}
+    )
+    assert replay.status_code == 401
+    assert replay.json()["detail"] == "Invalid or expired refresh token"
+
+
 def test_refresh_rejects_unknown_token(client):
     resp = client.post(
         "/api/v1/auth/refresh", json={"refresh_token": "not-a-real-token"}
