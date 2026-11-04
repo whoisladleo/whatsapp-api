@@ -99,6 +99,19 @@ def _try_claim_stock(db: Session, product: Product) -> bool:
     return True
 
 
+def _bump_quote_cycle(context, product_name: str) -> int:
+    """Shared quote-cycle counter (Rule 3): consecutive quote rounds on the
+    SAME product bump failed_cycles; a quote for a new/different product
+    means a fresh negotiation and resets. Works on either context model —
+    both carry the same fields (#136). Returns the new count."""
+    if context.current_product_intent == product_name:
+        context.failed_cycles = (context.failed_cycles or 0) + 1
+    else:
+        context.failed_cycles = 0
+    context.current_product_intent = product_name
+    return context.failed_cycles or 0
+
+
 class DealRejected(Exception):
     """An AGREEMENT_REACHED marker failed server-side validation; no order was created."""
 

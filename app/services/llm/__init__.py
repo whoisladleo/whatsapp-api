@@ -12,6 +12,13 @@ import os  # noqa: F401  (tests patch app.services.llm.os.path.exists)
 from app.core.config import settings
 from app.services.llm.close import CloseMixin
 from app.services.llm.constants import RESEND_MIN_INTERVAL, RESERVATION_WINDOW
+from app.services.llm.conversation import (
+    CHANNEL_INSTAGRAM,
+    CHANNEL_WHATSAPP,
+    build_merchant_prompt,
+    build_platform_prompt,
+    render_catalog,
+)
 from app.services.llm.helpers import (
     DealRejected,
     _hold_expired,
@@ -50,6 +57,8 @@ from app.services.vision_match import match_post_to_product
 __all__ = [
     "CloseMixin",
     "ClaudeProvider",
+    "CHANNEL_INSTAGRAM",
+    "CHANNEL_WHATSAPP",
     "DMReplyMixin",
     "DealRejected",
     "LLMLengthCutoff",
@@ -80,9 +89,12 @@ __all__ = [
     "_reclose_guard_note",
     "_truncate_for_alert",
     "_try_claim_stock",
+    "build_merchant_prompt",
+    "build_platform_prompt",
     "httpx",
     "llm_service",
     "match_post_to_product",
     "os",
+    "render_catalog",
     "settings",
 ]

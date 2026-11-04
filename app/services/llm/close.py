@@ -11,6 +11,7 @@ from app.db.models import (
     ConversationContext,
     Customer,
     InstagramAccount,
+    InstagramConversationContext,
     InstagramCustomer,
     Installment,
     InstallmentStatus,
@@ -23,7 +24,8 @@ from app.db.models import (
 )
 from app.services import llm as llm_facade
 from app.services.llm.constants import RESERVATION_WINDOW
-from app.services.llm.helpers import DealRejected, _lang_text, _race_loser_note
+from app.services.llm.conversation import CHANNEL_INSTAGRAM, CHANNEL_WHATSAPP
+from app.services.llm.helpers import DealRejected, _hold_expired, _lang_text, _race_loser_note
 # _reclose_guard_note and _try_claim_stock are called via llm_facade (not
 # imported) so tests patching app.services.llm.* keep landing. Same for
 # match_post_to_product in replies.py.
@@ -40,6 +42,39 @@ from app.services.llm.prompts import (
 logger = logging.getLogger("app.services.llm")
 
 
+def _validated_close_target(db: Session, merchant_id, agreement: dict, label: str) -> tuple:
+    """Shared AGREEMENT_REACHED validation for both close paths: the product
+    must exist, be completed, and the price must sit inside its band with
+    stock to sell (subscriptions skip the stock rule — they have no units,
+    #89). label prefixes the rejection reason with the channel (""/"Instagram
+    ") so logs keep attributing the path. Raises DealRejected — the caller
+    replaces the model's reply with the holding line and hands off (#37)."""
+    product = (
+        db.query(Product)
+        .filter(Product.merchant_id == merchant_id, Product.name.ilike(agreement["product_name"]))
+        .first()
+    )
+    price = agreement["price"]
+    if not product:
+        raise DealRejected(f"{label}AGREEMENT_REACHED for unknown product '{agreement['product_name']}'")
+    # Drafts carry placeholder 0 prices — a close must never land on one,
+    # even if a merchant set stock on it before completing it.
+    if product.is_draft:
+        raise DealRejected(f"{label}AGREEMENT_REACHED for '{product.name}' but it's an uncompleted draft")
+    if not (product.min_price <= price <= product.max_price):
+        raise DealRejected(
+            f"{label}AGREEMENT_REACHED price {price} outside [{product.min_price}, {product.max_price}] "
+            f"for '{product.name}' (possible prompt injection)"
+        )
+    if not product.is_subscription:
+        if (product.quantity or 0) < 1:
+            raise DealRejected(f"{label}AGREEMENT_REACHED for '{product.name}' but it's out of stock")
+    payment_type = (
+        PaymentType.INSTALLMENT if agreement["payment_type"] == "installment" else PaymentType.FULL
+    )
+    return product, payment_type
+
+
 class CloseMixin:
     async def _close_deal(
         self,
@@ -51,48 +86,59 @@ class CloseMixin:
         context: ConversationContext,
     ) -> Optional[str]:
         """
-        Validates a parsed AGREEMENT_REACHED marker against the real catalog
-        (server-side enforcement of min/max price and stock — the prompt's
-        "SECRET FLOOR" instruction alone doesn't stop a prompt-injected
-        model from claiming an out-of-band price), reserves stock, creates
-        the Order, and dispatches the real Tunzaa payment. Returns a short
-        note to append to the customer-facing reply. Raises DealRejected for
-        an invalid agreement — the caller replaces the model's reply with a
-        holding line and hands off, since the buyer was just told a deal
-        was agreed (#37).
+        WhatsApp close: validates the parsed AGREEMENT_REACHED marker
+        server-side (the prompt's floor instruction alone doesn't stop a
+        prompt-injected model from claiming an out-of-band price) and runs
+        the shared close tail. Returns a short note to append to the
+        customer-facing reply. Raises DealRejected for an invalid agreement
+        — the caller replaces the model's reply with a holding line and
+        hands off, since the buyer was just told a deal was agreed (#37).
         """
-        product = (
-            db.query(Product)
-            .filter(Product.merchant_id == account.user_id, Product.name.ilike(agreement["product_name"]))
-            .first()
-        )
-        price = agreement["price"]
-        if not product:
-            raise DealRejected(f"AGREEMENT_REACHED for unknown product '{agreement['product_name']}'")
-        # Drafts carry placeholder 0 prices — a close must never land on
-        # one, even if a merchant set stock on it before completing it.
-        if product.is_draft:
-            raise DealRejected(f"AGREEMENT_REACHED for '{product.name}' but it's an uncompleted draft")
-        if not (product.min_price <= price <= product.max_price):
-            raise DealRejected(
-                f"AGREEMENT_REACHED price {price} outside [{product.min_price}, {product.max_price}] "
-                f"for '{product.name}' (possible prompt injection)"
-            )
-        # Subscriptions have no units — quantity is meaningless for them
-        # (the dashboard doesn't even ask for it), so neither the
-        # out-of-stock backstop nor the atomic claim below applies (#89).
-        if not product.is_subscription:
-            if (product.quantity or 0) < 1:
-                raise DealRejected(f"AGREEMENT_REACHED for '{product.name}' but it's out of stock")
-
-        payment_type = (
-            PaymentType.INSTALLMENT if agreement["payment_type"] == "installment" else PaymentType.FULL
+        product, payment_type = _validated_close_target(db, account.user_id, agreement, label="")
+        return await self._close_core(
+            db,
+            customer=customer,
+            product=product,
+            price=agreement["price"],
+            payment_type=payment_type,
+            channel=CHANNEL_WHATSAPP,
+            account_id=account.id,
+            language=customer.language,
+            phone_for_dispatch=normalized_from_phone,
+            context=context,
         )
 
+    async def _close_core(
+        self,
+        db: Session,
+        *,
+        customer: Customer,
+        product: Product,
+        price: float,
+        payment_type: PaymentType,
+        channel: str,
+        account_id=None,
+        instagram_account_id=None,
+        instagram_customer: Optional[InstagramCustomer] = None,
+        language: Optional[str],
+        phone_for_dispatch: str,
+        context=None,
+        label: str = "",
+    ) -> Optional[str]:
+        """Shared deal-closing tail for both channels: duplicate guard,
+        atomic stock claim, order row, subscription link, quote-state reset,
+        reminders, and the Tunzaa dispatch. context is either context model
+        (both carry the same quote fields now) or None. Raises DealRejected
+        exactly like the old per-channel closes."""
+        channel_filter = (
+            Order.account_id == account_id
+            if channel == CHANNEL_WHATSAPP
+            else Order.instagram_account_id == instagram_account_id
+        )
         # Duplicate-close guard — before the stock claim, so a re-close
         # neither reserves a unit nor dispatches a second payment (#101).
         reclose_note = llm_facade._reclose_guard_note(
-            db, customer.id, product, Order.account_id == account.id, customer.language
+            db, customer.id, product, channel_filter, language
         )
         if reclose_note:
             return reclose_note
@@ -105,11 +151,14 @@ class CloseMixin:
         # the hold window, so a second customer can't be sold the same
         # unit while this one is paying).
         if not product.is_subscription and not llm_facade._try_claim_stock(db, product):
-            raise DealRejected(f"AGREEMENT_REACHED for '{product.name}' but it's out of stock")
+            raise DealRejected(f"{label}AGREEMENT_REACHED for '{product.name}' but it's out of stock")
+
         order = Order(
             customer_id=customer.id,
             product_id=product.id,
-            account_id=account.id,
+            account_id=account_id,
+            instagram_account_id=instagram_account_id,
+            instagram_customer_id=instagram_customer.id if instagram_customer else None,
             quantity=1,
             agreed_price=price,
             payment_type=payment_type,
@@ -125,26 +174,99 @@ class CloseMixin:
             # partial unique index rejected ours (#114). Same outcome as
             # the guard catching it, one message later.
             db.rollback()
-            return _race_loser_note(db, customer.id, product, payment_type, customer.language)
+            return _race_loser_note(db, customer.id, product, payment_type, language)
         db.refresh(order)
 
-        self._create_subscription_if_needed(db, order, product, customer)
+        self._create_subscription_if_needed(db, order, product, customer, instagram_customer)
 
-        context.last_offer = price
-        # No longer just a quote — it's a real order now, so nothing to
-        # nudge the customer about, and the failed-attempts count resets.
-        context.pending_quote_price = None
-        context.pending_quote_at = None
-        context.quote_nudge_count = 0
-        context.failed_cycles = 0
-        db.commit()
+        if context is not None:
+            context.last_offer = price
+            # No longer just a quote — it's a real order now, so nothing to
+            # nudge the customer about, and the failed-attempts count resets.
+            context.pending_quote_price = None
+            context.pending_quote_at = None
+            context.quote_nudge_count = 0
+            context.failed_cycles = 0
+            db.commit()
 
         self._schedule_reminders(order.id)
 
-        note = await self._dispatch_payment(
-            db, order, product, normalized_from_phone, payment_type, customer.language
+        return await self._dispatch_payment(
+            db, order, product, phone_for_dispatch, payment_type, language
         )
-        return note
+
+    async def _resend_payment_note(
+        self,
+        db: Session,
+        *,
+        live_order: Optional[Order],
+        resend: dict,
+        phone_for_dispatch: Optional[str],
+        fallback_phone: Optional[str],
+        language: Optional[str],
+        close_fresh_fn,
+    ) -> Optional[str]:
+        """Shared RESEND_PAYMENT resolution for both channels. live_order is
+        this chat's newest PENDING FULL order (looked up by the caller with
+        channel keys) or None. Re-fires against it, dispatches onto it when
+        the first attempt never went out, or closes fresh from the marker's
+        terms when no live order exists. Returns the note to append, or None
+        when there's nothing to resend. close_fresh_fn(resend) runs the
+        channel's close and may raise — the caller hands off on failure."""
+        if live_order is not None and _hold_expired(live_order):
+            # A weeks-old hold, not this deal — the fallback below closes
+            # fresh (and the reclose guard retires this row when it does).
+            live_order = None
+        if live_order is not None and (
+            live_order.product is None or live_order.customer is None
+        ):
+            logger.warning(
+                "Ignoring live RESEND_PAYMENT order %s: product or customer row is gone.",
+                live_order.id,
+            )
+            live_order = None
+        if live_order is not None and resend.get("product_name"):
+            # The marker names a different deal than the live order
+            # (abandoned cart for A, now closing B) — re-firing the wrong
+            # prompt would charge for the wrong thing, so fall through to
+            # a fresh close for the named deal instead.
+            if (
+                live_order.product.name.lower() != resend["product_name"].lower()
+                or abs((live_order.agreed_price or 0) - resend["price"]) > 0.01
+            ):
+                logger.warning(
+                    "RESEND_PAYMENT names %r at %s but live order %s is %r at %s; closing fresh.",
+                    resend["product_name"],
+                    resend["price"],
+                    live_order.id,
+                    live_order.product.name,
+                    live_order.agreed_price,
+                )
+                live_order = None
+        if live_order is not None and live_order.tunzaa_transaction_id:
+            return await self._resend_payment_for_order(
+                db, live_order, phone_for_dispatch, language
+            )
+        if live_order is not None:
+            return await self._dispatch_payment(
+                db, live_order, live_order.product, phone_for_dispatch, PaymentType.FULL, language
+            )
+        if resend.get("product_name"):
+            if resend.get("payment_type") == "installment":
+                # Plan legs are pushed on Tunzaa's own schedule — re-firing
+                # would rebill a leg. The model's own words go out alone.
+                logger.warning("Ignoring RESEND_PAYMENT for an installment deal; legs are Tunzaa-pushed.")
+                return None
+            if not fallback_phone:
+                # Instagram never gives us the number — without it in the
+                # marker there is no phone to send the fresh prompt to.
+                logger.warning("Ignoring RESEND_PAYMENT fallback close: marker carries no phone number.")
+                return None
+            return await close_fresh_fn(resend)
+        logger.warning(
+            "Ignoring RESEND_PAYMENT: no live PENDING order for this chat and no deal terms to close fresh."
+        )
+        return None
 
     def _create_subscription_if_needed(
         self,
@@ -313,46 +435,31 @@ class CloseMixin:
                 logger.error(f"Failed to schedule {task.name}: {sched_err}")
 
     async def _close_instagram_deal(
-        self, db: Session, account: InstagramAccount, ig_customer: InstagramCustomer, agreement: dict
+        self,
+        db: Session,
+        account: InstagramAccount,
+        ig_customer: InstagramCustomer,
+        agreement: dict,
+        context: Optional[InstagramConversationContext] = None,
     ) -> Optional[str]:
         """
-        Instagram counterpart to _close_deal: validates the parsed
-        AGREEMENT_REACHED marker the same way (server-side catalog/price/
-        stock enforcement), then reserves stock and creates the Order —
-        except there's no pre-existing WhatsApp Customer/ConversationContext
-        to work from here, since Instagram never gave us a phone number up
-        front. The model is instructed to ask for one before emitting this
-        marker (see generate_dm_response's prompt); `agreement["phone"]` is
-        that number. Once normalized, it resolves/creates the same
-        phone-keyed Customer the WhatsApp flow uses, so payment dispatch,
-        reminders, and the dashboard Orders page all work identically
-        regardless of which channel the deal originated on — the only
-        difference is Order.instagram_account_id instead of .account_id.
-        ig_customer (the InstagramCustomer, distinct from the phone-keyed
-        Customer above) is only needed to let a subscription product's
-        renewal notices go out as an Instagram DM later — see
+        Instagram close: same server-side validation as _close_deal, except
+        there's no pre-existing WhatsApp Customer to work from, since
+        Instagram never gave us a phone number up front. The model is
+        instructed to ask for one before emitting this marker (see the DM
+        prompt); `agreement["phone"]` is that number. Once normalized, it
+        resolves/creates the same phone-keyed Customer the WhatsApp flow
+        uses, so payment dispatch, reminders, and the dashboard Orders page
+        all work identically regardless of which channel the deal originated
+        on — the only difference is Order.instagram_account_id instead of
+        .account_id. ig_customer (the InstagramCustomer, distinct from the
+        phone-keyed Customer above) is only needed to let a subscription
+        product's renewal notices go out as an Instagram DM later — see
         _create_subscription_if_needed.
         """
-        product = (
-            db.query(Product)
-            .filter(Product.merchant_id == account.user_id, Product.name.ilike(agreement["product_name"]))
-            .first()
+        product, payment_type = _validated_close_target(
+            db, account.user_id, agreement, label="Instagram "
         )
-        price = agreement["price"]
-        if not product:
-            raise DealRejected(f"Instagram AGREEMENT_REACHED for unknown product '{agreement['product_name']}'")
-        # Same draft backstop as the WhatsApp close path above.
-        if product.is_draft:
-            raise DealRejected(f"Instagram AGREEMENT_REACHED for '{product.name}' but it's an uncompleted draft")
-        if not (product.min_price <= price <= product.max_price):
-            raise DealRejected(
-                f"Instagram AGREEMENT_REACHED price {price} outside [{product.min_price}, {product.max_price}] "
-                f"for '{product.name}' (possible prompt injection)"
-            )
-        # Subscriptions have no units — see _close_deal (#89).
-        if not product.is_subscription:
-            if (product.quantity or 0) < 1:
-                raise DealRejected(f"Instagram AGREEMENT_REACHED for '{product.name}' but it's out of stock")
 
         phone = agreement.get("phone")
         if not phone:
@@ -365,6 +472,12 @@ class CloseMixin:
             db.add(customer)
             db.commit()
             db.refresh(customer)
+        if customer.language is None and ig_customer.language is not None:
+            # First writer wins across channels (see Customer.language): an
+            # IG classification backfills a still-unset phone row so later
+            # template sends pick the right language.
+            customer.language = ig_customer.language
+            db.commit()
 
         # An Instagram prospect buying a platform plan becomes a merchant:
         # without a User row, activation can't sync their AI access and
@@ -375,49 +488,17 @@ class CloseMixin:
             db.add(User(username=normalized_phone))
             db.commit()
 
-        payment_type = (
-            PaymentType.INSTALLMENT if agreement["payment_type"] == "installment" else PaymentType.FULL
-        )
-
-        # Duplicate-close guard — same as _close_deal (#101).
-        reclose_note = llm_facade._reclose_guard_note(
-            db, customer.id, product, Order.instagram_account_id == account.id, customer.language
-        )
-        if reclose_note:
-            return reclose_note
-
-        # Atomic stock claim — see _close_deal; a lost race rejects
-        # exactly like the out-of-stock pre-check above (#54). Skipped
-        # for subscriptions, which have no units (#89).
-        if not product.is_subscription and not llm_facade._try_claim_stock(db, product):
-            raise DealRejected(f"Instagram AGREEMENT_REACHED for '{product.name}' but it's out of stock")
-        order = Order(
-            customer_id=customer.id,
-            product_id=product.id,
-            instagram_account_id=account.id,
-            # Lets _notify_customer (tunzaa_webhook.py) find the right DM
-            # thread for a payment confirmation/failure notice — the
-            # phone-keyed Customer above has no link back to this. See #(31).
-            instagram_customer_id=ig_customer.id,
-            quantity=1,
-            agreed_price=price,
+        return await self._close_core(
+            db,
+            customer=customer,
+            product=product,
+            price=agreement["price"],
             payment_type=payment_type,
-            status=OrderStatus.PENDING,
-            reserved_until=datetime.utcnow() + RESERVATION_WINDOW,
-        )
-        db.add(order)
-        try:
-            db.commit()
-        except IntegrityError:
-            # Same double-close race as _close_deal above (#114).
-            db.rollback()
-            return _race_loser_note(db, customer.id, product, payment_type, customer.language)
-        db.refresh(order)
-
-        self._create_subscription_if_needed(db, order, product, customer, ig_customer)
-
-        self._schedule_reminders(order.id)
-
-        return await self._dispatch_payment(
-            db, order, product, normalized_phone, payment_type, customer.language
+            channel=CHANNEL_INSTAGRAM,
+            instagram_account_id=account.id,
+            instagram_customer=ig_customer,
+            language=ig_customer.language or customer.language,
+            phone_for_dispatch=normalized_phone,
+            context=context,
+            label="Instagram ",
         )
