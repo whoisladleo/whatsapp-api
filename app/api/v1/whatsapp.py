@@ -13,6 +13,7 @@ from app.core.security import is_safe_external_url, verify_meta_signature
 import httpx
 from app.core.attachments import describe_attachments
 from app.core.webhook_parser import WebhookParser
+from app.services import resume as resume_service
 from app.services.handoff_flow import normalize_button_id
 from app.crud import message as crud_message
 from app.tasks.webhook_processing import apply_async_or_rollback, process_inbound_message
@@ -309,7 +310,13 @@ def resume_handoff(
         raise HTTPException(status_code=404, detail=str(e))
     except crud_message.ConversationNotInHandoffError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    return {"status": "resumed", "phone": phone}
+    verdict = resume_service.verdict_for_whatsapp(db, account.id, phone)
+    queued = resume_service.dispatch_resume_reply(verdict)
+    return {
+        "status": "resumed",
+        "phone": phone,
+        "resume_reply": "queued" if queued else f"skipped_{verdict.reason}",
+    }
 
 
 @router.get("/messages", response_model=list[MessageRead])

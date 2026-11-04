@@ -1253,6 +1253,14 @@ def test_button_type_takeover_tap_resumes_and_confirms(
     from app.db.models import ConversationContext, ConversationState, Customer
 
     monkeypatch.setattr(flow_module, "redis_client", fakeredis.FakeRedis())
+    # The take-over turn is covered in the resume tests; running it nested
+    # and eager here would corrupt this test's session, so suppress just
+    # the dispatch — the verdict and reply text stay real.
+    verdicts = []
+    monkeypatch.setattr(
+        "app.services.resume.dispatch_resume_reply",
+        lambda verdict: verdicts.append(verdict) or False,
+    )
     _platform_plus_handoff(db_session, merchant_owner, "PHONE_BTN2")
     owner_username = merchant_owner.username
 
@@ -1278,6 +1286,8 @@ def test_button_type_takeover_tap_resumes_and_confirms(
     assert context.state == ConversationState.NEGOTIATING
     outbound = db_session.query(Message).filter(Message.direction == "outbound").first()
     assert "Amara is back on 255711111111" in outbound.body
+    assert "replying to their last message now" in outbound.body
+    assert [v.answerable for v in verdicts] == [True]
 
 
 @respx.mock

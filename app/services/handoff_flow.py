@@ -19,6 +19,7 @@ from app.db.models import (
     User,
     WhatsAppAccount,
 )
+from app.services import resume as resume_service
 
 logger = logging.getLogger(__name__)
 
@@ -416,14 +417,24 @@ def _takeover(db: Session, merchant: User, target: dict, note: str) -> str:
             crud_instagram.resume_conversation(db, uuid.UUID(target["customer_id"]))
         except crud_instagram.ConversationNotInHandoffError:
             return f"{target['name']} is not currently waiting."
-        return f"Amara is back on {target['name']}{note} — she'll reply to their next message."
+        verdict = resume_service.verdict_for_instagram(db, uuid.UUID(target["customer_id"]))
+        resume_service.dispatch_resume_reply(verdict)
+        return resume_service.takeover_resume_line(
+            target["name"], note, f"/reply {target['name']} <message>", verdict
+        )
     try:
         crud_message.resume_conversation_for_account(
             db, uuid.UUID(target["account_id"]), target["ref"]
         )
     except (crud_message.ConversationNotFoundError, crud_message.ConversationNotInHandoffError) as e:
         return str(e)
-    return f"Amara is back on {target['name']}{note} — she'll reply to their next message."
+    verdict = resume_service.verdict_for_whatsapp(
+        db, uuid.UUID(target["account_id"]), target["ref"]
+    )
+    resume_service.dispatch_resume_reply(verdict)
+    return resume_service.takeover_resume_line(
+        target["name"], note, f"/reply {target['ref']} <message>", verdict
+    )
 
 
 async def consume_reply_mode(db: Session, merchant: User, message_body: str) -> str | None:

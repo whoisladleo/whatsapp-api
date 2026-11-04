@@ -1,5 +1,14 @@
 # Decisions
 
+## Resume answers the last message immediately (take-over reply, 2026-11-04, #149)
+
+**Chose:** every resume path (`/resume` phone/@/pick, the alert's takeover button, both HTTP endpoints) now verdicts and re-dispatches the normal inbound pipeline on the customer's last message instead of just flipping state. One shared service (`app/services/resume.py`) holds the verdict (latest inbound row + Meta 24h window) and the dispatch; WhatsApp reuses its body-based task unchanged, Instagram takes a new trailing `resume=True` that skips the already-won row claim (the conversation lock still serializes, and the flag propagates through both retry paths). Past-window resumes stay silent with a "reply manually" hint — no new template, no tag machinery. Safe to re-run: the handoff marker early-returns before close/quote/resend on both channels, so a handoff turn never closed anything the take-over could double-close. Two faithful-to-inbound edges accepted: an armed platform reply-mode can be consumed by a resume turn exactly as the original message would have, and a customer message landing mid-resume gets its own turn (possible double answer, locks only serialize). Verdict is computed synchronously so the merchant reply/HTTP body reports `queued` vs `skipped_*`; the turn itself runs async.
+
+**Considered and rejected:**
+- *A dedicated resume-reply task duplicating generate+send.* Rejected: ~60 lines × 2 channels of pipeline duplication is the exact drift #136 removed. Re-dispatch keeps one pipeline.
+- *Synchronous generate inside resume (the /direct shape).* Rejected: /direct is words-only proactive (never closes, never re-handoffs) — wrong semantics for a take-over, which must be a full turn. Async dispatch also keeps resume endpoints fast.
+- *A WA template / IG tag for past-window resumes.* Rejected: needs Meta approvals (days), and the owner chose tell-and-stay-silent. The window check failing closed is the feature.
+
 ## Meta-rejected handoff alerts are loud and failed, not "sent" (2026-11-04, #148)
 
 **Chose:** `_send_platform_alert_to_merchant` now treats a template response without `"messages"` as a failed send: error-logs the Meta body and records the alert as failed. Root cause of a live mystery: `send_template` never raises on Meta errors (returns `{"error": ...}` as a normal value), and the handoff path only guarded exceptions — so a rejected `handoff_notification` was stored as `"sent"` (an error dict is truthy) with zero log noise. Every other template caller already checked for `"messages"`; the handoff path was the one that didn't. Uses the existing `usage.whatsapp_send_succeeded` helper rather than a new inline check. Regression test posts a 400 + error body and asserts the log line plus strict `"failed"` status (the older 500-body test asserts weak `in ("sent", "failed")` and was left untouched).

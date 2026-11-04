@@ -277,14 +277,21 @@ async def test_bare_resume_lists_pending_handoffs(db_session, merchant_account):
     assert "/resume <number above>" in reply
 
 
-async def test_resume_index_pick_whatsapp(db_session, merchant_account):
+async def test_resume_index_pick_whatsapp(db_session, merchant_account, monkeypatch):
     customer, context = await _handed_off_customer(db_session, merchant_account)
+    calls = []
+    monkeypatch.setattr(
+        "app.tasks.webhook_processing.process_inbound_message.apply_async",
+        lambda *a, **kw: calls.append(kw.get("args")),
+    )
 
     reply = await handle_merchant_message(db_session, merchant_account, "/resume 1", "255700000099")
 
     db_session.refresh(context)
     assert context.state == ConversationState.NEGOTIATING
     assert f"Conversation with {customer.phone_number} resumed" in reply
+    assert "Amara is replying to their last message now" in reply
+    assert calls == [[str(merchant_account.id), customer.phone_number, "need help"]]
 
 
 async def test_resume_index_pick_instagram(db_session, merchant_account):
@@ -295,6 +302,63 @@ async def test_resume_index_pick_instagram(db_session, merchant_account):
     db_session.refresh(context)
     assert context.state == ConversationState.NEGOTIATING
     assert "Conversation with @waiter resumed" in reply
+
+
+async def test_resume_stale_stays_silent_with_manual_hint(db_session, merchant_account, monkeypatch):
+    from datetime import datetime, timedelta
+
+    customer, context = await _handed_off_customer(db_session, merchant_account)
+    msg = (
+        db_session.query(Message)
+        .filter(Message.from_phone == customer.phone_number, Message.direction == "inbound")
+        .one()
+    )
+    msg.timestamp = datetime.utcnow() - timedelta(hours=25)
+    db_session.commit()
+    calls = []
+    monkeypatch.setattr(
+        "app.tasks.webhook_processing.process_inbound_message.apply_async",
+        lambda *a, **kw: calls.append(kw.get("args")),
+    )
+
+    reply = await handle_merchant_message(
+        db_session, merchant_account, f"/resume {customer.phone_number}", "255700000099"
+    )
+
+    db_session.refresh(context)
+    assert context.state == ConversationState.NEGOTIATING
+    assert "over 24 hours old" in reply
+    assert f"/reply {customer.phone_number}" in reply
+    assert calls == []
+
+
+async def test_resume_instagram_answerable_dispatches_takeover(db_session, merchant_account, monkeypatch):
+    from app.db.models import InstagramDirectMessage
+
+    ig_customer, context = await _ig_handed_off_customer(db_session, merchant_account)
+    dm = InstagramDirectMessage(
+        account_id=ig_customer.account_id, customer_id=ig_customer.id,
+        direction="inbound", body="do you deliver?",
+    )
+    db_session.add(dm)
+    db_session.commit()
+    db_session.refresh(dm)
+    calls = []
+    monkeypatch.setattr(
+        "app.tasks.instagram_dm_processing.process_inbound_dm.apply_async",
+        lambda *a, **kw: calls.append(kw.get("args")),
+    )
+
+    reply = await handle_merchant_message(
+        db_session, merchant_account, "/resume @waiter", "255700000099"
+    )
+
+    db_session.refresh(context)
+    assert context.state == ConversationState.NEGOTIATING
+    assert "Amara is replying to their last message now" in reply
+    assert calls == [[
+        str(ig_customer.account_id), str(ig_customer.id), str(dm.id), 0, None, 0, True,
+    ]]
 
 
 async def test_resume_out_of_range_index_falls_through_to_phone_path(db_session, merchant_account):
@@ -346,8 +410,13 @@ async def test_resume_customer_not_in_handoff(db_session, merchant_account):
     assert "not currently in a human handoff state" in reply
 
 
-async def test_resume_success(db_session, merchant_account):
+async def test_resume_success(db_session, merchant_account, monkeypatch):
     customer, context = await _handed_off_customer(db_session, merchant_account)
+    calls = []
+    monkeypatch.setattr(
+        "app.tasks.webhook_processing.process_inbound_message.apply_async",
+        lambda *a, **kw: calls.append(kw.get("args")),
+    )
 
     reply = await handle_merchant_message(
         db_session, merchant_account, f"/resume {customer.phone_number}", "255700000099"
@@ -356,7 +425,9 @@ async def test_resume_success(db_session, merchant_account):
     db_session.refresh(context)
     assert context.state == ConversationState.NEGOTIATING
     assert context.handoff_at is None
-    assert "resumed" in reply.lower()
+    assert "Amara is replying to their last message now" in reply
+    # Take-over turn re-dispatches the last inbound message (#149).
+    assert calls == [[str(merchant_account.id), customer.phone_number, "need help"]]
 
 
 async def test_resume_instagram_no_account_connected(db_session, merchant_account):

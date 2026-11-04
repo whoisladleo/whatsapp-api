@@ -302,11 +302,20 @@ async def test_done_button_disarms_and_reports(db_session, merchant, business_ac
 
 
 async def test_takeover_button_resumes_instagram(
-    db_session, merchant, business_account, wa_handoff, ig_handoff
+    db_session, merchant, business_account, wa_handoff, ig_handoff, monkeypatch
 ):
+    calls = []
+    monkeypatch.setattr(
+        "app.tasks.instagram_dm_processing.process_inbound_dm.apply_async",
+        lambda *a, **kw: calls.append(kw.get("args")),
+    )
+
     reply = await handle_button(db_session, merchant, BUTTON_TAKEOVER, None)
 
     assert "Amara is back on @waitingbuyer" in reply
+    # No inbound DM rows on file: nothing to answer, next-message fallback.
+    assert "she'll reply to their next message" in reply
+    assert calls == []
     context = (
         db_session.query(InstagramConversationContext)
         .filter(InstagramConversationContext.customer_id == ig_handoff.id)
@@ -316,13 +325,20 @@ async def test_takeover_button_resumes_instagram(
 
 
 async def test_takeover_button_resumes_whatsapp_via_context(
-    db_session, merchant, business_account, wa_handoff, ig_handoff
+    db_session, merchant, business_account, wa_handoff, ig_handoff, monkeypatch
 ):
     remember_alert("wamid.alert_wa", _target(account_id=str(business_account.id)))
+    calls = []
+    monkeypatch.setattr(
+        "app.tasks.webhook_processing.process_inbound_message.apply_async",
+        lambda *a, **kw: calls.append(kw.get("args")),
+    )
 
     reply = await handle_button(db_session, merchant, BUTTON_TAKEOVER, "wamid.alert_wa")
 
     assert "Amara is back on 255711111111" in reply
+    assert "she's replying to their last message now" in reply
+    assert calls == [[str(business_account.id), "255711111111", "hello?"]]
     context = (
         db_session.query(ConversationContext)
         .join(Customer, ConversationContext.customer_id == Customer.id)

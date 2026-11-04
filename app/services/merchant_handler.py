@@ -21,6 +21,7 @@ from app.db.models import (
 )
 from app.crud import message as crud_message
 from app.crud import instagram as crud_instagram
+from app.services import resume as resume_service
 from app.services import usage
 from app.services.handoff_flow import (
     list_pending_handoffs,
@@ -96,7 +97,9 @@ async def handle_merchant_message(db: Session, account: WhatsAppAccount, message
             return str(e)
         except crud_message.ConversationNotInHandoffError as e:
             return str(e)
-        return f"Conversation with {phone} resumed. Amara will respond to their next message."
+        verdict = resume_service.verdict_for_whatsapp(db, account.id, phone)
+        resume_service.dispatch_resume_reply(verdict)
+        return resume_service.merchant_resume_line(phone, f"/reply {phone} <message>", verdict)
 
     if body.lower() == "/reply" or body.lower().startswith("/reply "):
         rest = body[len("/reply"):].strip()
@@ -258,7 +261,11 @@ async def _resume_pending_pick(db: Session, account: WhatsAppAccount, pick: dict
         return str(e)
     except crud_message.ConversationNotInHandoffError as e:
         return str(e)
-    return f"Conversation with {pick['ref']} resumed. Amara will respond to their next message."
+    verdict = resume_service.verdict_for_whatsapp(db, uuid.UUID(pick["account_id"]), pick["ref"])
+    resume_service.dispatch_resume_reply(verdict)
+    return resume_service.merchant_resume_line(
+        pick["ref"], f"/reply {pick['ref']} <message>", verdict
+    )
 
 
 async def _resend_pending_pick(db: Session, account: WhatsAppAccount, pick: dict) -> str:
@@ -660,4 +667,8 @@ async def _resume_instagram_conversation(db: Session, account: WhatsAppAccount, 
         # customer UUID, not something to show the merchant — build our
         # own using what they actually typed instead.
         return f"@{ig_username} is not currently in a human handoff state."
-    return f"Conversation with @{ig_username} resumed. Amara will respond to their next message."
+    verdict = resume_service.verdict_for_instagram(db, ig_customer.id)
+    resume_service.dispatch_resume_reply(verdict)
+    return resume_service.merchant_resume_line(
+        f"@{ig_username}", f"/reply @{ig_username} <message>", verdict
+    )

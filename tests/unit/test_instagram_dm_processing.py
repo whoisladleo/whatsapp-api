@@ -315,6 +315,53 @@ def test_outage_retry_claim_is_compare_and_swap(db_session, account, customer, i
     assert task_module.process_inbound_dm(*ids, 1, claimed_at.isoformat()) == "Processed."
 
 
+def test_resume_turn_skips_claim_on_already_processed_row(
+    db_session, account, customer, inbound_dm, fake_llm_reply, monkeypatch
+):
+    """Take-over turns re-run an already-claimed row (#149): resume=True
+    skips the claim CAS instead of returning 'Already processed'."""
+    fake_provider = _FakeProvider("ig-tok")
+    monkeypatch.setattr(task_module, "InstagramProvider", lambda access_token: fake_provider)
+    ids = (account.id, customer.id, inbound_dm.id)
+
+    assert task_module.process_inbound_dm(*ids) == "Processed."
+    assert task_module.process_inbound_dm(*ids) == "Already processed; skipping duplicate dispatch."
+    fake_provider.response = {"message_id": "mid_out_2"}
+    assert task_module.process_inbound_dm(*ids, 0, None, 0, True) == "Processed."
+    assert fake_provider.calls == [("ig_biz_1", "igsid_1", "It's 45000 TZS.")] * 2
+
+
+def test_resume_outage_retry_propagates_resume_flag(
+    db_session, account, customer, inbound_dm, monkeypatch
+):
+    """A resume turn that hits an LLM outage retries with resume intact —
+    without propagation the retry would hit the already-claimed row and
+    drop the take-over reply as a duplicate (#149)."""
+    calls = []
+
+    async def flaky(**kwargs):
+        calls.append(kwargs["retry_on_outage"])
+        if len(calls) == 1:
+            raise task_module.LLMUnavailable("overloaded")
+        return "It's 45000 TZS."
+
+    class FakeLLMService:
+        generate_dm_response = staticmethod(flaky)
+
+    monkeypatch.setattr(task_module, "llm_service", FakeLLMService())
+    fake_provider = _FakeProvider("ig-tok")
+    monkeypatch.setattr(task_module, "InstagramProvider", lambda access_token: fake_provider)
+    inbound_dm.processed_at = datetime(2026, 10, 23, 12, 0, 0)
+    db_session.commit()
+
+    task_module.process_inbound_dm.apply_async(
+        args=[account.id, customer.id, inbound_dm.id, 0, None, 0, True]
+    )
+
+    assert calls == [True, True]
+    assert len(fake_provider.calls) == 1
+
+
 def test_send_failure_alerts_merchant(db_session, account, customer, inbound_dm, monkeypatch):
     monkeypatch.setattr(task_module, "_send_with_retries", _no_retry_send)
     alerts = []
