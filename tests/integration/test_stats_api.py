@@ -99,6 +99,38 @@ def test_current_period_stats(client, db_session, auth_user, shop, monkeypatch):
     ]
 
 
+def test_dashboard_limit_uses_plan_not_global_default(client, db_session, auth_user, shop, monkeypatch):
+    from app.db.models import ProductSubscription, ProductSubscriptionStatus
+
+    monkeypatch.setattr(settings, "PLAN_REPLY_LIMIT", 10)
+    user, *_ = shop
+    _, headers = auth_user
+    seller = User(username="255700099998")
+    buyer = Customer(phone_number=user.username)
+    db_session.add_all([seller, buyer])
+    db_session.commit()
+    plan = Product(
+        slug="stats-plan", name="Plan", max_price=100000, min_price=100000,
+        quantity=0, merchant_id=seller.id, is_subscription=True,
+        is_platform_plan=True, monthly_reply_limit=50,
+    )
+    db_session.add(plan)
+    db_session.commit()
+    order = Order(customer_id=buyer.id, product_id=plan.id, agreed_price=100000, status=OrderStatus.PAID)
+    db_session.add(order)
+    db_session.commit()
+    db_session.add(ProductSubscription(
+        order_id=order.id, customer_id=buyer.id, product_id=plan.id,
+        status=ProductSubscriptionStatus.ACTIVE, monthly_amount=100000,
+        next_billing_at=datetime.utcnow() + timedelta(days=5),
+    ))
+    db_session.commit()
+
+    body = client.get(URL, headers=headers).json()
+
+    assert body["replies"]["limit"] == 50
+
+
 def test_previous_period(client, db_session, auth_user, shop):
     user, *_ = shop
     _, headers = auth_user

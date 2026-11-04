@@ -2,11 +2,15 @@ from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from app.core.catalog_client import DRAFT_NAME_PREFIX
-from app.db.models import Product, User
+from app.db.models import Order, Product, ProductSubscription, User
 from app.schemas.product import ProductCreate, ProductUpdate
 from typing import List, Optional
 import re
 import uuid
+
+
+class ProductHasSubscriptionsError(Exception):
+    """Raised when deleting a product that still has subscription rows."""
 
 
 # Columns a bulk row may never write, on either the insert or the update
@@ -136,6 +140,21 @@ def update_product_stock(
     return db_product
 
 def delete_product(db: Session, db_product: Product) -> None:
+    if (
+        db.query(ProductSubscription)
+        .filter(ProductSubscription.product_id == db_product.id)
+        .first()
+        is not None
+    ):
+        raise ProductHasSubscriptionsError(
+            "This product still has subscriptions and can't be deleted."
+        )
+    # Order history survives the product: orders.product_id is nullable and
+    # every read path tolerates a NULL product, so the link is NULLed
+    # explicitly rather than relying on the DB-level ON DELETE — SQLite
+    # (tests) doesn't enforce FK actions, and the explicit update keeps
+    # both backends identical.
+    db.query(Order).filter(Order.product_id == db_product.id).update({"product_id": None})
     retailer_id = str(db_product.id)
     db.delete(db_product)
     db.commit()

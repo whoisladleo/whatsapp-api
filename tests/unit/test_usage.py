@@ -87,6 +87,19 @@ def test_past_due_period_rolls_forward_past_a_stale_billing_date(db_session, mer
     assert (start, end) == (stale, stale + timedelta(days=30))
 
 
+def test_previous_subscription_period_rolls_backward(db_session, merchant):
+    next_billing = datetime(2026, 11, 5, 9, 0)
+    _platform_subscription(db_session, merchant, ProductSubscriptionStatus.ACTIVE, next_billing)
+    start, _ = usage.billing_period(db_session, merchant, now=datetime(2026, 10, 23))
+
+    prev_start, prev_end = usage.billing_period(
+        db_session, merchant, now=start - timedelta(microseconds=1)
+    )
+
+    assert prev_end == start
+    assert (prev_start, prev_end) == (start - timedelta(days=30), start)
+
+
 def test_cancelled_subscription_falls_back_to_calendar_month(db_session, merchant):
     _platform_subscription(
         db_session, merchant, ProductSubscriptionStatus.CANCELLED, datetime(2026, 11, 5)

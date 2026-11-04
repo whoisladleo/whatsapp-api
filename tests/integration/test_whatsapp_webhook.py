@@ -469,6 +469,44 @@ def test_webhook_forwarding_runs_after_response_via_background_tasks(
     ] == [(whatsapp_module._forward_to_callback, "http://8.8.8.8/hook")]
 
 
+@respx.mock
+def test_webhook_forward_rechecks_safety_immediately_before_post(
+    client, db_session, merchant_owner, monkeypatch
+):
+    # The enqueue-time check passes, but DNS re-resolves to an unsafe
+    # address before the background task POSTs (SSRF via rebinding) — the
+    # send-time re-check must refuse the POST anyway.
+    import app.api.v1.whatsapp as whatsapp_module
+
+    account = WhatsAppAccount(
+        name="Test Shop",
+        phone_number_id="PHONE_CB_REBIND",
+        access_token="tok",
+        ai_enabled=False,
+        callback_url="http://8.8.8.8/hook",
+        user_id=merchant_owner.id,
+    )
+    db_session.add(account)
+    db_session.commit()
+
+    callback_route = respx.post("http://8.8.8.8/hook").mock(
+        return_value=httpx.Response(200, json={})
+    )
+
+    verdicts = iter([True, False])
+
+    def flip_verdict(url):
+        return next(verdicts)
+
+    monkeypatch.setattr(whatsapp_module, "is_safe_external_url", flip_verdict)
+
+    payload = _text_webhook_payload("PHONE_CB_REBIND", "255711111112", "hi")
+    resp = client.post(WEBHOOK_URL, json=payload)
+
+    assert resp.status_code == 200
+    assert not callback_route.called
+
+
 # --- Status updates, knowledge base lookup, Meta send failure ---------------
 
 

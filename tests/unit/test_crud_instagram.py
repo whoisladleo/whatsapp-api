@@ -227,6 +227,25 @@ def test_get_or_create_customer_returns_existing_and_updates_username(db_session
     assert db_session.query(InstagramCustomer).count() == 1
 
 
+def test_get_or_create_customer_scopes_same_sender_per_account(db_session, account, other_user):
+    # IGSIDs are app-scoped: the same sender at two shops must get two
+    # rows, not share one (previously the second shop was handed the
+    # first shop's row, leaking DM history and conversation state).
+    other_account = crud_instagram.upsert_account(
+        db_session, other_user.id, "ig_other", "tok_other", "other_shop"
+    )
+
+    mine = crud_instagram.get_or_create_customer(db_session, account.id, "igsid_shared", "shopper")
+    theirs = crud_instagram.get_or_create_customer(db_session, other_account.id, "igsid_shared", "shopper")
+    mine_again = crud_instagram.get_or_create_customer(db_session, account.id, "igsid_shared")
+
+    assert mine.id != theirs.id
+    assert mine.account_id == account.id
+    assert theirs.account_id == other_account.id
+    assert mine_again.id == mine.id
+    assert db_session.query(InstagramCustomer).count() == 2
+
+
 def test_get_or_create_conversation_creates_with_default_state(db_session, account):
     customer = crud_instagram.get_or_create_customer(db_session, account.id, "igsid_1")
 

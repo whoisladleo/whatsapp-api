@@ -209,9 +209,14 @@ def conversation_has_outbound_message(db: Session, customer_id: uuid.UUID) -> bo
 def get_or_create_customer(
     db: Session, account_id: uuid.UUID, ig_scoped_id: str, username: Optional[str] = None
 ) -> InstagramCustomer:
+    # Scoped to (account_id, ig_scoped_id): IGSIDs are app-scoped, so the
+    # same sender at two shops must get two rows, not share one.
     customer = (
         db.query(InstagramCustomer)
-        .filter(InstagramCustomer.ig_scoped_id == ig_scoped_id)
+        .filter(
+            InstagramCustomer.account_id == account_id,
+            InstagramCustomer.ig_scoped_id == ig_scoped_id,
+        )
         .first()
     )
     if customer is None:
@@ -228,7 +233,10 @@ def get_or_create_customer(
             db.rollback()
             customer = (
                 db.query(InstagramCustomer)
-                .filter(InstagramCustomer.ig_scoped_id == ig_scoped_id)
+                .filter(
+                    InstagramCustomer.account_id == account_id,
+                    InstagramCustomer.ig_scoped_id == ig_scoped_id,
+                )
                 .first()
             )
             if customer is None:

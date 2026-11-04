@@ -386,8 +386,18 @@ class InstagramCustomer(Base):
     """
     __tablename__ = "instagram_customers"
 
+    # One row per (account, sender): IGSIDs are app-scoped, so the same
+    # person messaging two shops has the same ig_scoped_id at both — a
+    # global unique used to hand the second shop the first shop's row,
+    # leaking DM history and conversation state across shops.
+    __table_args__ = (
+        UniqueConstraint(
+            "account_id", "ig_scoped_id", name="uq_instagram_customers_account_igsid"
+        ),
+    )
+
     id = Column(UUIDType, primary_key=True, default=uuid.uuid4, index=True)
-    ig_scoped_id = Column(String, unique=True, index=True, nullable=False)
+    ig_scoped_id = Column(String, index=True, nullable=False)
     username = Column(String, nullable=True)
     account_id = Column(UUIDType, ForeignKey("instagram_accounts.id"), nullable=False)
     # Same one-shot classification as Customer.language, but stored
@@ -554,7 +564,10 @@ class Order(Base):
 
     id = Column(UUIDType, primary_key=True, default=uuid.uuid4, index=True)
     customer_id = Column(UUIDType, ForeignKey("customers.id"))
-    product_id = Column(UUIDType, ForeignKey("products.id"), nullable=True)
+    # Order history survives the product: deleting a product NULLs this
+    # link (see crud.product.delete_product) instead of blocking or
+    # cascading — every read path already tolerates a NULL product.
+    product_id = Column(UUIDType, ForeignKey("products.id", ondelete="SET NULL"), nullable=True)
     account_id = Column(UUIDType, ForeignKey("whatsapp_accounts.id"), nullable=True)
     # Dashboard-native purchases (Pay Now) carry no channel account, so the
     # merchant join can't attribute them — this records the buying user at

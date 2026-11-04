@@ -3,7 +3,7 @@ services:
     image: whoisladleo/whatsapp:latest
     restart: always
     ports:
-      - "${PORT:-8001}:8000"
+      - "${PORT:-8001}:${PORT:-8001}"
     environment:
       - PORT=${PORT:-8001}
       - POSTGRES_SERVER=${POSTGRES_SERVER:-db}
@@ -40,7 +40,7 @@ services:
       - TIMEOUT=${TIMEOUT:-120}
       - BACKEND_CORS_ORIGINS=${BACKEND_CORS_ORIGINS}
     healthcheck:
-      test: [ "CMD-SHELL", "sh -c 'curl -fs http://127.0.0.1:${PORT:-8000}/health || exit 1'" ]
+      test: [ "CMD-SHELL", "sh -c 'curl -fs http://127.0.0.1:${PORT:-8001}/health || exit 1'" ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -52,8 +52,9 @@ services:
 
   redis:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
+    # No ports mapping: api/worker reach Redis over the internal compose
+    # network (redis://redis:6379/0). Publishing 6379 exposed a
+    # passwordless Redis to the host/network (#156).
 
   celery_worker:
     image: whoisladleo/whatsapp:latest

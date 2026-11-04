@@ -118,20 +118,55 @@ def _lock_key(account_id: str, from_phone: str) -> str:
     return f"webhook_lock:{account_id}:{normalize_phone(from_phone)}"
 
 
-def _acquire_lock(key: str) -> bool:
+def _acquire_lock(key: str) -> str | None:
+    """
+    Returns this holder's token on success, None when the lock is held.
+    The token makes the release a compare-and-delete: a worker whose turn
+    outlasted the TTL must not delete the next holder's lock (the old
+    fixed value + unconditional delete did exactly that).
+    """
+    token = uuid.uuid4().hex
     try:
-        return bool(
-            rate_limit_module._redis_client.set(key, "1", nx=True, ex=LOCK_TTL_SECONDS)
-        )
+        if rate_limit_module._redis_client.set(key, token, nx=True, ex=LOCK_TTL_SECONDS):
+            return token
+        return None
     except Exception:
         # Fail open, matching check_and_increment's fail-open behavior — a
-        # Redis outage shouldn't stop customers from getting replies.
-        return True
+        # Redis outage shouldn't stop customers from getting replies. The
+        # token never matches a real lock value, so the release below is a
+        # safe no-op (and nothing was ever SET to release anyway).
+        return token
 
 
-def _release_lock(key: str) -> None:
+def _release_lock(key: str, token: str) -> None:
+    """Deletes the lock only if it still holds our token (WATCH-guarded, so
+    the check and the delete are atomic). A Lua compare-and-delete would do
+    the same on real Redis but fakeredis has no EVAL, so tests couldn't run
+    it — WATCH works on both."""
     try:
-        rate_limit_module._redis_client.delete(key)
+        from redis.exceptions import WatchError
+
+        client = rate_limit_module._redis_client
+        token = str(token)
+        with client.pipeline(transaction=True) as pipe:
+            while True:
+                try:
+                    pipe.watch(key)
+                    current = pipe.get(key)
+                    if current is None:
+                        pipe.unwatch()
+                        return
+                    if isinstance(current, bytes):
+                        current = current.decode()
+                    if current != token:
+                        pipe.unwatch()
+                        return
+                    pipe.multi()
+                    pipe.delete(key)
+                    pipe.execute()
+                    return
+                except WatchError:
+                    continue
     except Exception:
         pass
 
@@ -178,7 +213,8 @@ def process_inbound_message(
             return "Account not found."
 
         lock_key = _lock_key(account_id, from_phone)
-        if not _acquire_lock(lock_key):
+        lock_token = _acquire_lock(lock_key)
+        if not lock_token:
             if attempt >= LOCK_MAX_RETRIES:
                 logger.warning(
                     f"Giving up on {lock_key} after {LOCK_MAX_RETRIES} retries "
@@ -207,7 +243,7 @@ def process_inbound_message(
         except LLMUnavailable as e:
             outage = e
         finally:
-            _release_lock(lock_key)
+            _release_lock(lock_key, lock_token)
 
         # Dispatched only after the lock is released, so the retry can take it.
         logger.warning(f"Claude unavailable for {lock_key} (attempt {llm_attempt}); retrying: {outage}")

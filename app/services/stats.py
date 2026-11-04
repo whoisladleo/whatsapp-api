@@ -30,7 +30,11 @@ def merchant_stats(db: Session, merchant: User, period: Literal["current", "prev
         start, end = usage.billing_period(db, merchant, now=start - timedelta(microseconds=1))
 
     replies_used = usage.count_events(db, merchant.id, AmaraEventKind.REPLY, start, end)
-    limit = settings.PLAN_REPLY_LIMIT
+    # The dashboard must show the meter enforcement actually uses (#90) —
+    # the plan's limit, not the global default. Unlimited (seller-exempt,
+    # no limit set) falls back to the global for display, same as
+    # app/tasks/usage_alerts.py.
+    limit = usage.effective_reply_limit(db, merchant) or settings.PLAN_REPLY_LIMIT
 
     orders = (
         db.query(Order)

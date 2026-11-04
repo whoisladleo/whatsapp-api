@@ -11,6 +11,7 @@ from app.schemas.account import (
     NumberSubscriptionResponse,
 )
 from app.crud.account import (
+    AccountHasHistoryError,
     create_account, get_account_by_id, get_accounts_by_user,
     update_account, delete_account,
 )
@@ -175,7 +176,10 @@ def delete_existing_account(
     db_account = get_account_by_id(db=db, account_id=account_id, user_id=current_user.id)
     if not db_account:
         raise HTTPException(status_code=404, detail="Account not found")
-    delete_account(db=db, db_account=db_account)
+    try:
+        delete_account(db=db, db_account=db_account)
+    except AccountHasHistoryError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     return {"status": "deleted"}
 
 

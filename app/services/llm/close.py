@@ -46,9 +46,11 @@ def _validated_close_target(db: Session, merchant_id, agreement: dict, label: st
     """Shared AGREEMENT_REACHED validation for both close paths: the product
     must exist, be completed, and the price must sit inside its band with
     stock to sell (subscriptions skip the stock rule — they have no units,
-    #89). label prefixes the rejection reason with the channel (""/"Instagram
-    ") so logs keep attributing the path. Raises DealRejected — the caller
-    replaces the model's reply with the holding line and hands off (#37)."""
+    #89). Platform plans are fixed-price: the price must equal max exactly,
+    not merely land in the band. label prefixes the rejection reason with
+    the channel (""/"Instagram ") so logs keep attributing the path. Raises
+    DealRejected — the caller replaces the model's reply with the holding
+    line and hands off (#37)."""
     product = (
         db.query(Product)
         .filter(Product.merchant_id == merchant_id, Product.name.ilike(agreement["product_name"]))
@@ -61,6 +63,11 @@ def _validated_close_target(db: Session, merchant_id, agreement: dict, label: st
     # even if a merchant set stock on it before completing it.
     if product.is_draft:
         raise DealRejected(f"{label}AGREEMENT_REACHED for '{product.name}' but it's an uncompleted draft")
+    if product.is_platform_plan and price != product.max_price:
+        raise DealRejected(
+            f"{label}AGREEMENT_REACHED price {price} is not the fixed plan price "
+            f"{product.max_price} for '{product.name}' (plans sell at exactly Max Price)"
+        )
     if not (product.min_price <= price <= product.max_price):
         raise DealRejected(
             f"{label}AGREEMENT_REACHED price {price} outside [{product.min_price}, {product.max_price}] "

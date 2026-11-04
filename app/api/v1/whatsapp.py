@@ -89,6 +89,12 @@ async def _forward_to_callback(callback_url: str, payload: dict) -> None:
     """Best-effort merchant forward; runs as a BackgroundTasks task after the
     Meta ACK, so a slow merchant endpoint can't delay it. Failures are
     logged, never raised."""
+    # Re-checked here, immediately before the POST — the enqueue-time check
+    # in handle_webhook runs before this task executes, and DNS can
+    # re-resolve to a different address in between (SSRF via rebinding).
+    if not is_safe_external_url(callback_url):
+        print(f"Skipping forward to unsafe callback_url: {callback_url}")
+        return
     try:
         async with httpx.AsyncClient() as client:
             await client.post(callback_url, json=payload, timeout=5.0)

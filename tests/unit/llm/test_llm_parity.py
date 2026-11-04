@@ -136,6 +136,23 @@ def entry_plan(db_session, merchant):
 
 
 @pytest.fixture
+def banded_plan(db_session, merchant):
+    # A plan with a real band (min < max): existing rows carry min == max,
+    # which can't distinguish band validation from exact-price enforcement.
+    p = Product(
+        slug="parity-banded-plan", name="Parity Banded Plan",
+        max_price=100000, min_price=50000, quantity=0,
+        merchant_id=merchant.id, is_subscription=True,
+        is_platform_plan=True, monthly_reply_limit=2000,
+        allow_installments=False,
+    )
+    db_session.add(p)
+    db_session.commit()
+    db_session.refresh(p)
+    return p
+
+
+@pytest.fixture
 def wa_customer(db_session):
     c = Customer(phone_number="255700000136")
     db_session.add(c)
@@ -193,6 +210,23 @@ def test_render_catalog_dm_plan_note():
     assert "includes 2,000 Amara replies a month" in out
     out_unlimited = render_catalog([_product(is_subscription=True, is_platform_plan=True)])
     assert "includes unlimited Amara replies" in out_unlimited
+
+
+def test_render_catalog_dm_plan_has_no_floor():
+    plan = _product(
+        name="Banded Plan", slug="parity-bp", max_price=100000, min_price=50000,
+        quantity=0, is_subscription=True, is_platform_plan=True,
+        monthly_reply_limit=2000,
+    )
+    out = render_catalog([plan, _product()])
+    plan_line = next(l for l in out.splitlines() if l.startswith("- Banded Plan:"))
+    assert plan_line == (
+        "- Banded Plan: Max Price TZS 100,000, available now, billed monthly, "
+        "includes 2,000 Amara replies a month"
+    )
+    # The regular product alongside keeps its negotiation floor.
+    widget_line = next(l for l in out.splitlines() if l.startswith("- Widget:"))
+    assert "Lowest Price You May Offer TZS 44,000" in widget_line
 
 
 def test_render_catalog_comment_mode_is_price_and_availability_only():
@@ -613,6 +647,53 @@ async def test_close_validation_keeps_channel_prefixes(
             db_session, ig_account, ig_customer,
             {"product_name": "Nope", "price": 1, "payment_type": "full", "phone": "255700000001"},
         )
+
+
+async def test_close_rejects_plan_price_below_max(
+    db_session, shop_account, wa_customer, wa_context, banded_plan,
+):
+    # In-band but not max: a haggled plan price must not close.
+    service = _service_with_fake_client()
+    with pytest.raises(DealRejected, match="fixed plan price") as exc:
+        await service._close_deal(
+            db_session, shop_account, wa_customer, "255700000136",
+            {"product_name": "Parity Banded Plan", "price": 50000, "payment_type": "full"},
+            wa_context,
+        )
+    assert "Instagram" not in str(exc.value)
+    assert db_session.query(Order).count() == 0
+
+
+async def test_close_accepts_plan_price_at_max(
+    db_session, shop_account, wa_customer, wa_context, banded_plan, monkeypatch,
+):
+    service = _service_with_fake_client()
+
+    async def _fake_dispatch(db, order, product, phone, payment_type, language=None):
+        return "PAY-NOTE"
+
+    monkeypatch.setattr(service, "_dispatch_payment", _fake_dispatch)
+    note = await service._close_deal(
+        db_session, shop_account, wa_customer, "255700000136",
+        {"product_name": "Parity Banded Plan", "price": 100000, "payment_type": "full"},
+        wa_context,
+    )
+    assert note == "PAY-NOTE"
+    order = db_session.query(Order).filter(Order.account_id == shop_account.id).one()
+    assert order.agreed_price == 100000
+
+
+async def test_ig_close_rejects_plan_price_below_max(
+    db_session, ig_account, ig_customer, banded_plan,
+):
+    service = _service_with_fake_client()
+    with pytest.raises(DealRejected, match="Instagram AGREEMENT_REACHED price .* fixed plan price"):
+        await service._close_instagram_deal(
+            db_session, ig_account, ig_customer,
+            {"product_name": "Parity Banded Plan", "price": 75000,
+             "payment_type": "full", "phone": "255700000001"},
+        )
+    assert db_session.query(Order).count() == 0
 
 
 async def test_ig_close_clears_quote_state_and_copies_language(

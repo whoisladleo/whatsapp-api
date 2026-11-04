@@ -7,7 +7,7 @@ import respx
 from app.core.config import settings
 from app.core.security import create_access_token
 from app.db.models import (
-    NumberSubscription, NumberSubscriptionStatus, PhoneNumberPool, PhoneNumberStatus, User,
+    Message, NumberSubscription, NumberSubscriptionStatus, PhoneNumberPool, PhoneNumberStatus, User,
 )
 
 BASE = "/api/v1/accounts"
@@ -222,6 +222,36 @@ def test_delete_account_requires_auth(client):
     resp = client.delete(f"{BASE}/1")
 
     assert resp.status_code in (401, 403)
+
+
+def test_delete_account_with_history_returns_409_and_keeps_account(
+    client, auth_user, db_session
+):
+    # History rows reference the account via plain FKs — deleting through
+    # them 500ed on Postgres. Refuse with 409 instead.
+    _, headers = auth_user
+    with respx.mock:
+        respx.get(url__regex=VALIDATE_URL_RE).mock(return_value=httpx.Response(200))
+        created = client.post(BASE, json=_account_payload(), headers=headers).json()
+
+    db_session.add(
+        Message(
+            whatsapp_message_id="wamid.acc409",
+            from_phone="255711110003",
+            type="text",
+            body="hi",
+            direction="inbound",
+            account_id=uuid.UUID(created["id"]),
+        )
+    )
+    db_session.commit()
+
+    resp = client.delete(f"{BASE}/{created['id']}", headers=headers)
+
+    assert resp.status_code == 409
+    assert "messages" in resp.json()["detail"]
+    listed = client.get(BASE, headers=headers).json()
+    assert [a["id"] for a in listed] == [created["id"]]
 
 
 def test_get_account_status_returns_meta_fields(client, auth_user):

@@ -145,6 +145,61 @@ def test_delete_product_not_found_for_other_user(client, auth_user, other_user_h
     assert resp.status_code == 404
 
 
+def test_delete_product_with_orders_nulls_the_link_and_keeps_history(
+    client, auth_user, db_session
+):
+    from app.db.models import Customer, Order
+
+    _, headers = auth_user
+    created = client.post(BASE, json=_product_payload(), headers=headers).json()
+
+    customer = Customer(phone_number="255711110004")
+    db_session.add(customer)
+    db_session.commit()
+    db_session.refresh(customer)
+    order = Order(customer_id=customer.id, product_id=uuid.UUID(created["id"]))
+    db_session.add(order)
+    db_session.commit()
+    order_id = order.id
+
+    resp = client.delete(f"{BASE}/{created['id']}", headers=headers)
+
+    assert resp.status_code == 204
+    surviving = db_session.query(Order).filter(Order.id == order_id).first()
+    assert surviving is not None
+    assert surviving.product_id is None
+
+
+def test_delete_product_with_subscriptions_returns_409(client, auth_user, db_session):
+    from app.db.models import Customer, Order, ProductSubscription
+
+    _, headers = auth_user
+    created = client.post(BASE, json=_product_payload(), headers=headers).json()
+
+    customer = Customer(phone_number="255711110005")
+    db_session.add(customer)
+    db_session.commit()
+    db_session.refresh(customer)
+    order = Order(customer_id=customer.id, product_id=uuid.UUID(created["id"]))
+    db_session.add(order)
+    db_session.commit()
+    db_session.refresh(order)
+    db_session.add(
+        ProductSubscription(
+            order_id=order.id,
+            customer_id=customer.id,
+            product_id=uuid.UUID(created["id"]),
+            monthly_amount=50000,
+        )
+    )
+    db_session.commit()
+
+    resp = client.delete(f"{BASE}/{created['id']}", headers=headers)
+
+    assert resp.status_code == 409
+    assert "subscriptions" in resp.json()["detail"]
+
+
 def test_slug_collision_gets_suffixed(client, auth_user):
     _, headers = auth_user
     first = client.post(BASE, json=_product_payload(name="Shoes"), headers=headers).json()
