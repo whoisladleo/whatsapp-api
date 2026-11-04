@@ -460,3 +460,73 @@ def test_quota_exhausted_sends_holding_without_llm(
     assert fake_llm_reply.called_with is None
     assert db_session.query(AmaraEvent).filter_by(kind=AmaraEventKind.REPLY).count() == 2
     assert db_session.query(AmaraEvent).filter_by(kind=AmaraEventKind.LIMIT_BLOCKED).count() == 1
+
+
+# --- Per-customer lock --------------------------------------------------------
+#
+# Same acquire-or-redispatch shape as process_inbound_message: without it,
+# two same-content deliveries race and the buyer gets contradictory replies
+# (a reclose "already on its way" plus a dispatch-failure note, #142).
+# Under eager mode the nested apply_async calls run to completion
+# synchronously, so the eventual success is observable via side effects,
+# not the top-level return value (see the WA lock tests for the full
+# reasoning).
+
+def test_lock_contention_retries_then_succeeds(monkeypatch, db_session, account, customer, inbound_dm):
+    calls = {"n": 0}
+    processed = []
+    real_acquire = task_module._acquire_lock
+
+    def flaky_acquire(key):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return False
+        return real_acquire(key)
+
+    monkeypatch.setattr(task_module, "_acquire_lock", flaky_acquire)
+
+    async def fake_process(*args, **kwargs):
+        processed.append(kwargs.get("dm_row_id", args[3] if len(args) > 3 else None))
+        return "Success"
+
+    monkeypatch.setattr(task_module, "_process", fake_process)
+
+    result = task_module.process_inbound_dm.apply_async(
+        args=[account.id, customer.id, inbound_dm.id]
+    ).get()
+
+    assert result == "Retrying due to lock contention."
+    assert calls["n"] == 3
+    assert processed == [inbound_dm.id]
+
+
+def test_lock_contention_exhausts_retries_and_gives_up(monkeypatch, db_session, account, customer, inbound_dm):
+    calls = {"n": 0}
+
+    def always_fails(key):
+        calls["n"] += 1
+        return False
+
+    monkeypatch.setattr(task_module, "_acquire_lock", always_fails)
+
+    result = task_module.process_inbound_dm.apply_async(
+        args=[account.id, customer.id, inbound_dm.id]
+    ).get()
+
+    assert result == "Retrying due to lock contention."
+    from app.tasks.webhook_processing import LOCK_MAX_RETRIES
+
+    assert calls["n"] == LOCK_MAX_RETRIES + 1
+
+
+def test_process_inbound_dm_gives_up_at_max_attempt(monkeypatch, account, customer, inbound_dm):
+    """Direct, unambiguous test of the give-up branch itself (no recursion)."""
+    from app.tasks.webhook_processing import LOCK_MAX_RETRIES
+
+    monkeypatch.setattr(task_module, "_acquire_lock", lambda key: False)
+
+    result = task_module.process_inbound_dm(
+        account.id, customer.id, inbound_dm.id, 0, None, LOCK_MAX_RETRIES
+    )
+
+    assert result == "Lock contention exhausted."
