@@ -582,3 +582,79 @@ def test_get_or_create_pending_subscription_sets_instagram_customer_id_on_reuse(
 
     assert sub.instagram_customer_id == ig_customer.id
     assert db_session.query(ProductSubscription).count() == 1
+
+
+# --- activation-time sibling merge (#152) ------------------------------------
+
+
+def _paid_order(db_session, whatsapp_account, product, customer):
+    o = Order(
+        customer_id=customer.id, product_id=product.id, account_id=whatsapp_account.id,
+        quantity=1, agreed_price=100000, payment_type=PaymentType.FULL, status=OrderStatus.PAID,
+    )
+    db_session.add(o)
+    db_session.commit()
+    db_session.refresh(o)
+    return o
+
+
+def test_second_activation_merges_into_active_sibling(
+    db_session, whatsapp_account, product, customer, monkeypatch
+):
+    # A stale renewal prompt approved after a Pay Now catch-up (or any other
+    # race past the #115 guard) must not fork a second monthly billing
+    # chain: the newcomer's payment buys an extra 30d on the surviving row.
+    calls = _mock_apply_async(monkeypatch)
+    first_due = datetime.utcnow() + timedelta(days=30)
+    survivor = ProductSubscription(
+        order_id=_paid_order(db_session, whatsapp_account, product, customer).id,
+        customer_id=customer.id, product_id=product.id,
+        status=ProductSubscriptionStatus.ACTIVE, monthly_amount=100000,
+        next_billing_at=first_due,
+    )
+    newcomer = ProductSubscription(
+        order_id=_paid_order(db_session, whatsapp_account, product, customer).id,
+        customer_id=customer.id, product_id=product.id,
+        status=ProductSubscriptionStatus.PENDING_PAYMENT, monthly_amount=100000,
+    )
+    db_session.add_all([survivor, newcomer])
+    db_session.commit()
+
+    product_subscription.activate_after_first_payment(db_session, newcomer)
+
+    assert newcomer.status == ProductSubscriptionStatus.CANCELLED
+    assert survivor.status == ProductSubscriptionStatus.ACTIVE
+    assert survivor.next_billing_at == first_due + timedelta(days=30)
+    assert calls == []  # folded rows schedule no renewal of their own
+
+
+async def test_renewal_completion_merges_into_active_sibling(
+    db_session, whatsapp_account, product, customer, monkeypatch
+):
+    # Same fork through the other activation path: a PAST_DUE row whose
+    # retry lands after the sibling already went ACTIVE folds into it.
+    calls = _mock_apply_async(monkeypatch)
+    first_due = datetime.utcnow() + timedelta(days=30)
+    survivor = ProductSubscription(
+        order_id=_paid_order(db_session, whatsapp_account, product, customer).id,
+        customer_id=customer.id, product_id=product.id,
+        status=ProductSubscriptionStatus.ACTIVE, monthly_amount=100000,
+        next_billing_at=first_due,
+    )
+    latecomer = ProductSubscription(
+        order_id=_paid_order(db_session, whatsapp_account, product, customer).id,
+        customer_id=customer.id, product_id=product.id,
+        status=ProductSubscriptionStatus.PAST_DUE, monthly_amount=100000,
+        retry_count=1, past_due_since=datetime.utcnow(),
+    )
+    db_session.add_all([survivor, latecomer])
+    db_session.commit()
+
+    await product_subscription.handle_renewal_payment_result(
+        db_session, latecomer, "COMPLETED", "txn-late"
+    )
+
+    assert latecomer.status == ProductSubscriptionStatus.CANCELLED
+    assert survivor.status == ProductSubscriptionStatus.ACTIVE
+    assert survivor.next_billing_at == first_due + timedelta(days=30)
+    assert calls == []

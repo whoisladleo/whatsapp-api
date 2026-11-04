@@ -6,6 +6,8 @@ from app.core.config import settings
 from app.core.ids import coerce_uuid
 from app.db.session import SessionLocal
 from app.db.models import (
+    Installment,
+    InstallmentStatus,
     Order,
     OrderStatus,
     ProductSubscription,
@@ -198,6 +200,23 @@ def auto_cancel_order(order_id: str):
             # was scheduled (Pay Now reschedules on reuse) — this one is
             # stale; the newer firing will cancel at the new deadline.
             return "Reservation still active."
+        if order.tunzaa_plan_id:
+            # Multi-installment plans stay PENDING for months by design
+            # (legs arrive on Tunzaa's schedule) — cancelling one at 48h
+            # strands real money. Once any leg is paid the plan owns its
+            # own lifecycle and this firing stands down; a plan nobody
+            # ever paid into still cancels below like any unpaid order (#152).
+            any_leg_paid = (
+                db.query(Installment)
+                .filter(
+                    Installment.order_id == order.id,
+                    Installment.status == InstallmentStatus.PAID,
+                )
+                .first()
+                is not None
+            )
+            if any_leg_paid:
+                return "Installment plan in progress."
 
         # Atomic release (P10): only the transition winner restores. A
         # lost race means a FAILED callback, a dashboard cancel, or the

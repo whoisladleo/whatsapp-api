@@ -107,6 +107,52 @@ def sync_access_if_platform_subscription(db: Session, subscription: ProductSubsc
         subscription_access.sync_ai_access_for_merchant(db, merchant)
 
 
+def _fold_into_active_sibling(
+    db: Session, subscription: ProductSubscription
+) -> Optional[ProductSubscription]:
+    """
+    Folds a just-activated row into an already-ACTIVE sibling for the same
+    customer+product, if one exists — a stale renewal prompt approved after
+    a Pay Now catch-up (or any other race past the #115 guard) must not
+    fork a second monthly billing chain. The newcomer's payment buys an
+    extra RENEWAL_PERIOD_DAYS on the surviving row instead of a parallel
+    cycle, so two payments always mean 60 days on one chain, never two
+    chains billing monthly (#152). Returns the survivor when a fold
+    happened, None when the row stands alone. PAST_DUE siblings are
+    deliberately left for their own landing to fold — their prompt may
+    still be approved, which is real money, not a no-op.
+    """
+    siblings = (
+        db.query(ProductSubscription)
+        .filter(
+            ProductSubscription.customer_id == subscription.customer_id,
+            ProductSubscription.product_id == subscription.product_id,
+            ProductSubscription.status == ProductSubscriptionStatus.ACTIVE,
+            ProductSubscription.id != subscription.id,
+        )
+        .all()
+    )
+    if not siblings:
+        return None
+    survivor = min(siblings, key=lambda s: (s.next_billing_at is not None, s.next_billing_at))
+    if survivor.next_billing_at:
+        survivor.next_billing_at = survivor.next_billing_at + timedelta(days=RENEWAL_PERIOD_DAYS)
+    else:
+        survivor.next_billing_at = datetime.utcnow() + timedelta(days=RENEWAL_PERIOD_DAYS)
+    subscription.status = ProductSubscriptionStatus.CANCELLED
+    db.commit()
+    logger.warning(
+        "Merged subscription %s into ACTIVE sibling %s (customer %s, product %s): "
+        "extra cycle to %s, folded row cancelled.",
+        subscription.id,
+        survivor.id,
+        subscription.customer_id,
+        subscription.product_id,
+        survivor.next_billing_at,
+    )
+    return survivor
+
+
 def activate_after_first_payment(db: Session, subscription: ProductSubscription) -> None:
     """
     Called from the Tunzaa webhook's normal Order-COMPLETED handling
@@ -121,6 +167,12 @@ def activate_after_first_payment(db: Session, subscription: ProductSubscription)
     subscription.past_due_since = None
     subscription.next_billing_at = datetime.utcnow() + timedelta(days=RENEWAL_PERIOD_DAYS)
     db.commit()
+
+    if _fold_into_active_sibling(db, subscription) is not None:
+        # The payment bought an extra cycle on the surviving row — no
+        # renewal of its own, or the fork this merge closes would reopen.
+        sync_access_if_platform_subscription(db, subscription)
+        return
 
     try:
         charge_renewal.apply_async(
@@ -200,6 +252,12 @@ async def handle_renewal_payment_result(
         subscription.next_billing_at = datetime.utcnow() + timedelta(days=RENEWAL_PERIOD_DAYS)
         db.commit()
         _record_renewal_payment(db, subscription)
+        if _fold_into_active_sibling(db, subscription) is not None:
+            # A PAST_DUE retry landing after the sibling already went
+            # ACTIVE (Pay Now catch-up won the race) — the payment buys
+            # an extra cycle on the survivor, not a second chain (#152).
+            sync_access_if_platform_subscription(db, subscription)
+            return
         try:
             charge_renewal.apply_async(
                 args=[str(subscription.id)], countdown=RENEWAL_PERIOD_DAYS * 86400
