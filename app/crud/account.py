@@ -5,6 +5,7 @@ from app.schemas.account import AccountCreate, AccountUpdate
 from app.schemas.whatsapp import WhatsAppAccountCreate, WhatsAppAccountUpdate
 from app.crud import whatsapp as crud_whatsapp
 from app.crud.whatsapp import (
+    AccountHasHistoryError,
     PartialWhatsAppCredentialsError,
     PhonePoolExhaustedError,
     PoolAccessTokenNotConfiguredError,
@@ -20,6 +21,7 @@ from typing import List, Optional
 # second independent implementation of the same logic.
 
 __all__ = [
+    "AccountHasHistoryError",
     "PartialWhatsAppCredentialsError",
     "PhonePoolExhaustedError",
     "PoolAccessTokenNotConfiguredError",

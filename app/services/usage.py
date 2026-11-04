@@ -104,6 +104,11 @@ def billing_period(db: Session, merchant: User, now: Optional[datetime] = None) 
         # keep metering in consecutive periods rather than an expired one.
         while now >= end:
             end += period
+        # The mirror image: a `now` before the current window (the stats
+        # "previous period" view passes now=start-ε) rolls back instead of
+        # returning the current window again.
+        while now < end - period:
+            end -= period
         return end - period, end
 
     local = now + EAT_OFFSET

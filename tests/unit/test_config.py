@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 from cryptography.fernet import Fernet
 from pydantic import ValidationError
@@ -5,6 +7,12 @@ from pydantic import ValidationError
 from app.core.config import Settings
 
 _VALID_FERNET_KEY = Fernet.generate_key().decode()
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _read_repo_file(name: str) -> str:
+    return (_REPO_ROOT / name).read_text()
 
 
 def test_database_url_uses_explicit_override_when_set():
@@ -87,3 +95,36 @@ def test_testing_mode_needs_no_token_encryption_key():
     )
 
     assert settings.TOKEN_ENCRYPTION_KEY is None
+
+
+def test_dockerignore_excludes_secrets_and_caches():
+    # Both Dockerfiles COPY . . — without this, the live root .env bakes
+    # into the published image (#156).
+    lines = _read_repo_file(".dockerignore").splitlines()
+
+    for entry in (".env", ".git", ".venv", "__pycache__", ".coverage"):
+        assert any(line.strip().rstrip("/") == entry for line in lines), entry
+
+
+def test_prod_redis_publishes_no_ports():
+    # api/worker reach Redis over the compose network (redis://redis:6379/0),
+    # so publishing 6379 only exposed a passwordless Redis (#156).
+    prod_compose = _read_repo_file("docker-compose.prod.yml")
+
+    assert '"6379:6379"' not in prod_compose
+
+
+def test_prod_port_mapping_matches_gunicorn_bind():
+    # Gunicorn binds the container-side PORT (default 8001); the mapping's
+    # container side must be the same port, not 8000 (#156).
+    prod_compose = _read_repo_file("docker-compose.prod.yml")
+
+    assert '"${PORT:-8001}:${PORT:-8001}"' in prod_compose
+
+
+def test_prod_healthcheck_probes_container_port():
+    # Same alignment as the port mapping: the in-container probe must
+    # default to the port gunicorn actually binds (#156).
+    prod_compose = _read_repo_file("docker-compose.prod.yml")
+
+    assert "${PORT:-8001}/health" in prod_compose

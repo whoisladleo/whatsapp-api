@@ -334,9 +334,11 @@ async def test_generate_dm_response_catalog_shows_subscription_without_stock_uni
 
     line = next(l for l in captured["system"].splitlines() if l.startswith("- Taskflow Standard:"))
     assert line == (
-        "- Taskflow Standard: Max Price TZS 100,000, Lowest Price You May Offer TZS 100,000, "
+        "- Taskflow Standard: Max Price TZS 100,000, "
         "available now, billed monthly, includes 2,000 Amara replies a month"
     )
+    # Fixed-price plan: no haggle floor anywhere in the prompt.
+    assert "Lowest Price" not in captured["system"]
     assert "SAME language the customer just used" in captured["system"]
 
 

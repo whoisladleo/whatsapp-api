@@ -51,6 +51,26 @@ def test_create_knowledge_base_duplicate_slug_rejected(client, auth_user):
     assert resp.status_code == 400
 
 
+def test_create_knowledge_base_cross_user_slug_clash_is_400(client, auth_user, other_user_headers):
+    # Slug is globally unique but the pre-check is per-user: another
+    # merchant's slug must 400 here, not 500 on the constraint.
+    _, headers = auth_user
+    _upload(client, other_user_headers, name="Theirs", slug="shared-slug")
+
+    resp = _upload(client, headers, name="Mine", slug="shared-slug")
+
+    assert resp.status_code == 400
+
+
+def test_create_knowledge_base_rejects_oversize_file(client, auth_user):
+    _, headers = auth_user
+    files = {"file": ("big.md", io.BytesIO(b"x" * (5 * 1024 * 1024 + 1)), "text/markdown")}
+
+    resp = client.post(BASE, data={"name": "Big", "slug": "big"}, files=files, headers=headers)
+
+    assert resp.status_code == 413
+
+
 def test_create_knowledge_base_rejects_non_utf8_file(client, auth_user):
     _, headers = auth_user
     files = {"file": ("kb.md", io.BytesIO(b"\xff\xfe\x00\x01"), "text/markdown")}
@@ -117,6 +137,18 @@ def test_update_knowledge_base_slug_only(client, auth_user):
     body = resp.json()
     assert body["slug"] == "new-slug"
     assert body["name"] == created["name"]
+
+
+def test_update_knowledge_base_slug_clash_is_400(client, auth_user):
+    _, headers = auth_user
+    _upload(client, headers, name="First", slug="taken-slug")
+    created = _upload(client, headers, name="Second", slug="second-slug").json()
+
+    resp = client.put(
+        f"{BASE}/{created['id']}", data={"slug": "taken-slug"}, headers=headers
+    )
+
+    assert resp.status_code == 400
 
 
 def test_update_knowledge_base_rejects_non_utf8_file(client, auth_user):

@@ -38,7 +38,23 @@ def create_message(
         account_id=account_id,
     )
     db.add(db_message)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # Lost a concurrent insert race (two webhook deliveries for the
+        # same message both missed the SELECT above); fall back to the
+        # winner's row instead of 500ing (#86 pattern).
+        db.rollback()
+        if not whatsapp_message_id:
+            raise
+        existing = (
+            db.query(Message)
+            .filter(Message.whatsapp_message_id == whatsapp_message_id)
+            .first()
+        )
+        if existing is None:
+            raise
+        return existing
     db.refresh(db_message)
     return db_message
 

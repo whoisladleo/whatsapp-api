@@ -39,7 +39,8 @@ def render_catalog(products: List[Product], *, mode: str = "dm") -> str:
     a per-path fix again.
 
     mode="dm": full negotiation line (max price, floor, plan allowance,
-    stock, installments note) for the two stateful DM prompts.
+    stock, installments note) for the two stateful DM prompts — except
+    platform plans, which render max price with no floor (fixed price).
     mode="comment": the stateless comment reply — price and availability
     only, no floor or payment terms (it never closes).
     """
@@ -66,11 +67,19 @@ def render_catalog(products: List[Product], *, mode: str = "dm") -> str:
                     if p.monthly_reply_limit is not None
                     else ", includes unlimited Amara replies"
                 )
-            lines.append(
-                f"- {p.name}: Max Price TZS {p.max_price:,.0f}, "
-                f"Lowest Price You May Offer TZS {_negotiation_floor(p):,.0f}, "
-                f"{stock_display}{plan_note}{stock_note}{installments_note}"
-            )
+            if p.is_platform_plan:
+                # Fixed price — no haggle floor, or the model negotiates a
+                # plan it must sell at exactly Max Price.
+                lines.append(
+                    f"- {p.name}: Max Price TZS {p.max_price:,.0f}, "
+                    f"{stock_display}{plan_note}{stock_note}{installments_note}"
+                )
+            else:
+                lines.append(
+                    f"- {p.name}: Max Price TZS {p.max_price:,.0f}, "
+                    f"Lowest Price You May Offer TZS {_negotiation_floor(p):,.0f}, "
+                    f"{stock_display}{plan_note}{stock_note}{installments_note}"
+                )
         if p.description:
             lines.append(f"  {p.description}")
     return "\n".join(lines) + "\n"

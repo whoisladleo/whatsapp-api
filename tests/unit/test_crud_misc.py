@@ -112,6 +112,72 @@ def test_crud_message_create_message_dedupes_by_whatsapp_message_id(db_session):
     assert db_session.query(Message).count() == 1
 
 
+def test_crud_message_create_message_survives_concurrent_insert(db_session, monkeypatch):
+    # Two webhook deliveries for the same message both miss the SELECT and
+    # race to INSERT — the loser must fall back to the winner's row, not
+    # 500 on the unique constraint. Forces the first SELECT to miss (same
+    # #86 shape as test_crud_instagram's _miss_first_select).
+    user = User(username="255700000703")
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+    account = WhatsAppAccount(
+        name="Shop", phone_number_id="MISC_PH3", access_token="tok", user_id=user.id
+    )
+    db_session.add(account)
+    db_session.commit()
+    db_session.refresh(account)
+
+    data = {
+        "whatsapp_message_id": "wamid.race1",
+        "from_phone": "255711110001",
+        "type": "text",
+        "body": "hi",
+        "direction": "inbound",
+    }
+    first = crud_message.create_message(db_session, data, account.id)
+
+    real_query = db_session.query
+    missed = False
+
+    class _MissFirstFilter:
+        def __init__(self, real):
+            self._real = real
+
+        def first(self):
+            nonlocal missed
+            if not missed:
+                missed = True
+                return None
+            return self._real.first()
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    class _MissFirstQuery:
+        def __init__(self, real):
+            self._real = real
+
+        def filter(self, *args, **kwargs):
+            return _MissFirstFilter(self._real.filter(*args, **kwargs))
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    def query_spy(*args, **kwargs):
+        query = real_query(*args, **kwargs)
+        if args and args[0] is Message:
+            return _MissFirstQuery(query)
+        return query
+
+    monkeypatch.setattr(db_session, "query", query_spy)
+
+    second = crud_message.create_message(db_session, data, account.id)
+
+    assert second.id == first.id
+    assert db_session.query(Message).count() == 1
+
+
 def test_generate_slug_falls_back_to_uuid_for_unusable_name(db_session):
     slug = crud_product.generate_slug(db_session, "!!!")
 

@@ -1,5 +1,6 @@
 import uuid
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from app.db.session import get_db
@@ -13,6 +14,27 @@ from app.schemas.knowledge import (
 )
 
 router = APIRouter()
+
+_KB_UPLOAD_MAX_BYTES = 5 * 1024 * 1024
+
+
+async def _read_upload_capped(file: UploadFile) -> bytes:
+    """Chunked read with a cap — the whole file must never sit in RAM
+    uncapped (same 5MB pattern as the product image/CSV uploads)."""
+    size_bytes = 0
+    chunks = []
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        size_bytes += len(chunk)
+        if size_bytes > _KB_UPLOAD_MAX_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail="File is too large (max 5MB)",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 @router.post("", response_model=KnowledgeBaseInDB)
@@ -28,14 +50,21 @@ async def create_knowledge(
     if existing:
         raise HTTPException(status_code=400, detail="Knowledge base slug already exists")
 
-    content = await file.read()
+    content = await _read_upload_capped(file)
     try:
         text_content = content.decode("utf-8")
     except UnicodeDecodeError:
         raise HTTPException(status_code=400, detail="Only text or markdown files are supported")
 
     kb_in = KnowledgeBaseCreate(name=name, slug=slug, content=text_content)
-    return crud_knowledge.create_knowledge_base(db, kb_in, current_user.id)
+    try:
+        return crud_knowledge.create_knowledge_base(db, kb_in, current_user.id)
+    except IntegrityError:
+        # The slug column is globally unique but the pre-check above is
+        # per-user: another merchant's slug (or a concurrent same-slug
+        # create) fails here, and must be a 400, not a 500.
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Knowledge base slug already exists")
 
 
 @router.get("", response_model=List[KnowledgeBaseInDB])
@@ -79,14 +108,20 @@ async def update_knowledge(
     if slug:
         update_data["slug"] = slug
     if file:
-        content = await file.read()
+        content = await _read_upload_capped(file)
         try:
             update_data["content"] = content.decode("utf-8")
         except UnicodeDecodeError:
             raise HTTPException(status_code=400, detail="Only text or markdown files are supported")
 
     kb_in = KnowledgeBaseUpdate(**update_data)
-    return crud_knowledge.update_knowledge_base(db, db_kb, kb_in)
+    try:
+        return crud_knowledge.update_knowledge_base(db, db_kb, kb_in)
+    except IntegrityError:
+        # Renaming onto any other row's slug (the update path has no
+        # pre-check at all) violates the global unique constraint.
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Knowledge base slug already exists")
 
 
 @router.delete("/{kb_id}")

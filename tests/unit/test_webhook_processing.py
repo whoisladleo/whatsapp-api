@@ -226,7 +226,7 @@ def test_acquire_lock_fails_open_on_redis_error(monkeypatch):
 
     monkeypatch.setattr(webhook_processing.rate_limit_module, "_redis_client", BoomClient())
 
-    assert webhook_processing._acquire_lock("some-key") is True
+    assert webhook_processing._acquire_lock("some-key")  # truthy token: proceed without a lock
 
 
 def test_release_lock_swallows_redis_error(monkeypatch):
@@ -237,7 +237,34 @@ def test_release_lock_swallows_redis_error(monkeypatch):
     monkeypatch.setattr(webhook_processing.rate_limit_module, "_redis_client", BoomClient())
 
     # Should not raise.
-    webhook_processing._release_lock("some-key")
+    webhook_processing._release_lock("some-key", "some-token")
+
+
+def test_acquire_lock_returns_none_when_held():
+    key = "webhook_lock:test-held:255700000000"
+
+    first = webhook_processing._acquire_lock(key)
+    second = webhook_processing._acquire_lock(key)
+
+    assert first
+    assert second is None
+
+
+def test_release_lock_deletes_only_own_token():
+    redis_client = webhook_processing.rate_limit_module._redis_client
+    key = "webhook_lock:test-token:255700000000"
+
+    mine = webhook_processing._acquire_lock(key)
+    # A stale worker (its TTL expired, another turn re-acquired) must not
+    # delete the new holder's lock.
+    redis_client.delete(key)
+    theirs = webhook_processing._acquire_lock(key)
+
+    webhook_processing._release_lock(key, mine)
+
+    assert redis_client.get(key).decode() == theirs
+    webhook_processing._release_lock(key, theirs)
+    assert redis_client.get(key) is None
 
 
 # --- AI reply rate limiting ---------------------------------------------------

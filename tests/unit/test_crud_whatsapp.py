@@ -257,3 +257,78 @@ def test_delete_whatsapp_account_without_pool_number_is_a_noop_for_pool(db_sessi
 
     # Should not raise even though there's no associated pool row.
     crud_whatsapp.delete_whatsapp_account(db_session, account)
+
+
+def test_claim_available_pool_number_links_account_in_same_update(db_session):
+    # The account link rides the guarded UPDATE itself — no second commit
+    # that a crash could strand ASSIGNED-but-unlinked.
+    user = _user(db_session, "255700000314")
+    account = crud_whatsapp.create_whatsapp_account(
+        db_session,
+        WhatsAppAccountCreate(name="Shop", phone_number_id="OWN3", access_token="own-tok"),
+        user.id,
+    )
+    _pool_number(db_session, "POOL_LINKED")
+
+    claimed = crud_whatsapp.claim_available_pool_number(db_session, account.id)
+
+    assert claimed.status == PhoneNumberStatus.ASSIGNED
+    assert claimed.whatsapp_account_id == account.id
+
+
+def test_reassign_account_to_pool_number_links_pool_row(db_session, monkeypatch):
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "WHATSAPP_POOL_ACCESS_TOKEN", "pool-tok")
+    user = _user(db_session, "255700000315")
+    account = crud_whatsapp.create_whatsapp_account(
+        db_session,
+        WhatsAppAccountCreate(name="Shop", phone_number_id="OWN4", access_token="own-tok"),
+        user.id,
+    )
+    _pool_number(db_session, "POOL_REASSIGN")
+
+    updated = crud_whatsapp.reassign_account_to_pool_number(db_session, account)
+
+    assert updated.phone_number_id == "POOL_REASSIGN"
+    assert updated.access_token == "pool-tok"
+    pool_row = (
+        db_session.query(PhoneNumberPool)
+        .filter(PhoneNumberPool.phone_number_id == "POOL_REASSIGN")
+        .first()
+    )
+    assert pool_row.status == PhoneNumberStatus.ASSIGNED
+    assert pool_row.whatsapp_account_id == account.id
+
+
+def test_delete_whatsapp_account_with_history_raises(db_session):
+    from app.db.models import Message
+
+    user = _user(db_session, "255700000316")
+    account = crud_whatsapp.create_whatsapp_account(
+        db_session,
+        WhatsAppAccountCreate(name="Shop", phone_number_id="OWN5", access_token="own-tok"),
+        user.id,
+    )
+    db_session.add(
+        Message(
+            whatsapp_message_id="wamid.hist1",
+            from_phone="255711110002",
+            type="text",
+            body="hi",
+            direction="inbound",
+            account_id=account.id,
+        )
+    )
+    db_session.commit()
+
+    with pytest.raises(crud_whatsapp.AccountHasHistoryError):
+        crud_whatsapp.delete_whatsapp_account(db_session, account)
+
+    # Refused delete leaves the account untouched.
+    assert (
+        db_session.query(WhatsAppAccount)
+        .filter(WhatsAppAccount.id == account.id)
+        .first()
+        is not None
+    )

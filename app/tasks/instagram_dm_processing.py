@@ -58,7 +58,8 @@ def process_inbound_dm(
             return "Account or customer not found."
 
         lock_key = _ig_lock_key(account_id, customer_id)
-        if not _acquire_lock(lock_key):
+        lock_token = _acquire_lock(lock_key)
+        if not lock_token:
             if attempt >= LOCK_MAX_RETRIES:
                 logger.warning(
                     f"Giving up on {lock_key} after {LOCK_MAX_RETRIES} retries "
@@ -73,16 +74,16 @@ def process_inbound_dm(
             return "Retrying due to lock contention."
 
         try:
-            return _run_async(_process(db, account_id, customer_id, dm_row_id, llm_attempt, claimed_at, resume))
+            return _run_async(_process(db, account_id, customer_id, dm_row_id, llm_attempt, claimed_at, resume, lock_token))
         finally:
-            _release_lock(lock_key)
+            _release_lock(lock_key, lock_token)
     finally:
         db.close()
 
 
 async def _process(
     db, account_id: str, customer_id: str, dm_row_id: str, llm_attempt: int = 0,
-    claimed_at: str | None = None, resume: bool = False,
+    claimed_at: str | None = None, resume: bool = False, lock_token: str | None = None,
 ) -> str:
     account_uuid = coerce_uuid(account_id)
     customer_uuid = coerce_uuid(customer_id)
@@ -183,7 +184,7 @@ async def _process(
             # execution; lock churn in prod). Same rule as WhatsApp: the
             # retry is dispatched only after the lock is released (#142).
             # The wrapper's finally re-release below is a harmless no-op.
-            _release_lock(_ig_lock_key(account_id, customer_id))
+            _release_lock(_ig_lock_key(account_id, customer_id), lock_token)
             process_inbound_dm.apply_async(
                 args=[account_id, customer_id, dm_row_id, llm_attempt + 1, now.isoformat(), 0, resume],
                 countdown=LLM_RETRY_COUNTDOWNS_SECONDS[llm_attempt],

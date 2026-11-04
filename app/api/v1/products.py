@@ -20,6 +20,7 @@ from app.core.catalog_client import (
 )
 from app.core.config import settings
 from app.crud.product import (
+    ProductHasSubscriptionsError,
     create_product, get_product_by_id, get_products_by_merchant,
     update_product, update_product_stock, delete_product, bulk_upsert_products,
     import_catalog_products,
@@ -153,7 +154,10 @@ def delete_existing_product(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only platform admins can manage plan products",
         )
-    delete_product(db=db, db_product=db_product)
+    try:
+        delete_product(db=db, db_product=db_product)
+    except ProductHasSubscriptionsError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     return None
 
 @router.get("/bulk/template")

@@ -5,7 +5,16 @@ from typing import Optional
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.db.models import PhoneNumberPool, PhoneNumberStatus, WhatsAppAccount
+from app.db.models import (
+    ConversationContext,
+    MediaEntry,
+    Message,
+    NumberSubscription,
+    Order,
+    PhoneNumberPool,
+    PhoneNumberStatus,
+    WhatsAppAccount,
+)
 from app.schemas.whatsapp import WhatsAppAccountCreate, WhatsAppAccountUpdate
 
 
@@ -24,7 +33,13 @@ class PoolAccessTokenNotConfiguredError(Exception):
     """Raised when a pool claim is attempted but WHATSAPP_POOL_ACCESS_TOKEN isn't set."""
 
 
-def claim_available_pool_number(db: Session) -> Optional[PhoneNumberPool]:
+class AccountHasHistoryError(Exception):
+    """Raised when deleting an account that still has history rows."""
+
+
+def claim_available_pool_number(
+    db: Session, whatsapp_account_id: Optional[uuid.UUID] = None
+) -> Optional[PhoneNumberPool]:
     """
     Atomically claims one AVAILABLE pool row via a conditional UPDATE rather
     than SELECT ... FOR UPDATE — SQLite (used in this test suite) doesn't
@@ -32,6 +47,11 @@ def claim_available_pool_number(db: Session) -> Optional[PhoneNumberPool]:
     but a guarded "UPDATE ... WHERE status = AVAILABLE" is atomic and
     correct on both, since the affected-row count tells us whether we won
     the race.
+
+    The account link rides the same guarded UPDATE: linking it in a later
+    commit used to strand the row ASSIGNED-but-unlinked on a crash in
+    between (releasable by nothing, since release looks rows up by
+    whatsapp_account_id).
     """
     candidate = (
         db.query(PhoneNumberPool)
@@ -42,20 +62,23 @@ def claim_available_pool_number(db: Session) -> Optional[PhoneNumberPool]:
     if not candidate:
         return None
 
+    claimed_values = {"status": PhoneNumberStatus.ASSIGNED, "assigned_at": datetime.utcnow()}
+    if whatsapp_account_id is not None:
+        claimed_values["whatsapp_account_id"] = whatsapp_account_id
     claimed_count = (
         db.query(PhoneNumberPool)
         .filter(
             PhoneNumberPool.id == candidate.id,
             PhoneNumberPool.status == PhoneNumberStatus.AVAILABLE,
         )
-        .update({"status": PhoneNumberStatus.ASSIGNED, "assigned_at": datetime.utcnow()})
+        .update(claimed_values)
     )
     db.commit()
 
     if claimed_count == 0:
         # Someone else claimed this row between our SELECT and UPDATE — the
         # row is no longer AVAILABLE, so the next call naturally skips it.
-        return claim_available_pool_number(db)
+        return claim_available_pool_number(db, whatsapp_account_id)
 
     db.refresh(candidate)
     return candidate
@@ -96,7 +119,7 @@ def reassign_account_to_pool_number(db: Session, db_account: WhatsAppAccount) ->
 
     release_pool_number_for_account(db, db_account.id)
 
-    pool_number = claim_available_pool_number(db)
+    pool_number = claim_available_pool_number(db, db_account.id)
     if not pool_number:
         raise PhonePoolExhaustedError()
 
@@ -104,8 +127,6 @@ def reassign_account_to_pool_number(db: Session, db_account: WhatsAppAccount) ->
     db_account.access_token = settings.WHATSAPP_POOL_ACCESS_TOKEN
     db.commit()
 
-    pool_number.whatsapp_account_id = db_account.id
-    db.commit()
     db.refresh(db_account)
     return db_account
 
@@ -195,6 +216,32 @@ def get_multi_by_user(
 def delete_whatsapp_account(
     db: Session, db_account: WhatsAppAccount
 ) -> WhatsAppAccount:
+    # Checked BEFORE releasing the pool link: a refused delete must leave
+    # the account (and its pool row) exactly as they were. History rows
+    # reference this account via plain FKs, so deleting through them would
+    # 500 on Postgres — refuse with 409 instead of cascading.
+    dependents = (
+        ("messages", db.query(Message).filter(Message.account_id == db_account.id)),
+        ("media", db.query(MediaEntry).filter(MediaEntry.account_id == db_account.id)),
+        ("orders", db.query(Order).filter(Order.account_id == db_account.id)),
+        (
+            "number subscription",
+            db.query(NumberSubscription).filter(
+                NumberSubscription.account_id == db_account.id
+            ),
+        ),
+        (
+            "conversations",
+            db.query(ConversationContext).filter(
+                ConversationContext.account_id == db_account.id
+            ),
+        ),
+    )
+    for label, query in dependents:
+        if query.first() is not None:
+            raise AccountHasHistoryError(
+                f"This account still has {label} and can't be deleted."
+            )
     release_pool_number_for_account(db, db_account.id)
     db.delete(db_account)
     db.commit()
