@@ -31,3 +31,22 @@ def revoke_refresh_token(db: Session, record: RefreshToken) -> RefreshToken:
     db.commit()
     db.refresh(record)
     return record
+
+
+def try_revoke_refresh_token(db: Session, record_id: uuid.UUID) -> bool:
+    """
+    Atomically revokes one unrevoked refresh row. True iff this caller won
+    the race (rowcount==1); False means another request already revoked it.
+    Same conditional-UPDATE pattern as claim_available_pool_number —
+    correct on both SQLite tests and Postgres prod.
+    """
+    revoked_count = (
+        db.query(RefreshToken)
+        .filter(
+            RefreshToken.id == record_id,
+            RefreshToken.revoked_at.is_(None),
+        )
+        .update({"revoked_at": datetime.utcnow()})
+    )
+    db.commit()
+    return revoked_count == 1

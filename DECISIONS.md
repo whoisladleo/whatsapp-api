@@ -1,5 +1,19 @@
 # Decisions
 
+## Refresh rotation is an atomic conditional revoke; concurrent reuse 401s (2026-11-04, #154)
+
+**Chose:** `POST /auth/refresh` claims the presented token with a guarded `UPDATE ... WHERE id=:id AND revoked_at IS NULL` (`try_revoke_refresh_token`, mirroring `claim_available_pool_number`); rowcount==1 wins and mints, the loser takes the same 401 as any revoked/expired/unknown token — no oracle. Previously read-then-write, so two concurrent refreshes with the same Bearer [REDACTED] pass the checks and mint two pairs. Logout keeps its plain revoke: it always succeeds by design, so a lost race there is harmless.
+
+**Considered and rejected:**
+- *`SELECT ... FOR UPDATE` row locking.* Rejected: SQLite (tests) doesn't support it the way Postgres (prod) does; the guarded UPDATE is atomic and correct on both, same reason the pool claim uses it.
+
+## IG login codes are purpose-bound; any-JWT exchange closed (2026-11-04, #154)
+
+**Chose:** the `/instagram/callback` login code is minted with a `purpose: instagram_login` claim and `/instagram/exchange` 401s anything without it — previously any valid JWT (a live session token, an impersonation token) could be traded for a fresh full session, bypassing logout and upgrading impersonation.
+
+**Considered and rejected:**
+- *A server-side single-use code store.* Rejected: the JWT already carries signature + 2-minute expiry, and the exchange endpoint's per-code rate limit stays as the guessing guard — a store adds state for no new security property.
+
 ## Money-cluster fixes: plan auto-cancel, duplicate-chain merge, renewal failure routing, retry activation (2026-11-04, #152)
 
 **Chose:** (1) `auto_cancel_order` stands down for installment-plan orders once any leg is PAID — a plan is PENDING for months by design, and cancelling strands real money. A plan nobody paid into still cancels at 48h like any unpaid order (stock freed, linked sub failed). Stalled partials linger PENDING, visible in the dashboard; nothing reaps them. (2) A just-activated subscription folds into an already-ACTIVE sibling for the same customer+product instead of forking a second monthly chain: the newcomer's payment buys +30d on the survivor (earliest billing date wins), the folded row goes CANCELLED and schedules nothing. Hooked into both activation paths (`activate_after_first_payment` and the renewal COMPLETED branch) so arrival order doesn't matter; PAST_DUE siblings are left for their own landing to fold, since their prompt may still be approved. Pre-existing double-ACTIVE pairs (if any in prod) are NOT auto-merged — run a one-off query and let an admin cancel per the standing no-silent-money-movement rule. (3) A renewal push that throws now flows through the FAILED branch (bounded retries, both sides told) instead of log-and-drop, which had ended billing silently. (4) `retry_installment_reconcile` reaching PAID now runs `_activate_subscription_if_linked` plus the merchant completion alert — previously only the webhook path did, stranding SNPL plans the retry settled. Companion fix the merge forced: `charge_renewal` re-sleeps until the billing date when the cycle is already paid (same `_current_cycle_already_paid` helper as P3/P4) instead of pushing — without it, the survivor's already-scheduled task would have pushed a duplicate charge at the old date one cycle later. The customer gets no extra notice on retry-path activation (they were already told at leg time).
