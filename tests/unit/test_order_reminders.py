@@ -1,7 +1,17 @@
 import pytest
 
 import app.tasks.order_reminders as order_reminders
-from app.db.models import Customer, Order, OrderStatus, PaymentType, Product, User, WhatsAppAccount
+from app.db.models import (
+    Customer,
+    Installment,
+    InstallmentStatus,
+    Order,
+    OrderStatus,
+    PaymentType,
+    Product,
+    User,
+    WhatsAppAccount,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -369,3 +379,71 @@ def test_auto_cancel_loses_race_restores_no_stock(db_session, pending_order, pro
     reloaded_product = db_session.query(Product).filter(Product.id == product_id).first()
     db_session.refresh(reloaded_product)
     assert reloaded_product.quantity == stock_before
+
+
+def _pending_plan_order(db_session, customer, account, product, legs=()):
+    order = Order(
+        customer_id=customer.id,
+        account_id=account.id,
+        product_id=product.id,
+        quantity=1,
+        status=OrderStatus.PENDING,
+        agreed_price=45000,
+        payment_type=PaymentType.INSTALLMENT,
+        tunzaa_plan_id="1001",
+    )
+    db_session.add(order)
+    db_session.commit()
+    db_session.refresh(order)
+    for tunzaa_id, status in legs:
+        db_session.add(
+            Installment(
+                order_id=order.id,
+                tunzaa_installment_id=tunzaa_id,
+                amount_due=15000,
+                due_date=order.created_at,
+                status=status,
+            )
+        )
+    db_session.commit()
+    return order
+
+
+def test_auto_cancel_skips_plan_order_with_paid_leg(db_session, customer, account, product):
+    # A multi-installment plan is still PENDING at T+48h by design (legs
+    # arrive over months) — once any leg is paid, real money has moved and
+    # cancelling would strand it. The order must be left alone (#152).
+    order = _pending_plan_order(
+        db_session, customer, account, product, legs=[("10000", InstallmentStatus.PAID)]
+    )
+    order_id, product_id = order.id, product.id
+    stock_before = product.quantity
+
+    result = order_reminders.auto_cancel_order(order_id)
+
+    reloaded_order = db_session.query(Order).filter(Order.id == order_id).first()
+    reloaded_product = db_session.query(Product).filter(Product.id == product_id).first()
+    assert reloaded_order.status == OrderStatus.PENDING
+    assert reloaded_product.quantity == stock_before
+    assert result == "Installment plan in progress."
+
+
+def test_auto_cancel_cancels_plan_order_with_no_paid_legs(
+    db_session, customer, account, product, monkeypatch
+):
+    # Boundary pin: a plan nobody ever paid into still cancels at 48h like
+    # any other unpaid order — no money moved, stock must be freed.
+    _mock_send_text(monkeypatch)
+    order = _pending_plan_order(
+        db_session, customer, account, product, legs=[("10000", InstallmentStatus.PENDING)]
+    )
+    order_id, product_id = order.id, product.id
+    stock_before = product.quantity
+
+    result = order_reminders.auto_cancel_order(order_id)
+
+    reloaded_order = db_session.query(Order).filter(Order.id == order_id).first()
+    reloaded_product = db_session.query(Product).filter(Product.id == product_id).first()
+    assert result == "Success"
+    assert reloaded_order.status == OrderStatus.CANCELLED
+    assert reloaded_product.quantity == stock_before + 1

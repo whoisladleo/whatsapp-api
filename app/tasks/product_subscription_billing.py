@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime
 
 from app.core.celery_app import celery_app
 from app.core.ids import coerce_uuid
@@ -19,6 +20,7 @@ def charge_renewal(subscription_id: str):
 
 async def _do_charge_renewal(subscription_id: str) -> None:
     from app.db.models import ProductSubscription, ProductSubscriptionStatus
+    from app.services import product_subscription
     from app.services.tunzaa import tunzaa_service
 
     db = SessionLocal()
@@ -46,6 +48,21 @@ async def _do_charge_renewal(subscription_id: str) -> None:
             logger.error(f"charge_renewal: subscription {subscription_id} has no customer")
             return
 
+        if product_subscription._current_cycle_already_paid(subscription):
+            # The cycle is paid and not due — a sibling merge pushed the
+            # date forward, or this task was scheduled twice. Pushing now
+            # would be a duplicate charge; re-sleep until the date instead
+            # of billing. PAST_DUE rows never land here (the helper is
+            # ACTIVE-only), so retries are unaffected (#152).
+            delay = (subscription.next_billing_at - datetime.utcnow()).total_seconds()
+            try:
+                charge_renewal.apply_async(args=[str(subscription.id)], countdown=max(delay, 0))
+            except Exception as sched_err:
+                logger.error(
+                    f"Failed to reschedule not-yet-due renewal for subscription {subscription_id}: {sched_err}"
+                )
+            return
+
         try:
             await tunzaa_service.initiate_payment(
                 phone=customer.phone_number,
@@ -53,7 +70,12 @@ async def _do_charge_renewal(subscription_id: str) -> None:
                 reference=f"product-subscription-renewal-{subscription.id}",
             )
         except Exception as e:
+            # The push never left, so no webhook will ever arrive for it —
+            # logging alone ends billing silently (ACTIVE stays ACTIVE and
+            # is never charged again). Flow through the FAILED branch like
+            # any other failed charge: bounded retries, both sides told (#152).
             logger.error(f"Failed to push renewal charge for subscription {subscription_id}: {e}")
+            await product_subscription.handle_renewal_payment_result(db, subscription, "FAILED", None)
     finally:
         db.close()
 
@@ -170,5 +192,16 @@ async def _do_retry_installment_reconcile(order_id: str, attempt: int) -> None:
             return
         apply_installment_plan_state(db, order, plan_data)
         db.commit()
+        if order.status == OrderStatus.PAID:
+            # The retry is a second path to PAID (SNPL fully paid off while
+            # the webhook's plan fetch was down) — run the same activation
+            # and completion alert the webhook path runs, or a fully-paid
+            # plan strands in PENDING_PAYMENT with nobody told (#152).
+            from app.api.v1.tunzaa_webhook import (
+                _activate_subscription_if_linked,
+                _notify_merchant_of_payment,
+            )
+            await _activate_subscription_if_linked(db, order)
+            await _notify_merchant_of_payment(db, order)
     finally:
         db.close()
