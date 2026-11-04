@@ -11,24 +11,67 @@ from app.db.session import SessionLocal
 from app.services import usage
 from app.services.llm import LLMUnavailable, llm_service
 from app.tasks.claim_verification import should_verify_payment_claim, verify_payment_claim
-from app.tasks.webhook_processing import LLM_RETRY_COUNTDOWNS_SECONDS, _run_async, _send_with_retries
+from app.tasks.webhook_processing import (
+    LOCK_MAX_RETRIES,
+    LOCK_RETRY_COUNTDOWN_SECONDS,
+    LLM_RETRY_COUNTDOWNS_SECONDS,
+    _acquire_lock,
+    _release_lock,
+    _run_async,
+    _send_with_retries,
+)
 
 logger = logging.getLogger(__name__)
 
 
+def _ig_lock_key(account_id: str, customer_id: str) -> str:
+    return f"ig_dm_lock:{account_id}:{customer_id}"
+
+
 @celery_app.task
 def process_inbound_dm(
-    account_id: str, customer_id: str, dm_row_id: str, llm_attempt: int = 0, claimed_at: str | None = None
+    account_id: str, customer_id: str, dm_row_id: str, llm_attempt: int = 0,
+    claimed_at: str | None = None, attempt: int = 0,
 ):
     """
     Generates and sends Amara's reply to an inbound Instagram DM, continuing
     whatever conversation is already on file for this customer. dm_row_id is
     the just-created InstagramDirectMessage.id for the inbound message.
-    llm_attempt/claimed_at are only set on a Claude-outage retry (#38).
+    llm_attempt/claimed_at are only set on a Claude-outage retry (#38);
+    attempt counts lock-contention retries (same acquire-or-redispatch shape
+    as process_inbound_message — without it, two same-content deliveries
+    race and the buyer gets contradictory replies, e.g. a reclose
+    "already on its way" plus a dispatch-failure note for one number (#142)).
+    The lock is taken before the row claim, so a contended re-dispatch
+    arrives unclaimed and claims normally on its turn.
     """
     db = SessionLocal()
     try:
-        return _run_async(_process(db, account_id, customer_id, dm_row_id, llm_attempt, claimed_at))
+        account_uuid = coerce_uuid(account_id)
+        customer_uuid = coerce_uuid(customer_id)
+        dm_row_uuid = coerce_uuid(dm_row_id)
+        if account_uuid is None or customer_uuid is None or dm_row_uuid is None:
+            return "Account or customer not found."
+
+        lock_key = _ig_lock_key(account_id, customer_id)
+        if not _acquire_lock(lock_key):
+            if attempt >= LOCK_MAX_RETRIES:
+                logger.warning(
+                    f"Giving up on {lock_key} after {LOCK_MAX_RETRIES} retries "
+                    "(another message for this customer never released the lock)."
+                )
+                return "Lock contention exhausted."
+
+            process_inbound_dm.apply_async(
+                args=[account_id, customer_id, dm_row_id, llm_attempt, claimed_at, attempt + 1],
+                countdown=LOCK_RETRY_COUNTDOWN_SECONDS,
+            )
+            return "Retrying due to lock contention."
+
+        try:
+            return _run_async(_process(db, account_id, customer_id, dm_row_id, llm_attempt, claimed_at))
+        finally:
+            _release_lock(lock_key)
     finally:
         db.close()
 
@@ -122,6 +165,12 @@ async def _process(
             )
         except LLMUnavailable as e:
             logger.warning("Claude unavailable for DM %s (attempt %s); retrying: %s", dm_row_uuid, llm_attempt, e)
+            # Release early: the outage retry re-acquires the lock, and must
+            # not contend with this own turn (self-deadlock under eager
+            # execution; lock churn in prod). Same rule as WhatsApp: the
+            # retry is dispatched only after the lock is released (#142).
+            # The wrapper's finally re-release below is a harmless no-op.
+            _release_lock(_ig_lock_key(account_id, customer_id))
             process_inbound_dm.apply_async(
                 args=[account_id, customer_id, dm_row_id, llm_attempt + 1, now.isoformat()],
                 countdown=LLM_RETRY_COUNTDOWNS_SECONDS[llm_attempt],
