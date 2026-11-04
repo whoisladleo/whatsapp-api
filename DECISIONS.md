@@ -1,5 +1,13 @@
 # Decisions
 
+## Upsell banner for the WhatsApp-only handoff policy (2026-11-04, #145)
+
+**Chose:** the #144 policy is communicated with a persistent layout banner (amber, `UnpaidBanner` pattern) shown only when the merchant has no dialable handoff number, linking to Settings, plus a one-word settings-card fix ("WhatsApp alerts"). The flag (`has_handoff_number`) is computed backend-side by `resolve_handoff_number` and rides the existing `/auth/me/subscription` read the layout already makes — no new request per page load — which also kills the client-side resolver mirror in the settings page as the source of truth (it never checked dialability). Both schema and dashboard default to flag-true (no banner): a missing value must never nag merchants who have a number, same fail-hidden rule as `amara_active`. Either repo can merge first: the dashboard guards `!== false` against an older backend, and the new field is backward-compatible.
+
+**Considered and rejected:**
+- *A new endpoint or action for the flag.* Rejected: the layout's never-cached subscription call already exists precisely for banner verdicts; a second call per page load buys nothing.
+- *Settings-only placement.* Rejected: the settings page already has the handoff card — a banner there preaches to merchants already looking at the fix. The layout banner reaches everyone else, including the conversations page, which has no handoff UI at all.
+
 ## Handoff alerts stay WhatsApp-only; IG fallback rejected as upsell policy (2026-11-04, #144)
 
 **Chose:** no IG-DM-to-owner fallback when the owner has no WhatsApp number — decided during #144 Discovery, before any code. Handoffs are communicated as WhatsApp-only, and the limitation is deliberate upsell: an IG-only merchant who wants handoff alerts adds a WhatsApp number. The #140 loud skip-log stands as the internal record of each unsent alert. Technical backdrop (moot under the policy, recorded so nobody re-opens this on a false assumption): the IG Send API only reaches users who have messaged the sending account first, and `User` has no personal-IGSID field, so a fallback would have needed a new sender identity plus an opt-in capture flow, not just a send call.
