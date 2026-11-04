@@ -23,7 +23,7 @@ def _send_sync(provider, to, body):
 
 
 @celery_app.task
-def send_quote_nudge(context_id: str, account_id: str, scheduled_quote_at_iso: str, nudge_number: int):
+def send_quote_nudge(context_id: str, account_id: str, scheduled_quote_at_iso: str, nudge_number: int, channel: str = "whatsapp"):
     """
     One leg of the "still interested?" follow-up cascade for a customer who
     was quoted a price and went quiet. Scheduled once at quote time (see
@@ -35,10 +35,15 @@ def send_quote_nudge(context_id: str, account_id: str, scheduled_quote_at_iso: s
     Staleness check: scheduled_quote_at_iso and nudge_number must match the
     context's *current* pending quote exactly. Celery has no cheap way to
     cancel an already-scheduled task, so if the quote was cleared or
-    replaced by a newer one in the meantime (see generate_response's
-    proactive clearing), this just no-ops instead of sending a stale nudge.
+    replaced by a newer one in the meantime (see the DM paths' proactive
+    clearing), this just no-ops instead of sending a stale nudge.
+
+    channel selects the WhatsApp/Instagram send path; the default keeps
+    in-flight pre-#136 chains (scheduled with four args) working.
     """
     logger.info(f"Executing quote nudge {nudge_number} for context {context_id}")
+    if channel == "instagram_dm":
+        return _send_ig_quote_nudge(context_id, account_id, scheduled_quote_at_iso, nudge_number)
     db = SessionLocal()
     try:
         context_uuid = coerce_uuid(context_id)
@@ -142,6 +147,89 @@ def send_quote_nudge(context_id: str, account_id: str, scheduled_quote_at_iso: s
             try:
                 send_quote_nudge.apply_async(
                     args=[str(context_uuid), str(account_uuid), scheduled_quote_at_iso, nudge_number + 1],
+                    countdown=QUOTE_NUDGE_INTERVALS_SECONDS[nudge_number],
+                )
+            except Exception as sched_err:
+                logger.error(f"Failed to schedule next quote nudge for context {context_id}: {sched_err}")
+
+        return "Success"
+    finally:
+        db.close()
+
+
+def _send_ig_quote_nudge(context_id: str, account_id: str, scheduled_quote_at_iso: str, nudge_number: int):
+    """Instagram twin of send_quote_nudge: same staleness contract (quote +
+    count must match the context's current pending quote) and the same
+    body, but a plain-text DM instead of a WhatsApp message (no product-card
+    API here). Tagged HUMAN_AGENT so the later legs stay valid past the 24h
+    window — the same unconditional-tag shape as manual DM replies, so once
+    Meta approves the tag the whole chain works with no further change; until
+    then the late legs fail gracefully and the chain continues."""
+    from app.core.instagram_provider import InstagramProvider
+    from app.crud import instagram as crud_instagram
+    from app.db.models import InstagramAccount, InstagramConversationContext
+    from app.services import usage
+
+    db = SessionLocal()
+    try:
+        context_uuid = coerce_uuid(context_id)
+        account_uuid = coerce_uuid(account_id)
+        if context_uuid is None:
+            return "No pending quote for this context."
+        context = db.query(InstagramConversationContext).filter(InstagramConversationContext.id == context_uuid).first()
+        if not context or not context.pending_quote_at:
+            return "No pending quote for this context."
+
+        if context.pending_quote_at.isoformat() != scheduled_quote_at_iso:
+            return "Quote was superseded by a newer one; skipping stale nudge."
+
+        if (context.quote_nudge_count or 0) != nudge_number - 1:
+            return "Nudge count has moved on; skipping stale nudge."
+
+        customer = context.customer
+        if not customer:
+            return "No customer linked to this context."
+
+        if account_uuid is None:
+            return "Account not found."
+        account = db.query(InstagramAccount).filter(InstagramAccount.id == account_uuid).first()
+        if not account:
+            return "Account not found."
+        if customer.account_id != account.id:
+            return "Quote moved to a different account; skipping stale nudge."
+
+        product_name = context.current_product_intent or "that item"
+        body = f"Still interested in the {product_name}? Happy to hold it for you if you let me know."
+
+        provider = InstagramProvider(account.access_token)
+        try:
+            resp = asyncio.run(
+                provider.send_direct_message(
+                    account.ig_business_id, customer.ig_scoped_id, body, tag="HUMAN_AGENT"
+                )
+            )
+        except Exception as e:
+            logger.error(f"Quote nudge send failed for context {context_id}: {e}")
+            resp = None
+        if usage.instagram_send_succeeded(resp):
+            usage.record_reply(db, account.user_id, "instagram_dm", instagram_account_id=account.id)
+
+        crud_instagram.create_direct_message(
+            db,
+            account_id=account.id,
+            customer_id=customer.id,
+            direction="outbound",
+            body=body,
+            ig_message_id=(resp or {}).get("message_id"),
+        )
+
+        context.quote_nudge_count = nudge_number
+        db.commit()
+
+        if nudge_number < MAX_QUOTE_NUDGES:
+            try:
+                send_quote_nudge.apply_async(
+                    args=[str(context_uuid), str(account_uuid), scheduled_quote_at_iso, nudge_number + 1, "instagram_dm"],
                     countdown=QUOTE_NUDGE_INTERVALS_SECONDS[nudge_number],
                 )
             except Exception as sched_err:

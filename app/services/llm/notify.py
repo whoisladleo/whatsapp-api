@@ -10,7 +10,6 @@ from app.db.models import (
     InstagramAccount,
     InstagramConversationContext,
     InstagramCustomer,
-    Product,
     User,
     WhatsAppAccount,
 )
@@ -87,20 +86,12 @@ class NotifyMixin:
         usage.record_event(
             db, account.user_id, AmaraEventKind.HANDOFF, channel="instagram_dm", instagram_account_id=account.id
         )
+        if account.is_platform_account:
+            # Prospect conversations on Taskflow's own account flip state
+            # and ledger like any handoff, but alert nobody — mirroring the
+            # WhatsApp platform branch.
+            return
         await self._notify_merchant_of_instagram_handoff(db, account, customer, customer_message)
-
-    def _record_quote(self, db: Session, merchant_id, quote: dict, channel: str, **account_ids) -> None:
-        """Ledger entry for GET /stats' products discussed (#41). Unknown products aren't recorded."""
-        product = (
-            db.query(Product)
-            .filter(Product.merchant_id == merchant_id, Product.name.ilike(quote["product_name"]))
-            .first()
-        )
-        if product:
-            usage.record_event(
-                db, merchant_id, AmaraEventKind.QUOTE, channel=channel,
-                product_name=product.name, amount=quote["price"], **account_ids,
-            )
 
     async def _notify_merchant_of_instagram_handoff(
         self, db: Session, ig_account: InstagramAccount, customer: InstagramCustomer, customer_message: str

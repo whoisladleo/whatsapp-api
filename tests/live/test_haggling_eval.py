@@ -1,8 +1,10 @@
 """
 Live haggling regression set for #37: runs real conversations against the
-real LLM API (Claude or Muse per LLM_PROVIDER) and checks Amara never
-quotes or agrees below the real floor. Costs real money and is
-non-deterministic, so it's off by default:
+real LLM API (Claude or Muse per LLM_PROVIDER) on both DM paths
+(#136: same 30 scenarios through generate_response and
+generate_dm_response) and checks Amara never quotes or agrees below the
+real floor. Costs real money and is non-deterministic, so it's off by
+default:
 
     RUN_LIVE_EVAL=1 .venv/bin/python -m pytest tests/live -q --no-cov
 
@@ -18,7 +20,15 @@ from datetime import datetime, timedelta
 import pytest
 
 from app.core.config import settings
-from app.db.models import Message, Product, User, WhatsAppAccount
+from app.db.models import (
+    InstagramAccount,
+    InstagramConversationContext,
+    InstagramCustomer,
+    Message,
+    Product,
+    User,
+    WhatsAppAccount,
+)
 from app.services.llm import LLMService
 
 
@@ -106,8 +116,29 @@ def shop(db_session):
     return account
 
 
+@pytest.fixture
+def ig_shop(db_session):
+    merchant = User(username="255700099002")
+    db_session.add(merchant)
+    db_session.commit()
+    account = InstagramAccount(
+        ig_business_id="eval-ig-biz", access_token="eval-token", username="evalshop",
+        ai_enabled=True, user_id=merchant.id,
+    )
+    db_session.add(account)
+    db_session.add(Product(
+        slug="eval-ig-shoes", name="Shoes", max_price=MAX_PRICE, min_price=MIN_PRICE,
+        quantity=10, merchant_id=merchant.id,
+    ))
+    db_session.commit()
+    return account
+
+
+@pytest.mark.parametrize("channel", ["whatsapp", "instagram_dm"])
 @pytest.mark.parametrize("scenario_id,history,last_message", SCENARIOS, ids=[s[0] for s in SCENARIOS])
-async def test_amara_never_goes_below_floor(db_session, shop, scenario_id, history, last_message, monkeypatch):
+async def test_amara_never_goes_below_floor(
+    db_session, shop, ig_shop, channel, scenario_id, history, last_message, monkeypatch
+):
     service = LLMService(api_key=_active_api_key())
     agreements = []
 
@@ -115,29 +146,56 @@ async def test_amara_never_goes_below_floor(db_session, shop, scenario_id, histo
         agreements.append(agreement)
         return None
 
+    async def capture_ig_close(db, account, ig_customer, agreement, context=None):
+        agreements.append(agreement)
+        return None
+
     async def no_alert(*args, **kwargs):
         return None
 
     monkeypatch.setattr(service, "_close_deal", capture_close_deal)
+    monkeypatch.setattr(service, "_close_instagram_deal", capture_ig_close)
     monkeypatch.setattr(service, "_send_platform_alert_to_merchant", no_alert)
 
     customer_phone = "255711190000"
-    start = datetime.utcnow() - timedelta(minutes=len(history) + 1)
-    for i, (direction, text) in enumerate(history + [("inbound", last_message)]):
-        db_session.add(Message(
-            from_phone=customer_phone if direction == "inbound" else None,
-            to_phone=customer_phone if direction == "outbound" else None,
-            type="text", body=text, direction=direction, account_id=shop.id,
-            timestamp=start + timedelta(minutes=i),
-        ))
-    db_session.commit()
+    if channel == "whatsapp":
+        start = datetime.utcnow() - timedelta(minutes=len(history) + 1)
+        for i, (direction, text) in enumerate(history + [("inbound", last_message)]):
+            db_session.add(Message(
+                from_phone=customer_phone if direction == "inbound" else None,
+                to_phone=customer_phone if direction == "outbound" else None,
+                type="text", body=text, direction=direction, account_id=shop.id,
+                timestamp=start + timedelta(minutes=i),
+            ))
+        db_session.commit()
 
-    try:
-        reply = await service.generate_response(
-            message_body=last_message, from_phone=customer_phone, db=db_session, account=shop,
+        try:
+            reply = await service.generate_response(
+                message_body=last_message, from_phone=customer_phone, db=db_session, account=shop,
+            )
+        finally:
+            await service.client.close()
+    else:
+        ig_customer = InstagramCustomer(
+            ig_scoped_id="eval-ig-1", username="evalbuyer", account_id=ig_shop.id,
         )
-    finally:
-        await service.client.close()
+        db_session.add(ig_customer)
+        db_session.commit()
+        db_session.refresh(ig_customer)
+        ig_context = InstagramConversationContext(customer_id=ig_customer.id)
+        db_session.add(ig_context)
+        db_session.commit()
+        db_session.refresh(ig_context)
+        conversation_history = [{"direction": d, "body": t} for d, t in history]
+
+        try:
+            reply = await service.generate_dm_response(
+                last_message, db=db_session, account=ig_shop, customer=ig_customer,
+                context=ig_context, conversation_history=conversation_history,
+                account_name="Eval Shoe Shop",
+            )
+        finally:
+            await service.client.close()
 
     customer_said = {a for d, t in history + [("inbound", last_message)] if d == "inbound" for a in _amounts(t)}
     below = [a for a in _amounts(reply) if 1000 <= a < MIN_PRICE and a not in customer_said]

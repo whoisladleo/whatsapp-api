@@ -10,7 +10,8 @@ from app.db.models import AmaraEventKind, ConversationContext, Product, WhatsApp
 from app.services import llm as llm_facade
 from app.services import usage
 from app.services.llm.constants import FAILED_CYCLES_HANDOFF_THRESHOLD
-from app.services.llm.helpers import _is_out_of_stock
+from app.services.llm.conversation import render_catalog
+from app.services.llm.helpers import _bump_quote_cycle
 from app.services.llm.markers import _parse_comment_reply
 from app.services.llm.providers import MuseProvider, _complete_with_retry
 
@@ -71,12 +72,7 @@ class ReplyMixin:
             logger.warning(f"QUOTE for unknown product '{quote['product_name']}'; not tracking a nudge.")
             return
 
-        if context.current_product_intent == product.name:
-            context.failed_cycles = (context.failed_cycles or 0) + 1
-        else:
-            context.failed_cycles = 0
-
-        context.current_product_intent = product.name
+        _bump_quote_cycle(context, product.name)
         context.pending_quote_price = quote["price"]
         context.pending_quote_at = datetime.utcnow()
         context.quote_nudge_count = 0
@@ -134,15 +130,7 @@ class ReplyMixin:
             .filter(Product.merchant_id == merchant_id, Product.is_draft == False)
             .all()
         )
-        if not products:
-            catalog_str = "No products currently available."
-        else:
-            catalog_str = "Available Products:\n"
-            for p in products:
-                stock_note = " (OUT OF STOCK)" if _is_out_of_stock(p) else ""
-                catalog_str += f"- {p.name}: Price TZS {p.max_price:,.0f}, Stock: {p.quantity}{stock_note}\n"
-                if p.description:
-                    catalog_str += f"  {p.description}\n"
+        catalog_str = render_catalog(products, mode="comment")
 
         # Vision product-match (B2, Muse-only): when the commented-on post
         # has a usable photo, identify which catalog product it shows so

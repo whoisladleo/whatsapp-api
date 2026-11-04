@@ -332,6 +332,11 @@ class InstagramAccount(Base):
     access_token = Column(EncryptedString, nullable=True)
     username = Column(String, nullable=True)
     ai_enabled = Column(Boolean, default=True)
+    # Mirrors WhatsAppAccount.is_platform_account: True only for Taskflow's
+    # own account, where the merchant is the counterparty (onboarding pitch
+    # for platform plans) rather than a customer (#136). Set once by hand,
+    # never inferred from the username.
+    is_platform_account = Column(Boolean, default=False, nullable=False)
     user_id = Column(UUIDType, ForeignKey("users.id"))
     created_at = Column(DateTime, default=datetime.utcnow)
     # Last time access_token was (re)issued. NULL for pre-#80 rows — treated
@@ -385,6 +390,10 @@ class InstagramCustomer(Base):
     ig_scoped_id = Column(String, unique=True, index=True, nullable=False)
     username = Column(String, nullable=True)
     account_id = Column(UUIDType, ForeignKey("instagram_accounts.id"), nullable=False)
+    # Same one-shot classification as Customer.language, but stored
+    # IG-side: pre-close there is no phone-keyed Customer row yet, and a
+    # DM-only buyer may never produce one (#136).
+    language = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     account = relationship("InstagramAccount")
@@ -402,6 +411,15 @@ class InstagramConversationContext(Base):
     # MANAGEMENT) — same three states apply here.
     state = Column(Enum(ConversationState), default=ConversationState.NEGOTIATING)
     handoff_at = Column(DateTime, nullable=True)
+    # Negotiation/quote state, mirroring ConversationContext column for
+    # column: failed-cycle auto-handoff and quote nudges run on IG exactly
+    # as on WhatsApp (#136). NULL on pre-migration rows reads as unset.
+    failed_cycles = Column(Integer, default=0)
+    current_product_intent = Column(String, nullable=True)
+    last_offer = Column(Float, nullable=True)
+    pending_quote_price = Column(Float, nullable=True)
+    pending_quote_at = Column(DateTime, nullable=True)
+    quote_nudge_count = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

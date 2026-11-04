@@ -1,27 +1,34 @@
 import logging
+from datetime import datetime
 from typing import List, Optional
 
 from sqlalchemy.orm import Session
 
 from app.db.models import (
+    AmaraEventKind,
     InstagramAccount,
     InstagramConversationContext,
     InstagramCustomer,
+    InstagramDirectMessage,
     Order,
     OrderStatus,
     PaymentType,
     Product,
 )
+from app.services import usage
 from app.services.handoff_flow import consume_directive_ig, format_directive_block
-from app.services.llm.helpers import (
-    DealRejected,
-    _hold_expired,
-    _is_out_of_stock,
-    _negotiation_floor,
+from app.services.llm.constants import FAILED_CYCLES_HANDOFF_THRESHOLD
+from app.services.llm.conversation import (
+    CHANNEL_INSTAGRAM,
+    build_merchant_prompt,
+    build_platform_prompt,
+    render_catalog,
 )
+from app.services.llm.helpers import DealRejected, _bump_quote_cycle
 from app.services.llm.markers import (
     _mark_turn_outcome,
     _parse_and_strip_agreement,
+    _parse_and_strip_language,
     _parse_and_strip_quote,
     _parse_and_strip_resend,
 )
@@ -69,6 +76,16 @@ class DMReplyMixin:
         if not self.client:
             return None
 
+        # The customer just sent a new message, so they're no longer
+        # "quiet" — proactively clear any outstanding quote-nudge state,
+        # mirroring generate_response. Skipped for proactive (/direct)
+        # turns, where no new inbound arrived.
+        if context.pending_quote_at is not None and not proactive:
+            context.pending_quote_price = None
+            context.pending_quote_at = None
+            context.quote_nudge_count = 0
+            db.commit()
+
         # One-shot operator steering (/direct), consumed on this generated
         # reply — the handoff/quota callers return before reaching here,
         # so a paused conversation keeps its directive until Amara
@@ -76,71 +93,56 @@ class DMReplyMixin:
         # to anything customer-facing.
         directive = consume_directive_ig(customer.id)
 
-        # Drafts excluded — see the comment-reply builder above.
-        products = (
-            db.query(Product)
-            .filter(Product.merchant_id == account.user_id, Product.is_draft == False)
-            .all()
-        )
-        if not products:
-            catalog_str = "No products currently available."
+        # On the platform account the counterparty is a prospect merchant,
+        # not a customer: the catalog is the Taskflow plans, mirroring
+        # generate_response's platform branch.
+        is_platform_account = account.is_platform_account
+        if is_platform_account:
+            from app.services.subscription_access import get_platform_plans
+
+            products = [p for p in get_platform_plans(db) if not p.is_draft]
         else:
-            catalog_str = "Available Products:\n"
-            for p in products:
-                installments_note = "" if p.allow_installments else " (full payment only — installments not offered)"
-                stock_note = " (OUT OF STOCK)" if _is_out_of_stock(p) else ""
-                # Subscriptions have no units — a raw "Stock: 0" invites
-                # out-of-stock claims on plans (#92). Mirrors the WhatsApp
-                # catalog builder's wording.
-                stock_display = (
-                    "available now, billed monthly" if p.is_subscription else f"Stock: {p.quantity}"
-                )
-                plan_note = ""
-                if p.is_platform_plan:
-                    plan_note = (
-                        f", includes {p.monthly_reply_limit:,} Amara replies a month"
-                        if p.monthly_reply_limit is not None
-                        else ", includes unlimited Amara replies"
-                    )
-                catalog_str += f"- {p.name}: Max Price TZS {p.max_price:,.0f}, Lowest Price You May Offer TZS {_negotiation_floor(p):,.0f}, {stock_display}{plan_note}{stock_note}{installments_note}\n"
-                if p.description:
-                    catalog_str += f"  {p.description}\n"
+            # Drafts excluded — see the comment-reply builder above.
+            products = (
+                db.query(Product)
+                .filter(Product.merchant_id == account.user_id, Product.is_draft == False)
+                .all()
+            )
+        catalog_str = render_catalog(products)
 
         history_str = ""
         for m in conversation_history:
             sender = "Customer" if m["direction"] == "inbound" else "Amara"
             history_str += f"{sender}: {m['body']}\n"
 
-        instruction = f"""You are Amara, the AI sales agent for {account_name}, replying to a customer over Instagram Direct Message.
-
-{catalog_str}
-"""
-        if knowledge_content:
-            instruction += f"\nHere is additional knowledge:\n{knowledge_content}"
-
-        if directive:
-            instruction += format_directive_block(directive)
-
-        instruction += """
-RULES:
-1. Be helpful and friendly. Answer questions about products, pricing, and availability using only the catalog/knowledge above — never invent a product, price, stock level, or feature/detail that isn't there.
-2. Negotiation: negotiate between the catalog's max price and its lowest price you may offer. Never state or agree to a price below that lowest price.
-3. Closing: once the customer has clearly agreed on a specific product and price, ask whether they'd like to pay in full or in installments — unless the catalog marks that product "full payment only", in which case don't offer installments at all; if the customer asks for installments on such a product, tell them this one is full-payment only. Instagram doesn't give us their phone number automatically, so if you don't already have it from earlier in this conversation, ask for it too — explain it's needed to send the mobile-money payment request. Once you have a specific agreed price, a payment method choice, AND a phone number, confirm the deal and end your response with the exact marker [AGREEMENT_REACHED: product=<product name> price=<agreed price> payment=<full|installment> phone=<phone number>] (e.g. [AGREEMENT_REACHED: product=Shoes price=45000 payment=full phone=255700000000]). Only include this marker once all four are explicit — never guess or assume any of them.
-4. Payment: describe it accurately — a payment request gets sent directly to the given phone number for them to approve, not a menu of payment apps to choose from. Don't name specific mobile money providers.
-5. Human Handoff: if the customer is unreasonable, has complex questions you can't answer from the catalog/knowledge above, or explicitly asks for a human, include the exact marker [HUMAN_HANDOFF]. Don't include this for a normal close — that's handled by AGREEMENT_REACHED instead.
-6. Keep replies SHORT and natural, like a real Instagram DM — usually 1-3 sentences. Reply in the SAME language the customer just used — English message gets an English reply, Swahili gets Swahili. Never default to Swahili for an English message. Keep the entire reply in that one language — never mix Swahili and English within a single message.
-7. Currency: all prices are in Tanzanian Shillings (TZS) — always state them exactly as given, including the TZS label. Never say "$", "USD", "dollars", or imply any other currency, and never convert the number into another currency.
-8. Quoting: whenever you state a specific price for a product during negotiation but haven't closed the deal yet, end your response with the marker [QUOTE: product=<product name> price=<price>] (e.g. [QUOTE: product=Shoes price=45000]). Don't include this once you've emitted [AGREEMENT_REACHED] for the same deal.
-9. Out of stock: never offer, quote, or agree a price on a product the catalog marks OUT OF STOCK — if the customer asks about one, first say plainly, naming the product, that it is out of stock, then suggest an in-stock alternative from the catalog instead.
-10. Address: never assume the customer's gender. Use no gendered address term (never kaka/dada) unless they explicitly state their own — default to no address term in English, or ndugu in Swahili. Do not mirror their address terms back: them calling you kaka says nothing about them. If they question or correct how you address them, drop the term instantly, apologize WITHOUT repeating it, and never use it again in this conversation — the correction overrides anything earlier in the chat.
-11. Setup help: if the shop has no Instagram or WhatsApp business account yet, offer to help them set one up for free before starting — never promise the product works without one.
-12. Payment truth: you can't see Tunzaa's side. Never say payment is confirmed, received, or active — the confirmation message arrives separately once approved. After a close, only say the request is sent; if they say they've paid, thank them and say you're confirming it.
-13. Missing payment request: if they say the mobile-money request never arrived on their phone, say you're sorting it out now and end your response with the exact marker [RESEND_PAYMENT: product=<product name> price=<agreed price> payment=<full|installment> phone=<phone number>] repeating the same deal terms and phone number as the original close. The phone number is required — without it nothing can be re-sent. Never claim in your own words that you've re-sent it — the confirmation line is added automatically, and only when a resend actually fires. If the deal was installments, don't emit the marker at all: explain the charges arrive automatically on the payment provider's schedule instead.
-14. Coming back: if they message again after a goodbye, a no, or a quiet spell — even just "Hello" or a new question — treat it as a fresh start. Answer what they actually asked; never reply with another goodbye or keep pushing the old close.
-15. Subscription billing is monthly only — there is no yearly option and no discount for longer terms. If they ask for yearly, say plainly it's monthly-only.
-
-Reply with ONLY the message text (plus whichever marker applies, if any) — no other formatting.
-"""
+        # One-shot classification, stored IG-side (see
+        # InstagramCustomer.language) — notes go single-language once
+        # known, bilingual until then.
+        need_language_marker = customer.language is None
+        directive_block = format_directive_block(directive) if directive else None
+        if is_platform_account:
+            outbound_count = db.query(InstagramDirectMessage).filter(
+                InstagramDirectMessage.customer_id == customer.id,
+                InstagramDirectMessage.direction == "outbound",
+            ).count()
+            instruction = build_platform_prompt(
+                channel=CHANNEL_INSTAGRAM,
+                catalog_str=catalog_str,
+                is_first_message=(outbound_count == 0),
+                multi_plan=len(products) > 1,
+                knowledge_content=knowledge_content,
+                directive_block=directive_block,
+                need_language_marker=need_language_marker,
+            )
+        else:
+            instruction = build_merchant_prompt(
+                channel=CHANNEL_INSTAGRAM,
+                account_name=account_name,
+                catalog_str=catalog_str,
+                knowledge_content=knowledge_content,
+                directive_block=directive_block,
+                need_language_marker=need_language_marker,
+            )
 
         user_content = f'Recent conversation:\n{history_str}\nCustomer just sent: "{message_body}"\n\nRespond as Amara:'
         if proactive:
@@ -175,7 +177,7 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
                 # conversation they didn't ask to hand off.
                 return None
             await self._hand_off_instagram(db, account, customer, context, message_body)
-            return _holding_reply(None)
+            return _holding_reply(customer.language)
         except Exception as e:
             if retry_on_outage and _is_transient_llm_error(e):
                 raise LLMUnavailable(str(e)) from e
@@ -183,7 +185,7 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
             if proactive:
                 return None
             await self._hand_off_instagram(db, account, customer, context, message_body)
-            return _outage_reply(None)
+            return _outage_reply(customer.language)
 
         if not (response_text or "").strip():
             # Empty even after the inline retry — don't end in silence:
@@ -193,7 +195,15 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
             if proactive:
                 return None
             await self._hand_off_instagram(db, account, customer, context, message_body)
-            return _holding_reply(None)
+            return _holding_reply(customer.language)
+
+        # One-shot language classification (only requested in the prompt
+        # while customer.language is still unset) — stripped first so it
+        # can never leak, then persisted for single-language notes.
+        response_text, detected_language = _parse_and_strip_language(response_text)
+        if detected_language and customer.language is None:
+            customer.language = detected_language
+            db.commit()
 
         # Stripped up front so the markers can never leak through the
         # early handoff return below.
@@ -219,7 +229,7 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
                 logger.warning("AGREEMENT_REACHED in a proactive turn; sending words only, no close.")
                 return response_text
             try:
-                note = await self._close_instagram_deal(db, account, customer, agreement)
+                note = await self._close_instagram_deal(db, account, customer, agreement, context)
             except Exception as deal_err:
                 # Amara already told the buyer it's a deal — don't let that
                 # stand with nothing following (#37).
@@ -227,12 +237,12 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
                     f"Instagram deal not closed; handing off: {deal_err}"
                 )
                 await self._hand_off_instagram(db, account, customer, context, message_body)
-                return _holding_reply(None)
+                return _holding_reply(customer.language)
             if note:
                 _mark_turn_outcome(turn_outcome, "order_action")
                 response_text = f"{response_text}\n\n{note}".strip()
-        elif quote and not proactive:
-            self._record_quote(db, account.user_id, quote, "instagram_dm", instagram_account_id=account.id)
+        elif quote and not proactive and not account.is_platform_account:
+            await self._track_quote_ig(db, account, context, customer, quote, message_body)
 
         # Same payment-resend path as WhatsApp (see generate_response
         # step 3b) — only the order lookup keys, phone source, and close
@@ -253,80 +263,94 @@ Reply with ONLY the message text (plus whichever marker applies, if any) — no 
                 .order_by(Order.created_at.desc())
                 .first()
             )
-            if live_order is not None and _hold_expired(live_order):
-                live_order = None
-            if live_order is not None and (
-                live_order.product is None or live_order.customer is None
-            ):
-                logger.warning(
-                    "Ignoring live IG RESEND_PAYMENT order %s: product or customer row is gone.",
-                    live_order.id,
-                )
-                live_order = None
-            if live_order is not None and resend.get("product_name"):
-                if (
-                    live_order.product.name.lower() != resend["product_name"].lower()
-                    or abs((live_order.agreed_price or 0) - resend["price"]) > 0.01
-                ):
-                    logger.warning(
-                        "IG RESEND_PAYMENT names %r at %s but live order %s is %r at %s; closing fresh.",
-                        resend["product_name"],
-                        resend["price"],
-                        live_order.id,
-                        live_order.product.name,
-                        live_order.agreed_price,
-                    )
-                    live_order = None
-            resend_note = None
-            if live_order is not None and live_order.tunzaa_transaction_id:
-                resend_note = await self._resend_payment_for_order(
+            async def _close_fresh(marker_terms: dict) -> Optional[str]:
+                return await self._close_instagram_deal(
                     db,
-                    live_order,
-                    live_order.customer.phone_number,
-                    live_order.customer.language,
+                    account,
+                    customer,
+                    {
+                        "product_name": marker_terms["product_name"],
+                        "price": marker_terms["price"],
+                        "payment_type": "full",
+                        "phone": marker_terms["phone"],
+                    },
+                    context,
                 )
-            elif live_order is not None:
-                resend_note = await self._dispatch_payment(
+
+            try:
+                resend_note = await self._resend_payment_note(
                     db,
-                    live_order,
-                    live_order.product,
-                    live_order.customer.phone_number,
-                    PaymentType.FULL,
-                    live_order.customer.language,
+                    live_order=live_order,
+                    resend=resend,
+                    phone_for_dispatch=(
+                        live_order.customer.phone_number
+                        if live_order is not None and live_order.customer is not None
+                        else resend.get("phone")
+                    ),
+                    fallback_phone=resend.get("phone"),
+                    language=customer.language,
+                    close_fresh_fn=_close_fresh,
                 )
-            elif resend.get("product_name"):
-                if resend.get("payment_type") == "installment":
-                    logger.warning("Ignoring IG RESEND_PAYMENT for an installment deal; legs are Tunzaa-pushed.")
-                elif not resend.get("phone"):
-                    # Instagram never gives us the number — without it in
-                    # the marker there is no phone to send the fresh prompt
-                    # to. The model's words go out alone.
-                    logger.warning("Ignoring IG RESEND_PAYMENT fallback close: marker carries no phone number.")
-                else:
-                    try:
-                        resend_note = await self._close_instagram_deal(
-                            db,
-                            account,
-                            customer,
-                            {
-                                "product_name": resend["product_name"],
-                                "price": resend["price"],
-                                "payment_type": "full",
-                                "phone": resend["phone"],
-                            },
-                        )
-                    except Exception as deal_err:
-                        (logger.warning if isinstance(deal_err, DealRejected) else logger.error)(
-                            f"IG resend fallback close failed; handing off: {deal_err}"
-                        )
-                        await self._hand_off_instagram(db, account, customer, context, message_body)
-                        return _holding_reply(None)
-            else:
-                logger.warning(
-                    "Ignoring IG RESEND_PAYMENT: no live PENDING order for this chat and no deal terms to close fresh."
+            except Exception as deal_err:
+                (logger.warning if isinstance(deal_err, DealRejected) else logger.error)(
+                    f"IG resend fallback close failed; handing off: {deal_err}"
                 )
+                await self._hand_off_instagram(db, account, customer, context, message_body)
+                return _holding_reply(customer.language)
             if resend_note:
                 _mark_turn_outcome(turn_outcome, "order_action")
                 response_text = f"{response_text}\n\n{resend_note}".strip()
 
         return response_text
+
+    async def _track_quote_ig(
+        self,
+        db: Session,
+        account: InstagramAccount,
+        context: InstagramConversationContext,
+        ig_customer: InstagramCustomer,
+        quote: dict,
+        message_body: str,
+    ) -> None:
+        """IG twin of _track_quote: records an outstanding [QUOTE: ...],
+        counts consecutive rounds on the same product via the shared
+        _bump_quote_cycle, and schedules the first "still interested?"
+        nudge. Hits the same failed-cycle threshold into the IG handoff.
+        A quote for an unknown/draft product isn't tracked (nothing
+        sensible to nudge about)."""
+        from app.tasks.quote_nudges import QUOTE_NUDGE_INTERVALS_SECONDS, send_quote_nudge
+
+        product = (
+            db.query(Product)
+            .filter(
+                Product.merchant_id == account.user_id,
+                Product.name.ilike(quote["product_name"]),
+                Product.is_draft == False,
+            )
+            .first()
+        )
+        if not product:
+            logger.warning(f"QUOTE for unknown product '{quote['product_name']}'; not tracking a nudge.")
+            return
+
+        _bump_quote_cycle(context, product.name)
+        context.pending_quote_price = quote["price"]
+        context.pending_quote_at = datetime.utcnow()
+        context.quote_nudge_count = 0
+        db.commit()
+        usage.record_event(
+            db, account.user_id, AmaraEventKind.QUOTE, channel="instagram_dm",
+            instagram_account_id=account.id, product_name=product.name, amount=quote["price"],
+        )
+
+        if (context.failed_cycles or 0) >= FAILED_CYCLES_HANDOFF_THRESHOLD:
+            await self._hand_off_instagram(db, account, ig_customer, context, message_body)
+            return
+
+        try:
+            send_quote_nudge.apply_async(
+                args=[str(context.id), str(account.id), context.pending_quote_at.isoformat(), 1, "instagram_dm"],
+                countdown=QUOTE_NUDGE_INTERVALS_SECONDS[0],
+            )
+        except Exception as sched_err:
+            logger.error(f"Failed to schedule quote nudge for context {context.id}: {sched_err}")

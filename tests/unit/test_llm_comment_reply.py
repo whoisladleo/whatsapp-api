@@ -184,6 +184,25 @@ async def test_generate_comment_reply_catalog_marks_inactive_product_out_of_stoc
     assert "(OUT OF STOCK)" in line
 
 
+async def test_generate_comment_reply_catalog_subscription_is_available_not_stock_zero(db_session, merchant):
+    p = Product(
+        slug="ig-plan", name="Entry Plan", max_price=100000, min_price=100000,
+        quantity=0, merchant_id=merchant.id, is_subscription=True,
+    )
+    db_session.add(p)
+    db_session.commit()
+
+    captured = {}
+    service = _service_with_fake_client(captured=captured)
+
+    await service.generate_comment_reply(
+        "bei gani kwa mwezi?", merchant_id=merchant.id, db=db_session
+    )
+
+    line = next(l for l in captured["system"].splitlines() if l.startswith("- Entry Plan:"))
+    assert line == "- Entry Plan: Price TZS 100,000, available now, billed monthly"
+
+
 async def test_generate_comment_reply_catalog_excludes_drafts(db_session, merchant):
     p = Product(
         slug="ig-draft", name="Untitled import 12345678", max_price=0.0, min_price=0.0,
