@@ -1,5 +1,13 @@
 # Decisions
 
+## Handoff alerts stay WhatsApp-only; IG fallback rejected as upsell policy (2026-11-04, #144)
+
+**Chose:** no IG-DM-to-owner fallback when the owner has no WhatsApp number — decided during #144 Discovery, before any code. Handoffs are communicated as WhatsApp-only, and the limitation is deliberate upsell: an IG-only merchant who wants handoff alerts adds a WhatsApp number. The #140 loud skip-log stands as the internal record of each unsent alert. Technical backdrop (moot under the policy, recorded so nobody re-opens this on a false assumption): the IG Send API only reaches users who have messaged the sending account first, and `User` has no personal-IGSID field, so a fallback would have needed a new sender identity plus an opt-in capture flow, not just a send call.
+
+**Considered and rejected:**
+- *Platform-account sender + opt-in-DM keyword capture (the Discovery recommendation).* Rejected on business grounds: building the fallback would remove the pressure that moves IG-only merchants onto WhatsApp.
+- *Settings handle field for the owner's IG.* Rejected with the rest; additionally the weakest capture (needs handle-to-ID resolution and can't prove reachability).
+
 ## IG DM turn lock + early release on outage retry (2026-11-04, #142)
 
 **Chose:** `process_inbound_dm` takes a per-conversation Redis lock (`ig_dm_lock:{account}:{customer}`, same 30s TTL / 5-retry / countdown shape as the WhatsApp row lock) before the claim CAS, after a live incident where two concurrent turns replied to one customer with contradictory texts ("already on its way" alongside "something went wrong"). The lock serializes distinct turns; the claim CAS still guards double-delivery of one row. New `attempt` param mirrors WA exactly — same constants, no separate tuning, and the give-up path returns a string like the rest of the idempotent pre-claim returns. One subtlety found during implementation: the Claude-outage retry dispatches from *inside* `_process` (i.e. inside the locked region), so it now releases the lock early before dispatching — WA's rule that a retry is queued only after the lock is released, mirrored. The wrapper's `finally` re-release is a harmless no-op; the retry re-acquires on fire, so it still serializes against any newer turn that moved in meanwhile. Redis outage still fail-opens by design (replies may race, but nothing stalls). Three contention/acquire-failure tests added; the existing outage-retry test caught the self-deadlock before merge.
