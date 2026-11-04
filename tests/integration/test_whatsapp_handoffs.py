@@ -166,15 +166,22 @@ def test_resume_requires_auth(client, owner_and_account):
     assert resp.status_code in (401, 403)
 
 
-def test_resume_succeeds_and_flips_state_back_to_negotiating(client, db_session, owner_and_account):
+def test_resume_succeeds_and_flips_state_back_to_negotiating(
+    client, db_session, owner_and_account, monkeypatch
+):
     _, account, headers = owner_and_account
     headers = {**headers, "X-WhatsApp-Account-ID": str(account.id)}
     _seed_handoff(db_session, account, "255722229093")
+    calls = []
+    monkeypatch.setattr(
+        "app.tasks.webhook_processing.process_inbound_message.apply_async",
+        lambda *a, **kw: calls.append(kw.get("args")),
+    )
 
     resp = client.post(f"{URL}/255722229093/resume", headers=headers)
 
     assert resp.status_code == 200
-    assert resp.json() == {"status": "resumed", "phone": "255722229093"}
+    assert resp.json() == {"status": "resumed", "phone": "255722229093", "resume_reply": "queued"}
     customer = db_session.query(Customer).filter(Customer.phone_number == "255722229093").one()
     context = (
         db_session.query(ConversationContext)
@@ -183,6 +190,37 @@ def test_resume_succeeds_and_flips_state_back_to_negotiating(client, db_session,
     )
     assert context.state == ConversationState.NEGOTIATING
     assert context.handoff_at is None
+    assert calls == [[str(account.id), "255722229093", "hi"]]
+
+
+def test_resume_with_stale_last_message_skips_takeover_reply(
+    client, db_session, owner_and_account, monkeypatch
+):
+    from datetime import timedelta
+
+    _, account, headers = owner_and_account
+    headers = {**headers, "X-WhatsApp-Account-ID": str(account.id)}
+    _seed_handoff(db_session, account, "255722229093")
+    msg = (
+        db_session.query(Message)
+        .filter(Message.from_phone == "255722229093", Message.direction == "inbound")
+        .one()
+    )
+    msg.timestamp = datetime.utcnow() - timedelta(hours=25)
+    db_session.commit()
+    calls = []
+    monkeypatch.setattr(
+        "app.tasks.webhook_processing.process_inbound_message.apply_async",
+        lambda *a, **kw: calls.append(kw.get("args")),
+    )
+
+    resp = client.post(f"{URL}/255722229093/resume", headers=headers)
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "status": "resumed", "phone": "255722229093", "resume_reply": "skipped_stale",
+    }
+    assert calls == []
 
 
 def test_resume_404_when_no_conversation(client, owner_and_account):

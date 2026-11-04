@@ -31,7 +31,7 @@ def _ig_lock_key(account_id: str, customer_id: str) -> str:
 @celery_app.task
 def process_inbound_dm(
     account_id: str, customer_id: str, dm_row_id: str, llm_attempt: int = 0,
-    claimed_at: str | None = None, attempt: int = 0,
+    claimed_at: str | None = None, attempt: int = 0, resume: bool = False,
 ):
     """
     Generates and sends Amara's reply to an inbound Instagram DM, continuing
@@ -44,6 +44,10 @@ def process_inbound_dm(
     "already on its way" plus a dispatch-failure note for one number (#142)).
     The lock is taken before the row claim, so a contended re-dispatch
     arrives unclaimed and claims normally on its turn.
+    resume marks a take-over turn (#149): the row was already claimed and
+    processed by its original turn, so the claim CAS is skipped (the
+    conversation lock still serializes). It propagates through both
+    re-dispatch paths like any other turn parameter.
     """
     db = SessionLocal()
     try:
@@ -63,13 +67,13 @@ def process_inbound_dm(
                 return "Lock contention exhausted."
 
             process_inbound_dm.apply_async(
-                args=[account_id, customer_id, dm_row_id, llm_attempt, claimed_at, attempt + 1],
+                args=[account_id, customer_id, dm_row_id, llm_attempt, claimed_at, attempt + 1, resume],
                 countdown=LOCK_RETRY_COUNTDOWN_SECONDS,
             )
             return "Retrying due to lock contention."
 
         try:
-            return _run_async(_process(db, account_id, customer_id, dm_row_id, llm_attempt, claimed_at))
+            return _run_async(_process(db, account_id, customer_id, dm_row_id, llm_attempt, claimed_at, resume))
         finally:
             _release_lock(lock_key)
     finally:
@@ -77,7 +81,8 @@ def process_inbound_dm(
 
 
 async def _process(
-    db, account_id: str, customer_id: str, dm_row_id: str, llm_attempt: int = 0, claimed_at: str | None = None
+    db, account_id: str, customer_id: str, dm_row_id: str, llm_attempt: int = 0,
+    claimed_at: str | None = None, resume: bool = False,
 ) -> str:
     account_uuid = coerce_uuid(account_id)
     customer_uuid = coerce_uuid(customer_id)
@@ -98,16 +103,24 @@ async def _process(
     # processed_at its own earlier attempt wrote, rather than releasing the
     # claim in between — releasing would let a webhook redelivery claim the
     # row too and reopen the double-order race.
-    claim = db.query(InstagramDirectMessage).filter(InstagramDirectMessage.id == dm_row_uuid)
-    if claimed_at is None:
-        claim = claim.filter(InstagramDirectMessage.processed_at.is_(None))
+    if resume:
+        # Take-over turn (#149): this row was already claimed and processed
+        # by its original turn — re-running it is the whole point, so the
+        # claim CAS is skipped. The conversation lock above still
+        # serializes against any live turn on this customer.
+        logger.info("Resume turn for DM %s; skipping row claim.", dm_row_id)
+        now = datetime.utcnow()
     else:
-        claim = claim.filter(InstagramDirectMessage.processed_at == datetime.fromisoformat(claimed_at))
-    now = datetime.utcnow()
-    claimed = claim.update({"processed_at": now})
-    db.commit()
-    if claimed == 0:
-        return "Already processed; skipping duplicate dispatch."
+        claim = db.query(InstagramDirectMessage).filter(InstagramDirectMessage.id == dm_row_uuid)
+        if claimed_at is None:
+            claim = claim.filter(InstagramDirectMessage.processed_at.is_(None))
+        else:
+            claim = claim.filter(InstagramDirectMessage.processed_at == datetime.fromisoformat(claimed_at))
+        now = datetime.utcnow()
+        claimed = claim.update({"processed_at": now})
+        db.commit()
+        if claimed == 0:
+            return "Already processed; skipping duplicate dispatch."
 
     account = db.query(InstagramAccount).filter(InstagramAccount.id == account_uuid).first()
     customer = db.query(InstagramCustomer).filter(InstagramCustomer.id == customer_uuid).first()
@@ -172,7 +185,7 @@ async def _process(
             # The wrapper's finally re-release below is a harmless no-op.
             _release_lock(_ig_lock_key(account_id, customer_id))
             process_inbound_dm.apply_async(
-                args=[account_id, customer_id, dm_row_id, llm_attempt + 1, now.isoformat()],
+                args=[account_id, customer_id, dm_row_id, llm_attempt + 1, now.isoformat(), 0, resume],
                 countdown=LLM_RETRY_COUNTDOWNS_SECONDS[llm_attempt],
             )
             return "Retrying: LLM unavailable."

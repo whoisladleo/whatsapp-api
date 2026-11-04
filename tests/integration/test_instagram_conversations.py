@@ -281,12 +281,39 @@ def test_resume_success(client, db_session, auth_user, account, customer):
     resp = client.post(f"{HANDOFFS_URL}/{customer.id}/resume", headers=headers)
 
     assert resp.status_code == 200
+    assert resp.json()["resume_reply"] == "skipped_no_inbound"
     context = (
         db_session.query(InstagramConversationContext)
         .filter(InstagramConversationContext.customer_id == customer.id)
         .first()
     )
     assert context.state == ConversationState.NEGOTIATING
+
+
+def test_resume_queues_takeover_reply_when_answerable(
+    client, db_session, auth_user, account, customer, monkeypatch
+):
+    _, headers = auth_user
+    dm = InstagramDirectMessage(
+        account_id=account.id, customer_id=customer.id, direction="inbound", body="hello?"
+    )
+    db_session.add(dm)
+    db_session.add(
+        InstagramConversationContext(customer_id=customer.id, state=ConversationState.HUMAN_HANDOFF)
+    )
+    db_session.commit()
+    db_session.refresh(dm)
+    calls = []
+    monkeypatch.setattr(
+        "app.tasks.instagram_dm_processing.process_inbound_dm.apply_async",
+        lambda *a, **kw: calls.append(kw.get("args")),
+    )
+
+    resp = client.post(f"{HANDOFFS_URL}/{customer.id}/resume", headers=headers)
+
+    assert resp.status_code == 200
+    assert resp.json()["resume_reply"] == "queued"
+    assert calls == [[str(account.id), str(customer.id), str(dm.id), 0, None, 0, True]]
 
 
 def test_resume_404_for_unknown_customer(client, auth_user, account):

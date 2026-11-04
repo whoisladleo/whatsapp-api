@@ -24,6 +24,7 @@ from app.schemas.instagram import (
     InstagramPendingHandoffRead,
 )
 from app.services import instagram_oauth
+from app.services import resume as resume_service
 from app.tasks.instagram_comment_processing import process_inbound_comment
 from app.tasks.instagram_dm_processing import process_inbound_dm
 from app.tasks.instagram_token_refresh import refresh_account_token
@@ -409,7 +410,13 @@ def resume_handoff(
         raise HTTPException(status_code=404, detail=str(e))
     except crud_instagram.ConversationNotInHandoffError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    return {"status": "resumed", "customer_id": customer_id}
+    verdict = resume_service.verdict_for_instagram(db, customer_id)
+    queued = resume_service.dispatch_resume_reply(verdict)
+    return {
+        "status": "resumed",
+        "customer_id": customer_id,
+        "resume_reply": "queued" if queued else f"skipped_{verdict.reason}",
+    }
 
 
 @router.get("/messages", response_model=list[InstagramMessageRead])

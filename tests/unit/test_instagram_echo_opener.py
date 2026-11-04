@@ -401,9 +401,16 @@ def test_mid_chat_echo_sets_handoff_and_silences_amara(
     assert fake_llm_reply.called_with is None
 
 
-async def test_resume_reactivates_after_echo_handoff(client, db_session, owner, account, customer):
+async def test_resume_reactivates_after_echo_handoff(client, db_session, owner, account, customer, monkeypatch):
     """/resume @username (and the crud call behind it) flips the echo-set
     handoff back to NEGOTIATING."""
+    # Suppress just the take-over dispatch (covered in the resume tests):
+    # running the turn nested and eager here corrupts this test's session.
+    verdicts = []
+    monkeypatch.setattr(
+        "app.services.resume.dispatch_resume_reply",
+        lambda verdict: verdicts.append(verdict) or False,
+    )
     wa_account = WhatsAppAccount(
         name="Merchant WA", phone_number_id="PHONE_ECHO", access_token="tok", user_id=owner.id
     )
@@ -426,6 +433,8 @@ async def test_resume_reactivates_after_echo_handoff(client, db_session, owner, 
     reply = await handle_merchant_message(db_session, wa_account, "/resume @echo_shopper", owner.username)
 
     assert "resumed" in reply
+    assert "replying to their last message now" in reply
+    assert [v.answerable for v in verdicts] == [True]
     db_session.refresh(context)
     assert context.state == ConversationState.NEGOTIATING
     assert context.handoff_at is None
