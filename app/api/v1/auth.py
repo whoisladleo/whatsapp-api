@@ -708,11 +708,13 @@ def get_my_subscription(
 ):
     """Self-service status view — see app/services/self_service_billing.py."""
     from app.services import subscription_access
+    from app.crud import user as crud_user
 
     amara_active = subscription_access.is_merchant_allowed_ai(db, current_user)
+    has_handoff_number = crud_user.resolve_handoff_number(current_user) is not None
     subscription = self_service_billing.get_my_subscription(db, current_user)
     if not subscription:
-        return MySubscriptionRead(amara_active=amara_active)
+        return MySubscriptionRead(amara_active=amara_active, has_handoff_number=has_handoff_number)
 
     return MySubscriptionRead(
         status=subscription.status.value,
@@ -721,6 +723,7 @@ def get_my_subscription(
         retry_count=subscription.retry_count,
         past_due_since=subscription.past_due_since,
         amara_active=amara_active,
+        has_handoff_number=has_handoff_number,
     )
 
 

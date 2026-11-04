@@ -778,7 +778,28 @@ def test_get_my_subscription_none_when_no_subscription(client, auth_user, db_ses
     assert resp.json() == {
         "status": None, "monthly_amount": None, "next_billing_at": None,
         "retry_count": None, "past_due_since": None, "amara_active": False,
+        "has_handoff_number": True,
     }
+
+
+def test_get_my_subscription_reports_handoff_number_state(client, auth_user, db_session):
+    _seed_platform_product(db_session)
+    user, headers = auth_user
+
+    resp = client.get("/api/v1/auth/me/subscription", headers=headers)
+
+    assert resp.status_code == 200
+    assert resp.json()["has_handoff_number"] is True
+
+    user.username = None
+    user.phone_number = None
+    user.handoff_phone_number = None
+    db_session.commit()
+
+    resp = client.get("/api/v1/auth/me/subscription", headers=headers)
+
+    assert resp.status_code == 200
+    assert resp.json()["has_handoff_number"] is False
 
 
 def test_get_my_subscription_returns_status_when_found(client, auth_user, db_session, monkeypatch):
