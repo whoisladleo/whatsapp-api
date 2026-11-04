@@ -144,6 +144,11 @@ class MySubscriptionRead(BaseModel):
     # exemption, no-plans-configured) — the dashboard banner keys off this
     # rather than reimplementing subscription_access.is_merchant_allowed_ai.
     amara_active: bool = True
+    # Whether resolve_handoff_number finds a dialable alert target — the
+    # dashboard's WhatsApp-only upsell banner keys off this rather than
+    # mirroring the resolver client-side (#145). Defaults True (no banner):
+    # a missing value must never nag merchants who have a number.
+    has_handoff_number: bool = True
 
 class PayNowRequest(BaseModel):
     # Only needed if no phone is already on file (User.username/phone_number)
